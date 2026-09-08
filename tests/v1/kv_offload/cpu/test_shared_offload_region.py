@@ -995,3 +995,101 @@ def test_barrier_release_failure_keeps_original_error(iid, monkeypatch):
         _make_region(iid, barrier=MagicMock(side_effect=TimeoutError("barrier")))
 
     assert not os.path.exists(f"/dev/shm/vllm_offload_{iid}.mmap")
+
+
+# ---------------------------------------------------------------------------
+# Orphan reclamation (gh-53987 / gh-54002)
+# ---------------------------------------------------------------------------
+
+
+def _write_orphan(engine_id: str, size: int = PAGE_SIZE) -> str:
+    """Leave behind a region file the way a hard-killed engine would."""
+    path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    try:
+        os.ftruncate(fd, size)
+    finally:
+        os.close(fd)
+    return path
+
+
+def test_orphaned_region_is_reclaimed(iid):
+    """A region left by a crashed engine is removed when the next one starts.
+
+    cleanup() unlinks the file on a graceful shutdown, but a SIGKILL or an OOM
+    kill skips it. Where /dev/shm outlives the process the orphan keeps
+    consuming the tmpfs budget, so the next start must reclaim it.
+    """
+    orphan = _write_orphan(f"{iid}-orphan")
+    assert os.path.exists(orphan)
+
+    region = _make_region(iid)
+    try:
+        assert not os.path.exists(orphan)
+    finally:
+        region.cleanup()
+        _cleanup_file(orphan)
+
+
+def test_live_region_is_not_reclaimed(iid):
+    """A region another live engine is using must survive a new engine's start.
+
+    Reclaiming by filename alone would delete it, breaking a second vLLM
+    instance that shares this host's /dev/shm.
+    """
+    live = _make_region(f"{iid}-live")
+    live_path = live.mmap_path
+    try:
+        other = _make_region(f"{iid}-other")
+        try:
+            assert os.path.exists(live_path)
+        finally:
+            other.cleanup()
+    finally:
+        live.cleanup()
+        _cleanup_file(live_path)
+
+
+def test_empty_region_file_is_not_reclaimed(iid):
+    """A zero-length file is a region mid-creation, not an orphan.
+
+    The creator holds O_EXCL before it sizes the file, so an empty file may
+    belong to an engine that is starting right now.
+    """
+    path = f"/dev/shm/vllm_offload_{iid}-starting.mmap"
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.close(fd)
+    try:
+        region = _make_region(iid)
+        try:
+            assert os.path.exists(path)
+        finally:
+            region.cleanup()
+    finally:
+        _cleanup_file(path)
+
+
+def test_symlink_in_shm_is_not_followed(iid, tmp_path):
+    """A planted symlink must not be opened or removed.
+
+    /dev/shm is world-writable, so a local user can create a name matching the
+    region glob that points somewhere else. Reclamation must refuse to follow
+    it rather than opening an arbitrary file for writing.
+    """
+    target = tmp_path / "victim"
+    target.write_bytes(b"untouched")
+    link = f"/dev/shm/vllm_offload_{iid}-evil.mmap"
+    os.symlink(target, link)
+    try:
+        region = _make_region(iid)
+        try:
+            assert target.exists(), "the symlink target must not be removed"
+            assert target.read_bytes() == b"untouched"
+            # Without O_NOFOLLOW the open() follows the link, the flock
+            # succeeds and the unlink below it removes the planted name --
+            # so a surviving symlink is what shows we never opened it.
+            assert os.path.islink(link), "the planted symlink must be left alone"
+        finally:
+            region.cleanup()
+    finally:
+        _cleanup_file(link)
