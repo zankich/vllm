@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import fcntl
 import functools
 import time
 from collections import deque
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -190,8 +192,36 @@ def _canonical_block_sizes(
     return canonical_bytes_per_block
 
 
+@contextmanager
+def _region_registration_lock(region: SharedOffloadRegion):
+    """Serialize cudaHostRegister across the ranks sharing one region.
+
+    Concurrent registrations over the same pages intermittently fail with
+    cudaErrorInvalidValue on some drivers (observed on RTX 3090 Ti, TP2,
+    where one rank succeeded while the other failed). flock on the region's
+    own fd orders the ranks without introducing a named lock file that
+    could itself be orphaned by a crash.
+    """
+    if region.fd is None:
+        yield
+        return
+    fcntl.flock(region.fd, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        fcntl.flock(region.fd, fcntl.LOCK_UN)
+
+
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
-    """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
+    """Register the entire mmap as CUDA pinned memory via cudaHostRegister.
+
+    A failed registration poisons the CUDA context on affected drivers:
+    the next CUDA operation aborts with cudaErrorInvalidValue (observed
+    2026-09-08: rank 0's registration failed, the historical warning fired,
+    and the following torch.arange in kernel warmup killed the worker), so
+    a failure must fail this boot loudly rather than fall back to
+    "unpinned DMA".
+    """
     if not current_platform.is_cuda_alike():
         logger.info(
             "Skipping mmap host registration on %s; cudaHostRegister is only "
@@ -201,23 +231,40 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
         return
 
     rank = region.rank
-
     base_ptr = region._base.data_ptr()
-    result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
+    attempts = 3
+
+    with _region_registration_lock(region):
+        for attempt in range(1, attempts + 1):
+            result = torch.cuda.cudart().cudaHostRegister(
+                base_ptr, region.total_size_bytes, 0
+            )
+            if result.value == 0:
+                break
+            logger.warning(
+                "cudaHostRegister failed for rank=%d (code=%d), attempt %d/%d",
+                rank,
+                result.value,
+                attempt,
+                attempts,
+            )
+            time.sleep(1.0)
+
     if result.value != 0:
-        logger.warning(
-            "cudaHostRegister failed for rank=%d (code=%d) — "
-            "transfers will still work but may be slower (unpinned DMA)",
-            rank,
-            result,
+        raise RuntimeError(
+            f"cudaHostRegister failed for rank={rank} (code={result.value}) "
+            f"after {attempts} attempts. A failed registration poisons the "
+            "CUDA context (subsequent CUDA calls abort with "
+            "cudaErrorInvalidValue), so failing this boot instead of "
+            "continuing with a broken context."
         )
-    else:
-        logger.debug(
-            "cudaHostRegister rank=%d %.2f GB",
-            rank,
-            region.total_size_bytes / 1e9,
-        )
-        region.is_pinned = True
+
+    logger.debug(
+        "cudaHostRegister rank=%d %.2f GB",
+        rank,
+        region.total_size_bytes / 1e9,
+    )
+    region.is_pinned = True
 
 
 def _new_descriptor_buffers(
