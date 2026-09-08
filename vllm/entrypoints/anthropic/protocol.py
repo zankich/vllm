@@ -136,6 +136,10 @@ class AnthropicMessagesRequest(BaseModel):
     tools: list[AnthropicTool] | None = None
     top_k: int | None = None
     top_p: float | None = None
+    # Anthropic thinking config: {type: enabled, budget_tokens: N}.
+    # Permissive dict on purpose -- validation happens when the
+    # budget is mapped in _build_base_request.
+    thinking: dict[str, Any] | None = None
 
     # vLLM-specific fields that are not in Anthropic spec
     cache_salt: str | None = Field(
