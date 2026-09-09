@@ -27,11 +27,7 @@ git log <upstream-tag>..HEAD --stat    # full delta of the last-upstream-tag
 | `[Bugfix] ... stop zeroing offload hits under MTP/EAGLE` (#52771) | with no annotated drafter group every group was treated as volatile-tail, zeroing the whole request's offload hit on shared-group MTP models | upstream, merged to main after the branch cut |
 | `[Bugfix][KV Offload] ... unaligned cache-hit boundaries` (#55712) | SWA window coverage validation at unaligned hit boundaries | upstream, merged to main after the branch cut |
 | `Fix intermittent offload-region pinning failure` | concurrent `cudaHostRegister` of the shared offload region across TP ranks intermittently fails and poisons the CUDA context (warn-and-continue killed the next CUDA op); now flock-serialized across ranks, retried, and fails the boot loudly | fork-local, no upstream fix at port time |
-| `Reclaim orphaned offload regions` | a SIGKILL'd engine leaks `/dev/shm/vllm_offload_*.mmap`, wedging the next boot on shared `/dev/shm`; sweep at construction reclaims regions whose exclusive flock can be taken (port of upstream #54124, closed unmerged, onto the #52596-modified file) | upstream PR #54124, adapted |
-
-`#52596` (unlink the region after all workers map it) is upstream in
-v0.29.0 and therefore not carried. The v0.28 branch carries the same set
-plus that backport.
+| `Reclaim orphaned offload regions` | a SIGKILL'd engine leaks `/dev/shm/vllm_offload_*.mmap`, wedging the next boot on shared `/dev/shm`; sweep at construction reclaims regions whose exclusive flock can be taken (port of upstream #54124, closed unmerged) | upstream PR #54124, adapted |
 
 ## Rebase policy
 
@@ -40,7 +36,9 @@ Each upstream release: check which patches upstream has absorbed
 The commit messages record every hand-adaptation forced by
 intermediate-commit drift. Patches here exist to be deleted — the
 permanent fixes are the fork-local ones until upstream takes them.
-<!-- fork-preamble-end -->
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
