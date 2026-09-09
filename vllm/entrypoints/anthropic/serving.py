@@ -632,6 +632,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             content=[],
             model=generator.model,
             usage=_build_anthropic_usage(generator.usage),
+            metrics=generator.metrics,
             kv_transfer_params=generator.kv_transfer_params,
             ec_transfer_params=generator.ec_transfer_params,
         )
@@ -854,6 +855,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                                 type="message_delta",
                                 delta=stop_delta,
                                 usage=_build_anthropic_usage(origin_chunk.usage),
+                                metrics=origin_chunk.metrics,
                             )
                             data = chunk.model_dump_json(exclude_unset=True)
                             yield wrap_data_with_event(data, "message_delta")

@@ -8,6 +8,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 import vllm.envs as envs
+from vllm.entrypoints.generate.base.protocol import PerRequestMetrics
 
 
 class AnthropicError(BaseModel):
@@ -233,6 +234,9 @@ class AnthropicStreamEvent(BaseModel):
     index: int | None = None
     error: AnthropicError | None = None
     usage: AnthropicUsage | None = None
+    # vLLM-specific field that is not in Anthropic spec: per-request metrics
+    # (timing and speculative-decoding acceptance) on the final message_delta.
+    metrics: PerRequestMetrics | None = None
 
 
 class AnthropicMessagesResponse(BaseModel):
@@ -250,6 +254,13 @@ class AnthropicMessagesResponse(BaseModel):
     usage: AnthropicUsage | None = None
 
     # vLLM-specific fields that are not in Anthropic spec
+    metrics: PerRequestMetrics | None = Field(
+        default=None,
+        description=(
+            "vLLM per-request metrics (timing and speculative-decoding "
+            "acceptance) for single-sequence requests."
+        ),
+    )
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
