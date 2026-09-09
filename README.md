@@ -28,6 +28,7 @@ git log <upstream-tag>..HEAD --stat    # full delta of the last-upstream-tag
 | [`[Bugfix][KV Offload] ... unaligned cache-hit boundaries` (#55712)](https://github.com/vllm-project/vllm/pull/55712) | SWA window coverage validation at unaligned hit boundaries | upstream, merged to main after the branch cut |
 | `Fix intermittent offload-region pinning failure` | concurrent `cudaHostRegister` of the shared offload region across TP ranks intermittently fails and poisons the CUDA context (warn-and-continue killed the next CUDA op); now flock-serialized across ranks, retried, and fails the boot loudly | fork-local, no upstream fix at port time |
 | `Reclaim orphaned offload regions` | a SIGKILL'd engine leaks `/dev/shm/vllm_offload_*.mmap`, wedging the next boot on shared `/dev/shm`; sweep at construction reclaims regions whose exclusive flock can be taken (port of upstream [#54124](https://github.com/vllm-project/vllm/pull/54124), closed unmerged) | [upstream PR #54124](https://github.com/vllm-project/vllm/pull/54124), adapted |
+| `Surface per-request spec-decode metrics on the Anthropic messages API` | `--per-request-spec-decode-metrics` stats reach `/v1/chat/completions` upstream but were dropped by the `/v1/messages` converter; both the response and the final `message_delta` stream event now carry the same `metrics.speculative_decoding` field | fork-local |
 
 ## Rebase policy
 
