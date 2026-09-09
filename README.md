@@ -1,4 +1,46 @@
 <!-- markdownlint-disable MD001 MD041 -->
+<!-- fork-preamble-start -->
+# zankich/vllm — fork of vllm-project/vllm
+
+Production fork for a Qwen3.8-27B mamba-hybrid stack (TP2, MTP
+speculative decoding, prefix caching, fp8 KV, CPU + disk KV-offload
+tiers shared across two serving instances). Upstream vLLM is excellent;
+this fork exists to carry fixes that had not shipped in a release at
+deploy time. See what this fork changes with:
+
+```bash
+git log v0.29.0..HEAD --oneline        # everything on top of the tag
+git log <upstream-tag>..HEAD --stat    # full delta of the last-upstream-tag
+```
+
+## Branches
+
+- `v0.29.0-qwen` (default) — current, on the v0.29.0 tag
+- `v0.28.0-qwen` — previous generation, on the v0.28.0 tag
+
+## Patch set on `v0.29.0-qwen`
+
+| commit | what it does | origin |
+|---|---|---|
+| `Enforce thinking-budget wrap-up sentence` | prepends a pre-tokenized wrap-up sentence to the forced `</think>` close at thinking-budget exhaustion, with a spec-decode-resync fix so multi-token wrap-ups survive MTP rejection sampling; Anthropic `/v1/messages` `thinking.budget_tokens` maps to `thinking_token_budget`. dormant unless `VLLM_THINKING_WRAPUP_TOKEN_IDS` is set | fork-local |
+| `[Bugfix][KV Offload] ... truncate the load boundary` (#52807) | mamba/recurrent groups legitimately hold unhashed blocks below the computed mark; the from-zero scan collapsed the load boundary and asserted (upstream #50454) | upstream, merged to main after the v0.29 branch cut |
+| `[Bugfix] ... stop zeroing offload hits under MTP/EAGLE` (#52771) | with no annotated drafter group every group was treated as volatile-tail, zeroing the whole request's offload hit on shared-group MTP models | upstream, merged to main after the branch cut |
+| `[Bugfix][KV Offload] ... unaligned cache-hit boundaries` (#55712) | SWA window coverage validation at unaligned hit boundaries | upstream, merged to main after the branch cut |
+| `Fix intermittent offload-region pinning failure` | concurrent `cudaHostRegister` of the shared offload region across TP ranks intermittently fails and poisons the CUDA context (warn-and-continue killed the next CUDA op); now flock-serialized across ranks, retried, and fails the boot loudly | fork-local, no upstream fix at port time |
+| `Reclaim orphaned offload regions` | a SIGKILL'd engine leaks `/dev/shm/vllm_offload_*.mmap`, wedging the next boot on shared `/dev/shm`; sweep at construction reclaims regions whose exclusive flock can be taken (port of upstream #54124, closed unmerged, onto the #52596-modified file) | upstream PR #54124, adapted |
+
+`#52596` (unlink the region after all workers map it) is upstream in
+v0.29.0 and therefore not carried. The v0.28 branch carries the same set
+plus that backport.
+
+## Rebase policy
+
+Each upstream release: check which patches upstream has absorbed
+(`git merge-base --is-ancestor <upstream-sha> <tag>`), re-port the rest.
+The commit messages record every hand-adaptation forced by
+intermediate-commit drift. Patches here exist to be deleted — the
+permanent fixes are the fork-local ones until upstream takes them.
+<!-- fork-preamble-end -->
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
