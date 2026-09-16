@@ -105,6 +105,9 @@ class GroupOffloadConfig(NamedTuple):
     # of these groups is volatile and lacks a stable hash, so it must
     # be excluded from store and load scheduling.
     is_eagle_group: bool = False
+    # False for groups excluded from offload at config build (misaligned
+    # block vs hash size): no layers registered, empty keys forever.
+    participates: bool = True
 
     def load_window_size_in_chunks(self, num_tokens: int) -> int | None:
         window = self.sliding_window_size_in_chunks
@@ -301,6 +304,7 @@ class SchedulerOffloadConfig(NamedTuple):
                     ),
                     kv_event_group_spec=get_offloading_event_group_spec(kv_cache_group),
                     is_eagle_group=idx in eagle_groups,
+                    participates=bool(spec.config.groups[idx].layer_names),
                     requires_cow_source=(
                         isinstance(kv_spec, MambaSpec)
                         and kv_spec.mamba_cache_mode == "align"
@@ -311,9 +315,7 @@ class SchedulerOffloadConfig(NamedTuple):
         # Uniformity and tail support are properties of the groups that
         # actually offload; excluded groups sit at their own block size.
         participating = [
-            config
-            for config in kv_group_configs
-            if spec.config.groups[config.group_idx].layer_names
+            config for config in kv_group_configs if config.participates
         ]
         group_block_sizes = {config.tokens_per_block for config in participating}
         has_partial_recurrent_group = any(
@@ -405,6 +407,10 @@ class RequestOffloadState:
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
+            if not group_config.hashes_per_chunk:
+                # Excluded group (misaligned block vs hash size): no chunk
+                # hashes, nothing to key or store.
+                continue
             for req_block_hash in islice(
                 self.req.block_hashes,
                 group_config.hashes_per_chunk * len(group_state.offload_keys)
@@ -556,6 +562,9 @@ class OffloadingConnectorScheduler:
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
         for group_config in self.config.kv_group_configs:
+            if not group_config.participates:
+                # Excluded from offload: never in lookup, never touched.
+                continue
             if group_config.sliding_window_size_in_chunks is None:
                 full_attention_groups.append(group_config.group_idx)
             else:
@@ -724,6 +733,8 @@ class OffloadingConnectorScheduler:
         for group_config, group_state in zip(
             self.config.kv_group_configs, req_status.group_states
         ):
+            if not group_config.participates:
+                continue
             if group_config.sliding_window_size_in_chunks is None:
                 self.manager.touch(group_state.offload_keys, req_status.req_context)
             else:
