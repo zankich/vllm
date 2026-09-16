@@ -4,6 +4,8 @@
 
 from typing import TYPE_CHECKING
 
+from vllm.logger import init_logger
+
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -24,6 +26,8 @@ from vllm.v1.kv_offload.config import (
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
+
+logger = init_logger(__name__)
 
 
 def build_offloading_config(
@@ -54,13 +58,28 @@ def build_offloading_config(
     )
 
     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
-    for group in groups:
-        assert group.tokens_per_block % tokens_per_hash == 0, (
-            f"tokens_per_block={group.tokens_per_block} not divisible by "
-            f"tokens_per_hash={tokens_per_hash}. "
-            f"Hybrid models (e.g. Mamba+Attention) need "
-            f"--enable-prefix-caching to align block sizes."
+    # Hybrid + MTP: the drafter attention forms its own group whose smaller
+    # block (e.g. 8) need not divide the cross-group hash size (e.g. 800).
+    # Such groups stay GPU-resident instead of aborting the boot; drafter KV
+    # is request-lifetime, so excluding it from offload loses nothing.
+    offloadable = tuple(
+        group for group in groups if group.tokens_per_block % tokens_per_hash == 0
+    )
+    excluded = [group for group in groups if group.tokens_per_block % tokens_per_hash]
+    if excluded:
+        logger.warning(
+            "offloading: %d group(s) with tokens_per_block not divisible by "
+            "tokens_per_hash=%d stay GPU-resident: %s",
+            len(excluded),
+            tokens_per_hash,
+            [group.layer_names[0] for group in excluded],
         )
+    if not offloadable:
+        raise ValueError(
+            f"no KV cache group has tokens_per_block divisible by "
+            f"tokens_per_hash={tokens_per_hash}; offloading cannot proceed"
+        )
+    groups = offloadable
 
     blocks_per_chunk = 1
     blocks_per_chunk_config = extra_config.get("blocks_per_chunk")
