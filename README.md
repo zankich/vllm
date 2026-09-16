@@ -59,6 +59,7 @@ against `v0.29.0-qwen`.
 | [`[Qwen3.8-Flash-Next] Support FP8 indexer cache for QSA` (#54890)](https://github.com/vllm-project/vllm/pull/54890) | FP8 cache for the QSA indexer; adds `nvidia/ops/qsa_indexer.py` | upstream, cherry-picked from main |
 | [`Fix block FP8 MTP in ModelOpt mixed checkpoints` (#55513)](https://github.com/vllm-project/vllm/pull/55513) | routes block-FP8 routed experts to `Fp8MoEMethod` so FP8 MTP weights in ModelOpt mixed checkpoints load; hand-adapted, see below | upstream, cherry-picked from main, hand-adapted |
 | [`[Qwen4Exp] Support UVA PLE-offload and Engram tensor parallelism` (#54371)](https://github.com/vllm-project/vllm/pull/54371) | the payload: the PLE n-gram table moves to `nvidia/ngram_embedding.py`, pinned host-side and read through UVA on a side stream, Engram tensor parallelism (ETP=TP); adds `vllm/config/engram.py` | upstream, cherry-picked from main |
+| `Exclude block-misaligned KV groups from offloading` | Flash-Next + MTP forms groups [800 x5, 8]: the QSA indexer `raw_key_cache`'s 8-token block cannot chunk-hash at the 800-token granularity, and the offloading path asserted at config build, then in scheduler key/load/store math once the group was dropped outright. Misaligned groups keep their positional entry with no layers — nothing registers, stores, loads, or lookups for them — while the main-model context offloads normally. Verified by the restart-restore byte-compare protocol (garble PASS, ~3 GiB CPU-to-GPU restore) | fork-local |
 | [`[Qwen3.8-Flash-Next] Fuse Qwen4Exp PLE kernels` (#54517)](https://github.com/vllm-project/vllm/pull/54517) | load-critical for split-projection checkpoints: carries the `ple.key_proj`/`ple.value_proj` → merged `kv_proj` stacked-params remap, without which halt95-class checkpoints fail with `no module or parameter named layers.1.ple.key_proj`; also fuses the PLE kernels | upstream, composed via the cohort sync below |
 
 Hand-adaptations forced by intermediate-commit drift (the deltas vs the
@@ -98,10 +99,11 @@ intermediate-commit drift; the flashnext chain's adaptations are the
 bullets above, since its picks keep their upstream messages. Patches
 here exist to be deleted — the
 permanent fixes are the fork-local ones until upstream takes them.
-The flashnext chain is six upstream cherry-picks, one graft, and one
-cohort sync, so that branch deletes wholesale at the first final
-release the fork rebases onto that contains #54371 and #54517 (both
-already in v0.29.1rc0).
+The flashnext chain is six upstream cherry-picks, one graft, one cohort
+sync, and one fork-local offloading fix (which persists until upstream
+grows its own exclusion knob); the upstream part deletes wholesale at
+the first final release the fork rebases onto that contains #54371 and
+#54517 (both already in v0.29.1rc0).
 
 ---
 
