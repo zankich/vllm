@@ -1099,6 +1099,15 @@ class OffloadingConnectorScheduler:
                 block.block_id for block in group_blocks if block.block_id != 0
             )
 
+            if not group_config.participates:
+                # Excluded group: sparse engine allocation (indexer
+                # raw_key_cache) is not cdiv(tokens, block)-dense and no
+                # offload keys exist. Load nothing for it, but keep the
+                # per-group geometry aligned.
+                group_sizes.append(0)
+                block_indices.append(0)
+                continue
+
             tokens_per_block = group_config.tokens_per_block
             tokens_per_chunk = group_config.tokens_per_chunk
             offload_keys = group_state.offload_keys
