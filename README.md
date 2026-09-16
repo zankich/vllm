@@ -36,8 +36,10 @@ git log <upstream-tag>..HEAD --stat    # full delta of the last-upstream-tag
 
 ## Patch set on `v0.29.0-qwen-flashnext`
 
-`v0.29.0-qwen` plus seven upstream commits cherry-picked from main,
-backporting PLE UVA offload (#54371) so Qwen3.8-Flash-Next can serve
+`v0.29.0-qwen` plus the PLE-UVA backport: six upstream commits
+cherry-picked from main and a qwen4_exp cohort sync from upstream
+`c69d5d72a6` that composes #54517 with #54371's split, so
+Qwen3.8-Flash-Next can serve
 with MTP and KV offload on the fork base, where hybrid+MTP+offload is
 proven on the 27B stack. Upstream's current line cannot boot this
 model with the OffloadingConnector at all — hybrid block-size assert,
@@ -57,14 +59,22 @@ against `v0.29.0-qwen`.
 | [`[Qwen3.8-Flash-Next] Support FP8 indexer cache for QSA` (#54890)](https://github.com/vllm-project/vllm/pull/54890) | FP8 cache for the QSA indexer; adds `nvidia/ops/qsa_indexer.py` | upstream, cherry-picked from main |
 | [`Fix block FP8 MTP in ModelOpt mixed checkpoints` (#55513)](https://github.com/vllm-project/vllm/pull/55513) | routes block-FP8 routed experts to `Fp8MoEMethod` so FP8 MTP weights in ModelOpt mixed checkpoints load; hand-adapted, see below | upstream, cherry-picked from main, hand-adapted |
 | [`[Qwen4Exp] Support UVA PLE-offload and Engram tensor parallelism` (#54371)](https://github.com/vllm-project/vllm/pull/54371) | the payload: the PLE n-gram table moves to `nvidia/ngram_embedding.py`, pinned host-side and read through UVA on a side stream, Engram tensor parallelism (ETP=TP); adds `vllm/config/engram.py` | upstream, cherry-picked from main |
-| [`[Qwen3.8-Flash-Next] Fuse Qwen4Exp PLE kernels` (#54517)](https://github.com/vllm-project/vllm/pull/54517) | fuses the n-gram table gather and PLE conv into the PLE layer's own kernels with FP8 weight support; `ple_layer.py` re-absorbs the embedding machinery | upstream, cherry-picked from main after the payload |
+| [`[Qwen3.8-Flash-Next] Fuse Qwen4Exp PLE kernels` (#54517)](https://github.com/vllm-project/vllm/pull/54517) | load-critical for split-projection checkpoints: carries the `ple.key_proj`/`ple.value_proj` → merged `kv_proj` stacked-params remap, without which halt95-class checkpoints fail with `no module or parameter named layers.1.ple.key_proj`; also fuses the PLE kernels | upstream, composed via the cohort sync below |
 
 Hand-adaptations forced by intermediate-commit drift (the deltas vs the
 upstream commits as they landed on main):
 
+- the qwen4_exp cohort (`vllm/models/qwen4_exp/`, `tests/models/qwen4_exp/`)
+  is synced byte-identical to upstream `c69d5d72a6`, the tree the reference
+  nightly served with, rather than hunk-surgery: #54517 (`f870b92976`)
+  predates #54371's split, so picking it after the payload cannot compose
+  whole-file (an earlier such pick, `af3e055369`, regressed the split and
+  disconnected the ple-int4 plugin; superseded by the sync commit).
+  `short_conv_attn.py` takes only #54517's own hunk, and
+  `ngram_embedding.py` hashes to the ple-int4 plugin pin (`f3aaf292`);
 - picked in true ancestry order (`28e605fb33` `199cb9b964` `d9105ea800`
   `94e26dd3dd` `60ad959b6f`), after which #54371 applied with no
-  conflicts; #54517 (`f870b92976`) landed after the payload;
+  conflicts;
 - conflicts in the qwen4_exp cohort resolved whole-file to the incoming
   side, because the v0.29.0-era context cannot merge hunk-wise: the
   `mutates_args` `output`→`residual_output` rename in `ple_layer.py`
@@ -75,9 +85,9 @@ upstream commits as they landed on main):
   `Fp8Config` build with group-size validation, `has_blocked_weights`
   (which did not exist on this base), and the `Fp8MoEMethod`
   routed-experts branch;
-- `nvidia/ops/qsa.py` and `ops/hc.py` stay at their v0.29.0 release
-  state, since no pick touches them; `vllm/config/engram.py` and
-  `nvidia/ngram_embedding.py` are new files.
+- `nvidia/ops/qsa.py` and `ops/hc.py` ride the cohort sync to their
+  upstream states; `vllm/config/engram.py` and `nvidia/ngram_embedding.py`
+  are new files.
 
 ## Rebase policy
 
@@ -88,9 +98,10 @@ intermediate-commit drift; the flashnext chain's adaptations are the
 bullets above, since its picks keep their upstream messages. Patches
 here exist to be deleted — the
 permanent fixes are the fork-local ones until upstream takes them.
-The flashnext chain is pure upstream cherry-picks plus one graft, so
-that branch deletes wholesale at the first final release the fork
-rebases onto that contains #54371 (already in v0.29.1rc0).
+The flashnext chain is six upstream cherry-picks, one graft, and one
+cohort sync, so that branch deletes wholesale at the first final
+release the fork rebases onto that contains #54371 and #54517 (both
+already in v0.29.1rc0).
 
 ---
 
