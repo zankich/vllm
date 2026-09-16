@@ -208,6 +208,10 @@ class SchedulerOffloadConfig(NamedTuple):
         # architectures like DeepSeek V4 (MLA + SWA groups).
         full_attn_tokens_per_chunk: set[int] = set()
         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
+            if not spec.config.groups[idx].layer_names:
+                # Group excluded from offload at config build (misaligned
+                # block vs hash size): no layers, nothing to align.
+                continue
             kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
             sw = get_sliding_window_size_in_chunks(
                 kv_spec, tokens_per_block * spec.blocks_per_chunk
@@ -273,9 +277,14 @@ class SchedulerOffloadConfig(NamedTuple):
         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
             kv_cache_group = kv_cache_config.kv_cache_groups[idx]
             kv_spec = kv_cache_group.kv_cache_spec
-            sw = get_sliding_window_size_in_chunks(
-                kv_spec, tokens_per_block * spec.blocks_per_chunk
-            )
+            if spec.config.groups[idx].layer_names:
+                sw = get_sliding_window_size_in_chunks(
+                    kv_spec, tokens_per_block * spec.blocks_per_chunk
+                )
+            else:
+                # Excluded group (misaligned block vs hash size): no layers
+                # registered, no stores or loads; window size is moot.
+                sw = None
             kv_group_configs_list.append(
                 GroupOffloadConfig(
                     group_idx=idx,
@@ -299,11 +308,18 @@ class SchedulerOffloadConfig(NamedTuple):
                 )
             )
         kv_group_configs = tuple(kv_group_configs_list)
-        group_block_sizes = {config.tokens_per_block for config in kv_group_configs}
+        # Uniformity and tail support are properties of the groups that
+        # actually offload; excluded groups sit at their own block size.
+        participating = [
+            config
+            for config in kv_group_configs
+            if spec.config.groups[config.group_idx].layer_names
+        ]
+        group_block_sizes = {config.tokens_per_block for config in participating}
         has_partial_recurrent_group = any(
             config.requires_cow_source
             and config.tokens_per_block > spec.tokens_per_hash
-            for config in kv_group_configs
+            for config in participating
         )
         # Partial tails currently require one physical block per offload chunk
         # and uniform, non-windowed groups so one boundary identifies every
@@ -315,9 +331,9 @@ class SchedulerOffloadConfig(NamedTuple):
             and all(
                 config.sliding_window_size_in_chunks is None
                 or config.requires_cow_source
-                for config in kv_group_configs
+                for config in participating
             )
-            and not any(config.is_eagle_group for config in kv_group_configs)
+            and not any(config.is_eagle_group for config in participating)
             and vllm_config.parallel_config.decode_context_parallel_size == 1
         )
 

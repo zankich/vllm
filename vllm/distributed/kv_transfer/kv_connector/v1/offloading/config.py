@@ -58,28 +58,37 @@ def build_offloading_config(
     )
 
     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
-    # Hybrid + MTP: the drafter attention forms its own group whose smaller
-    # block (e.g. 8) need not divide the cross-group hash size (e.g. 800).
-    # Such groups stay GPU-resident instead of aborting the boot; drafter KV
-    # is request-lifetime, so excluding it from offload loses nothing.
-    offloadable = tuple(
-        group for group in groups if group.tokens_per_block % tokens_per_hash == 0
-    )
-    excluded = [group for group in groups if group.tokens_per_block % tokens_per_hash]
-    if excluded:
-        logger.warning(
-            "offloading: %d group(s) with tokens_per_block not divisible by "
-            "tokens_per_hash=%d stay GPU-resident: %s",
-            len(excluded),
-            tokens_per_hash,
-            [group.layer_names[0] for group in excluded],
-        )
-    if not offloadable:
+    # Hybrid + MTP: a group whose tokens_per_block does not divide the
+    # cross-group hash size (e.g. the QSA indexer's raw_key_cache at 8 vs
+    # 800) cannot be chunk-hashed for offload. The worker spec and the
+    # scheduler index groups in parallel, so the entry must stay in the
+    # tuple; strip its layers instead. Such a group registers nothing on
+    # the worker, never stores or loads, and its KV stays GPU-resident.
+    aligned_groups = []
+    for group in groups:
+        if group.tokens_per_block % tokens_per_hash == 0:
+            aligned_groups.append(group)
+        else:
+            logger.warning(
+                "offloading: group %s has tokens_per_block=%d not divisible "
+                "by tokens_per_hash=%d; keeping it GPU-resident, no layers "
+                "registered for offload",
+                group.layer_names[0],
+                group.tokens_per_block,
+                tokens_per_hash,
+            )
+            aligned_groups.append(
+                OffloadingGroupConfig(
+                    tokens_per_block=group.tokens_per_block,
+                    layer_names=(),
+                )
+            )
+    if not any(group.layer_names for group in aligned_groups):
         raise ValueError(
             f"no KV cache group has tokens_per_block divisible by "
             f"tokens_per_hash={tokens_per_hash}; offloading cannot proceed"
         )
-    groups = offloadable
+    groups = tuple(aligned_groups)
 
     blocks_per_chunk = 1
     blocks_per_chunk_config = extra_config.get("blocks_per_chunk")
