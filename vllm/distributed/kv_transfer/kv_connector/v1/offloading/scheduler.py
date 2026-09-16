@@ -1436,6 +1436,10 @@ class OffloadingConnectorScheduler:
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
+                if not group_config.participates:
+                    # Excluded group: no keys exist, but its block ids are
+                    # still allocated; storing nothing is the contract.
+                    continue
                 num_chunks = req_status.storable_chunks(
                     group_config, group_state, num_offloadable_tokens
                 )
