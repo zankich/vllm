@@ -50,10 +50,16 @@ def triton_scalar_specialization_rep(value: int) -> int:
 
 @dataclass(frozen=True)
 class TritonWarmupTensor:
-    # Compile-only tensor descriptor for Triton pointer specialization.
+    """Compile-only tensor metadata used by Triton warmup.
+
+    ``strides=None`` represents compact row-major storage. Pass explicit strides
+    whenever the runtime tensor can be padded, transposed, or otherwise strided.
+    """
+
     dtype: Any
     aligned: bool = True
     shape: tuple[int, ...] = (1,)
+    strides: tuple[int, ...] | None = None
 
     def data_ptr(self) -> int:
         return 0 if self.aligned else 1
@@ -61,13 +67,17 @@ class TritonWarmupTensor:
     def ptr_range(self) -> int:
         return 0
 
-    def stride(self) -> tuple[int, ...]:
-        strides: list[int] = []
-        stride = 1
-        for size in reversed(self.shape):
-            strides.append(stride)
-            stride *= size
-        return tuple(reversed(strides))
+    def stride(self, dim: int | None = None) -> int | tuple[int, ...]:
+        if self.strides is None:
+            strides: list[int] = []
+            stride = 1
+            for size in reversed(self.shape):
+                strides.append(stride)
+                stride *= size
+            result = tuple(reversed(strides))
+        else:
+            result = self.strides
+        return result if dim is None else result[dim]
 
 
 @dataclass(frozen=True)
