@@ -2,9 +2,12 @@
 <!-- fork-preamble-start -->
 # zankich/vllm — fork of vllm-project/vllm
 
-Production fork for a Qwen3.8-27B mamba-hybrid stack (TP2, MTP
+Production fork for Qwen3.8 serving: the 27B mamba-hybrid stack (TP2, MTP
 speculative decoding, prefix caching, fp8 KV, CPU + disk KV-offload
-tiers shared across two serving instances). Upstream vLLM is excellent;
+tiers across two serving instances, fs tier per instance) on
+`v0.29.0-qwen`, and Flash-Next bring-up (TP4+EP, MTP, the PLE n-gram
+table pinned host-side and read through UVA) on
+`v0.29.0-qwen-flashnext`. Upstream vLLM is excellent;
 this fork exists to carry fixes that had not shipped in a release at
 deploy time. See what this fork changes with:
 
@@ -16,6 +19,7 @@ git log <upstream-tag>..HEAD --stat    # full delta of the last-upstream-tag
 ## Branches
 
 - `v0.29.0-qwen` (default) — current, on the v0.29.0 tag
+- `v0.29.0-qwen-flashnext` — `v0.29.0-qwen` plus the upstream PLE-UVA backport chain for Qwen3.8-Flash-Next (patch table below; serving gates pending)
 - `v0.28.0-qwen` — previous generation, on the v0.28.0 tag
 
 ## Patch set on `v0.29.0-qwen`
@@ -30,13 +34,63 @@ git log <upstream-tag>..HEAD --stat    # full delta of the last-upstream-tag
 | `Reclaim orphaned offload regions` | a SIGKILL'd engine leaks `/dev/shm/vllm_offload_*.mmap`, wedging the next boot on shared `/dev/shm`; sweep at construction reclaims regions whose exclusive flock can be taken (port of upstream [#54124](https://github.com/vllm-project/vllm/pull/54124), closed unmerged) | [upstream PR #54124](https://github.com/vllm-project/vllm/pull/54124), adapted |
 | `Surface per-request spec-decode metrics on the Anthropic messages API` | `--per-request-spec-decode-metrics` stats reach `/v1/chat/completions` upstream but were dropped by the `/v1/messages` converter; both the response and the final `message_delta` stream event now carry the same `metrics.speculative_decoding` field | fork-local |
 
+## Patch set on `v0.29.0-qwen-flashnext`
+
+`v0.29.0-qwen` plus seven upstream commits cherry-picked from main,
+backporting PLE UVA offload (#54371) so Qwen3.8-Flash-Next can serve
+with MTP and KV offload on the fork base, where hybrid+MTP+offload is
+proven on the 27B stack. Upstream's current line cannot boot this
+model with the OffloadingConnector at all — hybrid block-size assert,
+MTP+offload CUDA failure, CPU-tier shm size mismatch — which is why
+#54371 was ported here rather than serving the nightly. The in-tree
+PLE formats are BF16 and FP8 only, and the FP8 table pins ~48 GiB of
+host RAM, so memory-constrained hosts need the int4 PLE plugin from
+this repo's `ple-int4/` (`vllm.general_plugins` entry point).
+above is inherited bit-identical: the six fork-patched files are 0-diff
+against `v0.29.0-qwen`.
+
+| commit | what it does | origin |
+|---|---|---|
+| [`[Bugfix][Qwen4Exp] ... state index strides in fused PLE conv` (#55375)](https://github.com/vllm-project/vllm/pull/55375) | fixes state index strides in the fused PLE convolution; brings in the new `nvidia/ops/ple.py` split module | upstream, cherry-picked from main |
+| [`[Kernel] Remove unused fake implementation` (#55535)](https://github.com/vllm-project/vllm/pull/55535) | drops unused fake (meta) implementations across the ops wrappers, helion kernels, and qwen4_exp layers | upstream, cherry-picked from main |
+| [`[Qwen3.8-Flash-Next] Remove torch.compile for NVIDIA implementation` (#55272)](https://github.com/vllm-project/vllm/pull/55272) | removes torch.compile from the NVIDIA model path; reshapes `model.py`/`ple_layer.py` to the state #54371's split applies against | upstream, cherry-picked from main |
+| [`[Qwen3.8-Flash-Next] Support FP8 indexer cache for QSA` (#54890)](https://github.com/vllm-project/vllm/pull/54890) | FP8 cache for the QSA indexer; adds `nvidia/ops/qsa_indexer.py` | upstream, cherry-picked from main |
+| [`Fix block FP8 MTP in ModelOpt mixed checkpoints` (#55513)](https://github.com/vllm-project/vllm/pull/55513) | routes block-FP8 routed experts to `Fp8MoEMethod` so FP8 MTP weights in ModelOpt mixed checkpoints load; hand-adapted, see below | upstream, cherry-picked from main, hand-adapted |
+| [`[Qwen4Exp] Support UVA PLE-offload and Engram tensor parallelism` (#54371)](https://github.com/vllm-project/vllm/pull/54371) | the payload: the PLE n-gram table moves to `nvidia/ngram_embedding.py`, pinned host-side and read through UVA on a side stream, Engram tensor parallelism (ETP=TP); adds `vllm/config/engram.py` | upstream, cherry-picked from main |
+| [`[Qwen3.8-Flash-Next] Fuse Qwen4Exp PLE kernels` (#54517)](https://github.com/vllm-project/vllm/pull/54517) | fuses the n-gram table gather and PLE conv into the PLE layer's own kernels with FP8 weight support; `ple_layer.py` re-absorbs the embedding machinery | upstream, cherry-picked from main after the payload |
+
+Hand-adaptations forced by intermediate-commit drift (the deltas vs the
+upstream commits as they landed on main):
+
+- picked in true ancestry order (`28e605fb33` `199cb9b964` `d9105ea800`
+  `94e26dd3dd` `60ad959b6f`), after which #54371 applied with no
+  conflicts; #54517 (`f870b92976`) landed after the payload;
+- conflicts in the qwen4_exp cohort resolved whole-file to the incoming
+  side, because the v0.29.0-era context cannot merge hunk-wise: the
+  `mutates_args` `output`→`residual_output` rename in `ple_layer.py`
+  would otherwise pair a fork signature with an upstream registration;
+- `modelopt.py` in #55513 keeps the fork's flat `QUANT_ALGOS`; main's
+  `LINEAR_ALGOS` restructure, from an unpicked intermediate commit, was
+  not taken. Only the fix is grafted: `_BLOCK_FP8_MOE_ALGOS`, the
+  `Fp8Config` build with group-size validation, `has_blocked_weights`
+  (which did not exist on this base), and the `Fp8MoEMethod`
+  routed-experts branch;
+- `nvidia/ops/qsa.py` and `ops/hc.py` stay at their v0.29.0 release
+  state, since no pick touches them; `vllm/config/engram.py` and
+  `nvidia/ngram_embedding.py` are new files.
+
 ## Rebase policy
 
 Each upstream release: check which patches upstream has absorbed
 (`git merge-base --is-ancestor <upstream-sha> <tag>`), re-port the rest.
 The commit messages record every hand-adaptation forced by
-intermediate-commit drift. Patches here exist to be deleted — the
+intermediate-commit drift; the flashnext chain's adaptations are the
+bullets above, since its picks keep their upstream messages. Patches
+here exist to be deleted — the
 permanent fixes are the fork-local ones until upstream takes them.
+The flashnext chain is pure upstream cherry-picks plus one graft, so
+that branch deletes wholesale at the first final release the fork
+rebases onto that contains #54371 (already in v0.29.1rc0).
 
 ---
 
