@@ -126,6 +126,63 @@ class GroupOffloadConfig(NamedTuple):
         return window
 
 
+def restore_accounting_summary(
+    req_id: str,
+    num_prompt_tokens: int,
+    num_locally_computed: int,
+    num_external: int,
+    keys_loaded: int,
+    group_tokens_per_chunk: int,
+) -> tuple[str, list[str]]:
+    """Fork-local restore-accounting instrumentation (2026-09-17).
+
+    One log line per offload restore carrying the restore-assembly
+    arithmetic, plus loud violations when the assembly
+    over-claims, misaligns, or under-covers — the byte-faithful tiers
+    cannot catch a wrong SET of correctly-hashed blocks, but these
+    invariants can.
+    """
+    boundary = num_locally_computed + num_external
+    violations: list[str] = []
+    if num_external == 0:
+        return (
+            f"restore-accounting req={req_id} prompt={num_prompt_tokens} "
+            f"local={num_locally_computed} ext=0 skipped",
+            violations,
+        )
+    if boundary > num_prompt_tokens:
+        violations.append(
+            f"boundary exceeds prompt: {boundary} > {num_prompt_tokens}"
+        )
+    if (
+        group_tokens_per_chunk > 0
+        and keys_loaded * group_tokens_per_chunk < num_external
+    ):
+        violations.append(
+            f"keys cannot cover ext: {keys_loaded} x "
+            f"{group_tokens_per_chunk} < {num_external}"
+        )
+    line = (
+        f"restore-accounting req={req_id} prompt={num_prompt_tokens} "
+        f"local={num_locally_computed} ext={num_external} "
+        f"boundary={boundary} keys={keys_loaded} "
+        f"chunk={group_tokens_per_chunk}"
+    )
+    return line, violations
+
+
+def _group_participates(spec: Any, idx: int) -> bool:
+    """Whether offloading group *idx* carries layers (False = excluded at
+    config build). Defensive on spec shape: the exclusion machinery reads
+    the spec's config only when present, so spec doubles without one
+    (unit fixtures) keep the legacy all-participating contract."""
+    config = getattr(spec, "config", None)
+    groups = getattr(config, "groups", None) if config is not None else None
+    if groups is not None and idx < len(groups):
+        return bool(getattr(groups[idx], "layer_names", None))
+    return True
+
+
 def get_sliding_window_size_in_chunks(
     kv_cache_spec: KVCacheSpec, tokens_per_chunk: int
 ) -> int | None:
@@ -211,7 +268,7 @@ class SchedulerOffloadConfig(NamedTuple):
         # architectures like DeepSeek V4 (MLA + SWA groups).
         full_attn_tokens_per_chunk: set[int] = set()
         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
-            if not spec.config.groups[idx].layer_names:
+            if not _group_participates(spec, idx):
                 # Group excluded from offload at config build (misaligned
                 # block vs hash size): no layers, nothing to align.
                 continue
@@ -280,7 +337,7 @@ class SchedulerOffloadConfig(NamedTuple):
         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
             kv_cache_group = kv_cache_config.kv_cache_groups[idx]
             kv_spec = kv_cache_group.kv_cache_spec
-            if spec.config.groups[idx].layer_names:
+            if _group_participates(spec, idx):
                 sw = get_sliding_window_size_in_chunks(
                     kv_spec, tokens_per_block * spec.blocks_per_chunk
                 )
@@ -304,7 +361,7 @@ class SchedulerOffloadConfig(NamedTuple):
                     ),
                     kv_event_group_spec=get_offloading_event_group_spec(kv_cache_group),
                     is_eagle_group=idx in eagle_groups,
-                    participates=bool(spec.config.groups[idx].layer_names),
+                    participates=_group_participates(spec, idx),
                     requires_cow_source=(
                         isinstance(kv_spec, MambaSpec)
                         and kv_spec.mamba_cache_mode == "align"
@@ -1172,6 +1229,25 @@ class OffloadingConnectorScheduler:
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
+
+        # Fork-local instrumentation: the assembly arithmetic, one line per
+        # restore (restore-shape correlation fields) with loud invariant checks.
+        line, violations = restore_accounting_summary(
+            req_id=request.request_id,
+            num_prompt_tokens=request.num_prompt_tokens,
+            num_locally_computed=num_locally_computed_tokens,
+            num_external=num_external_tokens,
+            keys_loaded=len(keys_to_load),
+            group_tokens_per_chunk=self.config.kv_group_configs[0].tokens_per_chunk,
+        )
+        logger.info(line)
+        for violation in violations:
+            logger.error(
+                "restore-accounting VIOLATION req=%s: %s "
+                "(corruption-class assembly error candidate — capture this request)",
+                request.request_id,
+                violation,
+            )
 
         load_job_id = self._generate_job_id()
         self._current_batch_load_jobs[load_job_id] = TransferJob(
