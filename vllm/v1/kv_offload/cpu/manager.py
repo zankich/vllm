@@ -3,6 +3,8 @@
 from collections import OrderedDict
 from collections.abc import Collection, Iterable
 
+import logging
+
 from typing_extensions import override
 
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
@@ -26,6 +28,8 @@ from vllm.v1.kv_offload.cpu.common import (
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
 
+logger = logging.getLogger(__name__)
+
 
 class CPUOffloadingManager(OffloadingManager):
     """
@@ -47,6 +51,7 @@ class CPUOffloadingManager(OffloadingManager):
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
+        kv_memoryview: memoryview | None = None,
     ):
         self.medium: Medium = Medium.CPU
         self._num_blocks: int = num_blocks
@@ -62,6 +67,21 @@ class CPUOffloadingManager(OffloadingManager):
         # Track blocks with an in-flight store (ref_cnt -1, not yet completed).
         self._num_write_pending_blocks: int = 0
 
+        # Fork-local integrity (2026-09-17): with a view of the shm tier's
+        # bytes, every completed store records sha256(key, slot) and every
+        # lookup re-verifies; post-recording corruption answers MISS and the
+        # block is evicted instead of serving wrong bytes silently. None
+        # disables checking entirely (unit construction, legacy behavior).
+        # Corruption between the GPU->CPU copy and the recording lands
+        # recorded-torn and is not detectable here — same store-time limit
+        # as the fs tier's sidecar carrier.
+        self._kv_bytes: memoryview | None = (
+            kv_memoryview.cast("B") if kv_memoryview is not None else None
+        )
+        self._integrity: dict[OffloadKey, bytes] | None = (
+            {} if self._kv_bytes is not None else None
+        )
+
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
         self.stores_skipped_in_current_batch: int = 0
@@ -71,6 +91,34 @@ class CPUOffloadingManager(OffloadingManager):
         self.counts: OrderedDict[OffloadKey, int] | None = (
             OrderedDict() if store_threshold >= 2 else None
         )
+
+    def _slot_checksum(self, key: OffloadKey, block_id: int) -> bytes:
+        from vllm.v1.kv_offload.tiering.fs.integrity import block_checksum
+
+        size = len(self._kv_bytes) // self._num_blocks
+        slot = self._kv_bytes[block_id * size : (block_id + 1) * size]
+        return block_checksum(key, slot)
+
+    def _reject_corrupt_block(self, key: OffloadKey, block: BlockStatus) -> None:
+        """Evict a block whose bytes no longer match its recorded checksum."""
+        logger.warning(
+            "CPU offload tier: slot %d for key %.16s failed its integrity "
+            "check; evicting and answering MISS (corruption class: "
+            "post-store clobber, aliasing, or torn writers)",
+            block.block_id,
+            key,
+        )
+        # The block was ready and unreferenced (callers gate on ref_cnt),
+        # so it is counted as evictable.
+        self._num_evictable_cache_blocks -= 1
+        assert self._num_evictable_cache_blocks >= 0
+        self._policy.remove(key)
+        self._free_block(block)
+        self._integrity.pop(key, None)
+        if self.events is not None:
+            self.events.append(
+                OffloadingEvent(keys=[key], medium=self.medium, removed=True)
+            )
 
     # --- block pool ---
 
@@ -127,6 +175,32 @@ class CPUOffloadingManager(OffloadingManager):
             return LookupResult.MISS
         if not block.is_ready:
             return LookupResult.HIT_PENDING
+        if self._integrity is not None and block.ref_cnt == 0:
+            # Verify each key once per request: the scheduler thread hashes
+            # the slot on the request's first lookup of the key and trusts
+            # the verdict for the request's lifetime. Unmitigated, a
+            # restore-heavy request re-hashing 10k+ MB-scale slots per step
+            # would dominate TTFT.
+            verified: set[OffloadKey] | None = getattr(
+                req_context, "_integrity_verified", None
+            )
+            if verified is None:
+                verified = set()
+                req_context._integrity_verified = verified  # type: ignore[attr-defined]
+            if key not in verified:
+                recorded = self._integrity.get(key)
+                if (
+                    recorded is None
+                    or self._slot_checksum(key, block.block_id) != recorded
+                ):
+                    # Never serve silently-wrong bytes: the corrupt block
+                    # leaves the cache and the caller recomputes. Blocks
+                    # referenced by an in-flight load (ref_cnt > 0) are left
+                    # alone here; the copy already in flight completes, and
+                    # the next request's first lookup rejects.
+                    self._reject_corrupt_block(key, block)
+                    return LookupResult.MISS
+                verified.add(key)
         return LookupResult.HIT
 
     @override
@@ -212,6 +286,8 @@ class CPUOffloadingManager(OffloadingManager):
             for key, block in evicted:
                 self._free_block(block)
                 to_evict.append(key)
+                if self._integrity is not None:
+                    self._integrity.pop(key, None)
 
         if to_evict and self.events is not None:
             self.events.append(
@@ -258,6 +334,8 @@ class CPUOffloadingManager(OffloadingManager):
                     self._num_evictable_cache_blocks += 1
                     self._policy.mark_evictable(key)
                     stored_keys.append(key)
+                    if self._integrity is not None:
+                        self._integrity[key] = self._slot_checksum(key, block.block_id)
         else:
             for key in keys:
                 block = self._policy.get(key)
@@ -285,6 +363,8 @@ class CPUOffloadingManager(OffloadingManager):
         self._policy.clear()
         self._num_evictable_cache_blocks = 0
         self._num_write_pending_blocks = 0
+        if self._integrity is not None:
+            self._integrity.clear()
 
         self._free_list.clear()
         self._num_allocated_blocks = 0

@@ -42,6 +42,7 @@ def make_cpu_manager(
     enable_events: bool = False,
     store_threshold: int = 0,
     max_tracker_size: int = 64_000,
+    kv_memoryview: memoryview | None = None,
 ) -> CPUOffloadingManager:
     return CPUOffloadingManager(
         num_blocks=num_blocks,
@@ -50,6 +51,7 @@ def make_cpu_manager(
         enable_events=enable_events,
         store_threshold=store_threshold,
         max_tracker_size=max_tracker_size,
+        kv_memoryview=kv_memoryview,
     )
 
 
@@ -1079,3 +1081,125 @@ def test_touch_forwards_req_context_to_policy(monkeypatch):
     assert len(received) == 1
     assert received[0][0] == keys
     assert received[0][1] is ctx
+
+
+# ---------------------------------------------------------------------------
+# Integrity: the CPU shm tier must not serve silently-wrong bytes.
+# Fork-local (2026-09-17): a corruption recurrence —
+# fs exonerated by construction (checksummed), CPU shm is the only
+# silently-wrong-capable tier in the cascade. Same KVMI treatment as the
+# fs tier, in-memory carrier (the CPU tier has no cross-restart reuse):
+# hash at store completion, verify at lookup, mismatch = MISS + evict.
+# ---------------------------------------------------------------------------
+
+
+def _make_integrity_buffer(num_blocks: int = 4, block_size: int = 64):
+    """A numpy-backed kv view the test can tamper with, plus helpers."""
+    import numpy as np
+
+    buf = np.zeros(num_blocks * block_size, dtype=np.uint8)
+    view = memoryview(buf)
+
+    def write_slot(block_id: int, key: int) -> None:
+        view[block_id * block_size : (block_id + 1) * block_size] = bytes(
+            ([(key + block_id) % 251] * 3 + [0x41]) * (block_size // 4)
+        )
+
+    def tamper_slot(block_id: int) -> None:
+        view[block_id * block_size] ^= 0xFF
+
+    return view, write_slot, tamper_slot
+
+
+def _store_and_complete(manager, keys, ctx, write_slot):
+    out = manager.prepare_store(keys, ctx)
+    assert out is not None
+    for key, block in zip(out.keys_to_store, out.store_spec.block_ids):
+        write_slot(int(block), int.from_bytes(key[:4], "big") % 1000)
+    manager.complete_store(out.keys_to_store, ctx)
+
+
+def test_lookup_miss_and_evict_when_slot_corrupt_after_store():
+    """The 19:00Z shape: stored clean, bytes clobbered later (aliasing,
+    torn writes, pinning-failure class). A later request's lookup must
+    answer MISS, not HIT, and the corrupt block must leave the cache."""
+    view, write_slot, tamper_slot = _make_integrity_buffer()
+    manager = make_cpu_manager(num_blocks=4, kv_memoryview=view)
+    _store_and_complete(manager, to_keys([1, 2]), _EMPTY_REQ_CTX, write_slot)
+
+    assert (
+        manager.lookup(to_key(1), make_req_context(req_id="first")) is LookupResult.HIT
+    )
+
+    # Corrupt block 0's bytes behind the manager's back.
+    tamper_slot(0)
+
+    assert (
+        manager.lookup(to_key(1), make_req_context(req_id="second"))
+        is LookupResult.MISS
+    )
+    # Evicted: a subsequent store reuses the freed slot without error.
+    _store_and_complete(manager, to_keys([3]), _EMPTY_REQ_CTX, write_slot)
+    assert (
+        manager.lookup(to_key(3), make_req_context(req_id="third")) is LookupResult.HIT
+    )
+
+
+def test_integrity_rejection_emits_removal_event():
+    """A rejected block must announce its death (removed=True event) so
+    event consumers learn the key is gone, mirroring eviction semantics.
+
+    Known carrier limit, deliberately not tested as detection: corruption
+    BETWEEN the GPU->CPU copy and the store-time recording lands recorded
+    — the checksum anchors truth at complete_store, same as the fs tier's
+    store-time limit. Post-recording corruption is the detectable class.
+    """
+    view, write_slot, tamper_slot = _make_integrity_buffer()
+    manager = make_cpu_manager(
+        num_blocks=4, enable_events=True, kv_memoryview=view
+    )
+    _store_and_complete(manager, to_keys([1, 2]), _EMPTY_REQ_CTX, write_slot)
+    list(manager.take_events())
+
+    tamper_slot(0)
+    assert (
+        manager.lookup(to_key(1), make_req_context(req_id="detects")) is LookupResult.MISS
+    )
+
+    events = list(manager.take_events())
+    assert len(events) == 1
+    assert events[0].removed is True
+    assert set(events[0].keys) == set(to_keys([1]))
+
+
+def test_integrity_silent_without_memoryview():
+    """No view injected (unit construction, or integrity off): behavior is
+    exactly the legacy contract — corruption is not detectable and lookup
+    still answers HIT. This is what every pre-existing test runs with."""
+    manager = make_cpu_manager(num_blocks=4)
+    out = manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
+    assert out is not None
+    manager.complete_store(out.keys_to_store, _EMPTY_REQ_CTX)
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.HIT
+
+
+def test_integrity_verification_once_per_request_context():
+    """Scheduler-thread cost bound: a request verifies each key's bytes on
+    its first lookup and trusts that verdict for the request's lifetime;
+    a different request re-verifies. Intra-request corruption after the
+    first lookup is answered HIT by design (the request's own generation
+    would already carry any such corruption); cross-request corruption
+    is caught by the next request's first lookup."""
+    view, write_slot, tamper_slot = _make_integrity_buffer()
+    manager = make_cpu_manager(num_blocks=4, kv_memoryview=view)
+    _store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
+
+    ctx_a = make_req_context(req_id="req-a")
+    ctx_b = make_req_context(req_id="req-b")
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+
+    tamper_slot(0)
+    # Same request: cached verdict, still HIT (documented design limit).
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+    # New request: re-verified, rejected, MISS.
+    assert manager.lookup(to_key(1), ctx_b) is LookupResult.MISS

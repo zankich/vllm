@@ -116,6 +116,11 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         self.complete_write = self.complete_store
 
         self._kv_memoryview = mmap_region.create_kv_memoryview()
+        # Fork-local integrity: arm the inherited slot-checksum verification
+        # with the region view (the plain CPUOffloadingSpec path stays
+        # unarmed unless it passes a view itself).
+        self._kv_bytes = self._kv_memoryview.cast("B")
+        self._integrity = {}
 
     def get_kv_memoryview(self) -> memoryview:
         """Return the memoryview over the primary tier's KV cache buffer.
