@@ -969,3 +969,134 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         assert torch.allclose(reader_tensor[1], expected)
     finally:
         reader.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Integrity: silently-wrong tier content must degrade to a clean miss.
+# Fork-local (2026-09-17): the corruption RCA showed full-length but
+# wrong-for-key block bytes restoring without any error. Every test below
+# corrupts stored content in a way today's load path cannot see; each load
+# must fail, remove the bad file, and flip the cached verdict to MISS so the
+# scheduler recomputes instead of attending to garbage.
+# ---------------------------------------------------------------------------
+
+_SIDECAR_SUFFIX = ".meta"
+
+
+def _store_blocks(tier, tensor, seeds: list[tuple[int, float]]):
+    """Store one block per (block_id, fill value) and wait for completion."""
+    for block_id, fill in seeds:
+        tensor[block_id] = fill
+    job = make_job(1, [key(i) for i in range(len(seeds))], [b for b, _ in seeds])
+    tier.submit_store(job)
+    assert all(r.success for r in drain(tier))
+
+
+def test_load_rejects_payload_tampered_in_place(fs_tier):
+    """Same-length in-place byte rewrite must fail the load, not serve it."""
+    tier, tensor = fs_tier
+    _store_blocks(tier, tensor, [(0, 0.25)])
+    path = tier.file_mapper.get_file_name(key(0))
+    with open(path, "r+b") as f:
+        f.write(b"\x01" * os.path.getsize(path))
+    ctx = ReqContext(req_id="tamper-req")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    tier.submit_load(make_job(2, [key(0)], [1], is_promotion=True))
+    results = drain(tier)
+    assert not results[0].success, "tampered payload must fail the load"
+    assert not os.path.exists(path), "tampered payload must be removed"
+    assert tier.lookup(key(0), ctx) in (LookupResult.MISS, LookupResult.RETRY)
+
+
+def test_load_rejects_block_written_under_a_different_key(fs_tier):
+    """Index-confusion shape: key(1)'s payload file overwritten with key(2)'s
+    bytes. The integrity record must not verify content against the wrong key."""
+    tier, tensor = fs_tier
+    _store_blocks(tier, tensor, [(0, 0.25), (1, 0.75)])
+    path0 = tier.file_mapper.get_file_name(key(0))
+    path1 = tier.file_mapper.get_file_name(key(1))
+    import shutil
+
+    shutil.copyfile(path1, path0)
+    ctx = ReqContext(req_id="crosskey-req")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    tier.submit_load(make_job(2, [key(0)], [2], is_promotion=True))
+    results = drain(tier)
+    assert not results[0].success, "wrong-for-key payload must fail the load"
+    assert not os.path.exists(path0), "rejected payload must be removed"
+    assert tier.lookup(key(0), ctx) in (LookupResult.MISS, LookupResult.RETRY)
+
+
+def test_load_rejects_transplanted_integrity_record(fs_tier):
+    """Even a fully consistent payload+record pair transplanted from another
+    key must be rejected: the record names its key, and the load is for a
+    different one."""
+    tier, tensor = fs_tier
+    _store_blocks(tier, tensor, [(0, 0.25), (1, 0.75)])
+    path0 = tier.file_mapper.get_file_name(key(0))
+    path1 = tier.file_mapper.get_file_name(key(1))
+    import shutil
+
+    shutil.copyfile(path1, path0)
+    shutil.copyfile(path1 + _SIDECAR_SUFFIX, path0 + _SIDECAR_SUFFIX)
+    ctx = ReqContext(req_id="transplant-req")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    tier.submit_load(make_job(2, [key(0)], [2], is_promotion=True))
+    results = drain(tier)
+    assert not results[0].success, "transplanted record must fail the load"
+    assert not os.path.exists(path0), "rejected payload must be removed"
+
+
+def test_load_without_integrity_record_is_a_miss(fs_tier):
+    """A payload with no integrity record (legacy or tampered) cannot be
+    verified, so it must not be trusted: fail, remove, recompute."""
+    tier, tensor = fs_tier
+    _store_blocks(tier, tensor, [(0, 0.25)])
+    path = tier.file_mapper.get_file_name(key(0))
+    sidecar = path + _SIDECAR_SUFFIX
+    assert os.path.exists(sidecar), "store must write an integrity record"
+    os.remove(sidecar)
+    ctx = ReqContext(req_id="nosidecar-req")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    tier.submit_load(make_job(2, [key(0)], [1], is_promotion=True))
+    results = drain(tier)
+    assert not results[0].success, "unverifiable payload must fail the load"
+    assert not os.path.exists(path), "unverifiable payload must be removed"
+
+
+def test_storage_replaced_under_live_tier_degrades_to_miss(fs_tier):
+    """Wipe the tier contents under a live manager and drop a foreign file at
+    a known path (a live-wipe remediation shape). The load must fail, and
+    the tier must keep working: a fresh store/load roundtrip afterwards
+    succeeds."""
+    tier, tensor = fs_tier
+    _store_blocks(tier, tensor, [(0, 0.25)])
+    path = tier.file_mapper.get_file_name(key(0))
+    import shutil
+
+    for entry in os.listdir(os.path.dirname(path)):
+        full = os.path.join(os.path.dirname(path), entry)
+        if os.path.isfile(full):
+            os.remove(full)
+        else:
+            shutil.rmtree(full)
+    with open(path, "wb") as f:
+        f.write(b"\xff" * (tier._block_size if hasattr(tier, "_block_size") else 4096))
+    ctx = ReqContext(req_id="wipe-req")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    tier.submit_load(make_job(2, [key(0)], [1], is_promotion=True))
+    results = drain(tier)
+    assert not results[0].success, "replaced storage must not be trusted"
+    # Production shape: the request that saw the rejection finishes (dropping
+    # its cached miss verdict), a later request re-probes fresh.
+    tier.on_request_finished(ctx)
+    # The tier remains serviceable: re-store and load clean.
+    tensor[0] = 0.5
+    tier.submit_store(make_job(3, [key(0)], [0]))
+    assert all(r.success for r in drain(tier))
+    assert lookup_and_wait(tier, [key(0)], ctx=ReqContext(req_id="wipe-req2")) == [
+        LookupResult.HIT
+    ]
+    tier.submit_load(make_job(4, [key(0)], [2], is_promotion=True))
+    assert all(r.success for r in drain(tier))
+    assert torch.all(tensor[2] == 0.5)

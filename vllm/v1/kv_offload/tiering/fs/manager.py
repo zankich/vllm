@@ -15,7 +15,6 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
               (hash-based subdirectories to limit directory fan-out)
 """
 
-import functools
 import json
 import os
 from collections.abc import Iterable
@@ -54,6 +53,7 @@ from vllm.v1.kv_offload.tiering.fs.io import (
     batch_store_block,
     probe_o_direct,
 )
+from vllm.v1.kv_offload.tiering.fs import integrity
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
 if TYPE_CHECKING:
@@ -159,6 +159,10 @@ class FileSystemTierManager(SecondaryTierManager):
         # the GIL that read cannot observe the finished job without the prior
         # write, so no extra lock is needed (get_finished is itself lock-free).
         self._load_progress: dict[JobId, int] = {}
+        # Fork-local integrity: payload path -> (st_dev, st_ino) at store time.
+        # A mismatch at load means the tier's storage was replaced under a
+        # live engine; the whole map is ground truth for nothing at that point.
+        self._storage_ids: dict[str, tuple[int, int]] = {}
 
         # Extract block size from primary view
         assert primary_kv_view.strides is not None, (
@@ -219,15 +223,35 @@ class FileSystemTierManager(SecondaryTierManager):
         keys = list(job_metadata.keys)
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = keys
-        task = functools.partial(
-            batch_store_block,
-            [self.file_mapper.get_file_name(key) for key in keys],
-            self._primary_kv_view,
-            [int(bid) * self._block_size for bid in job_metadata.block_ids],
-            self._block_size,
-            self._use_o_direct,
-        )
-        self._pool.enqueue_store(job_metadata.job_id, 1, [task])
+        paths = [self.file_mapper.get_file_name(key) for key in keys]
+        offsets = [int(bid) * self._block_size for bid in job_metadata.block_ids]
+
+        def store_task() -> None:
+            batch_store_block(
+                paths,
+                self._primary_kv_view,
+                offsets,
+                self._block_size,
+                self._use_o_direct,
+            )
+            # Fork-local integrity: record each block's key binding so a later
+            # load can refuse wrong-for-key or tampered bytes instead of
+            # restoring them silently. Writing from the current buffer is safe
+            # even when batch_store_block skipped an existing payload: if the
+            # on-disk bytes differ, the next load fails the checksum, removes
+            # the block, and the following store rewrites it.
+            view_b = self._primary_kv_view.cast("B")
+            for path, key, offset in zip(paths, keys, offsets):
+                integrity.write_sidecar(
+                    path, key, view_b[offset : offset + self._block_size]
+                )
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                self._storage_ids[path] = (st.st_dev, st.st_ino)
+
+        self._pool.enqueue_store(job_metadata.job_id, 1, [store_task])
 
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
@@ -241,6 +265,30 @@ class FileSystemTierManager(SecondaryTierManager):
 
         def load_task() -> None:
             try:
+                # Fork-local integrity pre-checks, before any block is read.
+                # A missing or foreign record, or a payload whose storage
+                # identity changed under a live tier, rejects the whole job
+                # (num_succeeded=0): the request recomputes cold, and no part
+                # of the batch is trusted.
+                for path, key in zip(paths, keys):
+                    record = integrity.read_sidecar(path)
+                    if record is None or record[0] != bytes(key):
+                        integrity.remove_block(path)
+                        raise OSError(
+                            f"integrity record missing or foreign for {path}"
+                        )
+                    try:
+                        st = os.stat(path)
+                    except OSError as exc:
+                        raise OSError(f"payload vanished under load: {path}") from exc
+                    known = self._storage_ids.get(path)
+                    if known is not None and known != (st.st_dev, st.st_ino):
+                        # The storage this tier's in-memory state was built on
+                        # was replaced underneath it; everything the tier
+                        # believes is now suspect.
+                        self._storage_ids.clear()
+                        integrity.remove_block(path)
+                        raise OSError(f"storage identity changed for {path}")
                 batch_load_block(
                     paths,
                     self._primary_kv_view,
@@ -248,6 +296,19 @@ class FileSystemTierManager(SecondaryTierManager):
                     self._block_size,
                     self._use_o_direct,
                 )
+                # Post-check: the bytes just read must match the record.
+                view_b = self._primary_kv_view.cast("B")
+                for path, key, offset in zip(paths, keys, offsets):
+                    record = integrity.read_sidecar(path)
+                    if record is None or not (
+                        record[0] == bytes(key)
+                        and record[1]
+                        == integrity.block_checksum(
+                            key, view_b[offset : offset + self._block_size]
+                        )
+                    ):
+                        integrity.remove_block(path)
+                        raise OSError(f"integrity checksum mismatch for {path}")
             except OSError as exc:
                 # Runs on the pool worker thread. Record how many blocks loaded
                 # before the failure so get_finished_jobs can keep them; this
