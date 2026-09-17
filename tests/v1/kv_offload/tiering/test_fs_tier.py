@@ -980,7 +980,8 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
 # scheduler recomputes instead of attending to garbage.
 # ---------------------------------------------------------------------------
 
-_SIDECAR_SUFFIX = ".meta"
+_SIDECAR_SUFFIX = ".meta"  # legacy carrier, kept for the orphan-inertness test
+_XATTR = "user.vllm_kv_integrity"
 
 
 def _store_blocks(tier, tensor, seeds: list[tuple[int, float]]):
@@ -990,6 +991,13 @@ def _store_blocks(tier, tensor, seeds: list[tuple[int, float]]):
     job = make_job(1, [key(i) for i in range(len(seeds))], [b for b, _ in seeds])
     tier.submit_store(job)
     assert all(r.success for r in drain(tier))
+
+
+def _strip_record(path: str) -> None:
+    import contextlib
+
+    with contextlib.suppress(OSError):
+        os.removexattr(path, _XATTR)
 
 
 def test_load_rejects_payload_tampered_in_place(fs_tier):
@@ -1031,6 +1039,8 @@ def test_load_rejects_transplanted_integrity_record(fs_tier):
     """Even a fully consistent payload+record pair transplanted from another
     key must be rejected: the record names its key, and the load is for a
     different one."""
+    import struct
+
     tier, tensor = fs_tier
     _store_blocks(tier, tensor, [(0, 0.25), (1, 0.75)])
     path0 = tier.file_mapper.get_file_name(key(0))
@@ -1038,7 +1048,11 @@ def test_load_rejects_transplanted_integrity_record(fs_tier):
     import shutil
 
     shutil.copyfile(path1, path0)
-    shutil.copyfile(path1 + _SIDECAR_SUFFIX, path0 + _SIDECAR_SUFFIX)
+    # Hand-pack a format-correct record naming key(1) and plant it on key(0)'s
+    # payload; the checksum field is irrelevant to the key-binding rejection.
+    k1 = bytes(key(1))
+    record = struct.pack("<4sBH16s", b"KVMI", 1, len(k1), b"\x00" * 16) + k1
+    os.setxattr(path0, _XATTR, record)
     ctx = ReqContext(req_id="transplant-req")
     assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
     tier.submit_load(make_job(2, [key(0)], [2], is_promotion=True))
@@ -1048,20 +1062,65 @@ def test_load_rejects_transplanted_integrity_record(fs_tier):
 
 
 def test_load_without_integrity_record_is_a_miss(fs_tier):
-    """A payload with no integrity record (legacy or tampered) cannot be
+    """A payload whose record is stripped (legacy or tampered) cannot be
     verified, so it must not be trusted: fail, remove, recompute."""
     tier, tensor = fs_tier
     _store_blocks(tier, tensor, [(0, 0.25)])
     path = tier.file_mapper.get_file_name(key(0))
-    sidecar = path + _SIDECAR_SUFFIX
-    assert os.path.exists(sidecar), "store must write an integrity record"
-    os.remove(sidecar)
+    assert _has_record(path), "store must write an integrity record xattr"
+    _strip_record(path)
     ctx = ReqContext(req_id="nosidecar-req")
     assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
     tier.submit_load(make_job(2, [key(0)], [1], is_promotion=True))
     results = drain(tier)
     assert not results[0].success, "unverifiable payload must fail the load"
     assert not os.path.exists(path), "unverifiable payload must be removed"
+
+
+def _has_record(path: str) -> bool:
+    import contextlib
+
+    with contextlib.suppress(OSError):
+        os.getxattr(path, _XATTR)
+        return True
+    return False
+
+
+def test_legacy_sidecar_files_are_inert(fs_tier):
+    """Pre-carrier-migration .meta sidecars may sit beside payloads forever;
+    they must never be consulted — a store under the xattr carrier with a
+    poisoned legacy .meta next to it still loads clean."""
+    tier, tensor = fs_tier
+    _store_blocks(tier, tensor, [(0, 0.25)])
+    path = tier.file_mapper.get_file_name(key(0))
+    with open(path + _SIDECAR_SUFFIX, "wb") as f:
+        f.write(b"garbage that would poison any sidecar-reading load")
+    ctx = ReqContext(req_id="legacy-req")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    tier.submit_load(make_job(2, [key(0)], [1], is_promotion=True))
+    results = drain(tier)
+    assert results[0].success, "legacy .meta must not affect xattr-verified loads"
+    assert torch.all(tensor[1] == 0.25)
+
+
+def test_tier_construction_fails_loud_without_xattr_support(tmp_path, monkeypatch):
+    """On a filesystem without user.* xattr support the tier must refuse to
+    start, not silently run as a 100% cache miss."""
+
+    def no_xattr(*args, **kwargs):
+        raise OSError(95, "Operation not supported")
+
+    monkeypatch.setattr(os, "setxattr", no_xattr)
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    with pytest.raises((OSError, ValueError)):
+        FileSystemTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=memoryview(tensor.numpy()),
+            tier_type="fs",
+            root_dir=str(tmp_path),
+            n_read_threads=2,
+            n_write_threads=2,
+        )
 
 
 def test_storage_replaced_under_live_tier_degrades_to_miss(fs_tier):

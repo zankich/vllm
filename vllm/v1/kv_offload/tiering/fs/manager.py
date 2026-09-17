@@ -191,6 +191,9 @@ class FileSystemTierManager(SecondaryTierManager):
         # I/O on filesystems that reject it (e.g. overlayfs, some NFS mounts)
         # rather than failing every block.
         self._use_o_direct = probe_o_direct(os.path.dirname(config_path))
+        # Fork-local integrity rides user.* xattrs on the payload files;
+        # refuse to serve as a silent 100% miss on filesystems without them.
+        integrity.probe_xattr(root_dir)
         if not self._use_o_direct:
             logger.warning(
                 "O_DIRECT is not supported at '%s'; falling back to buffered "
@@ -242,7 +245,7 @@ class FileSystemTierManager(SecondaryTierManager):
             # the block, and the following store rewrites it.
             view_b = self._primary_kv_view.cast("B")
             for path, key, offset in zip(paths, keys, offsets):
-                integrity.write_sidecar(
+                integrity.write_record(
                     path, key, view_b[offset : offset + self._block_size]
                 )
                 try:
@@ -271,7 +274,7 @@ class FileSystemTierManager(SecondaryTierManager):
                 # (num_succeeded=0): the request recomputes cold, and no part
                 # of the batch is trusted.
                 for path, key in zip(paths, keys):
-                    record = integrity.read_sidecar(path)
+                    record = integrity.read_record(path)
                     if record is None or record[0] != bytes(key):
                         integrity.remove_block(path)
                         raise OSError(
@@ -299,7 +302,7 @@ class FileSystemTierManager(SecondaryTierManager):
                 # Post-check: the bytes just read must match the record.
                 view_b = self._primary_kv_view.cast("B")
                 for path, key, offset in zip(paths, keys, offsets):
-                    record = integrity.read_sidecar(path)
+                    record = integrity.read_record(path)
                     if record is None or not (
                         record[0] == bytes(key)
                         and record[1]
