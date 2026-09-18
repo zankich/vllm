@@ -4088,14 +4088,17 @@ def test_shift_leaves_boundary_chunk_scoped_and_single_dropped():
 
 def test_shift_on_mixed_granularity_groups_loads_full_window():
     """Two participating groups with different chunk granularities (16 and
-    32, lcm-aligned 96-token extent): the shift shaves only what the ENGINE
-    believes cached. The load itself must stay over the full confirmed
-    window so each group's per-chunk geometry remains stock — a reduced
-    boundary is not chunk-legal for the coarser group (its cdiv over-claims
-    chunks past the boundary), the divergence that crashed prepare_load in
-    production on 2026-09-18 (A/B eviction churn, a7aee806e9). The engine
-    recomputes the dropped tail over the restored blocks; causal attention
-    never reads them before the prefill chunk's forward rewrites them."""
+    32, lcm-aligned 96-token extent): the shift shaves by the LCM of the
+    participating chunks (32), not the FA grid (16). Two crash classes
+    guard here: an FA-grid shave leaves the coarser group unable to cover
+    the boundary without a never-stored boundary key (its cdiv over-claims
+    chunks and the key set diverges from the promoted lookup window —
+    prepare_load 'not found in cache', 2026-09-18 A/B churn), and loading
+    the full pre-drop window instead overshoots the engine's block
+    allocation on small extensions ('len(group_blocks) >= num_gpu_blocks',
+    same night, warm phase). The LCM boundary is whole-chunk legal for
+    every group, allocation-safe by construction, and its recompute
+    overwrites the FA tail chunk the fingerprint indicts."""
     vllm_config = _make_vllm_config(
         extra_config={
             "self_describing_kv_events": True,
@@ -4129,23 +4132,24 @@ def test_shift_on_mixed_granularity_groups_loads_full_window():
 
     scheduler.manager.lookup.return_value = LookupResult.HIT
     num_hit, _ = scheduler.get_num_new_matched_tokens(request, 0)
-    # 96 = 6 x 16 = 3 x 32: flush-aligned on the FA grid, shift fires.
-    assert num_hit == 80
+    # 96 = 3 x lcm(16, 32): shift shaves one LCM, not one FA chunk.
+    assert num_hit == 64
 
     scheduler.update_state_after_alloc(
         request,
         KVCacheBlocks(
             (
-                [KVCacheBlock(i) for i in range(100, 106)],
-                [KVCacheBlock(i) for i in range(200, 203)],
+                [KVCacheBlock(i) for i in range(100, 104)],
+                [KVCacheBlock(i) for i in range(200, 202)],
             )
         ),
-        num_external_tokens=80,
+        num_external_tokens=64,
     )
     [load_job_id] = scheduler._current_batch_load_jobs
     keys = scheduler._jobs[load_job_id].keys
-    # Full confirmed window: 6 chunks of 16 + 3 chunks of 32 = 9 keys.
-    assert len(keys) == 9
+    # Whole-chunk legal window: 4 chunks of 16 + 2 chunks of 32 = 6 keys,
+    # never more than the engine's allocation for the shaved boundary.
+    assert len(keys) == 6
     dst = scheduler._current_batch_load_jobs[load_job_id].dst_spec
-    assert dst.group_sizes == [6, 3]
+    assert dst.group_sizes == [4, 2]
     assert req_status.partial_tail_boundary is None

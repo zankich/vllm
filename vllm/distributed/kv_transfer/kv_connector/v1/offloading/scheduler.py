@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -477,14 +478,6 @@ class RequestOffloadState:
     # Fine-grained token boundary selected beyond the last complete offload
     # chunk. It is consumed when the corresponding load is scheduled.
     partial_tail_boundary: int | None = None
-    # Fork (alignment shift): the pre-drop converged boundary when the shift
-    # fired. The shaved hit count is the ENGINE's belief, not the load
-    # extent — the load still covers the full confirmed window and the
-    # recomputed tail overwrites its KV before any attention reads it. A
-    # reduced boundary is not chunk-legal for coarser sibling groups (cdiv
-    # over-claims their chunks past the boundary). Consumed by
-    # update_state_after_alloc.
-    load_boundary_override: int | None = None
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
 
@@ -1206,20 +1199,33 @@ class OffloadingConnectorScheduler:
                     and self._alignment_shift
                     and req_status.partial_tail_boundary is None
                 ):
-                    fa_chunk = self.config.kv_group_configs[fa_idx].tokens_per_chunk
+                    # Shave by the LCM of every participating group's
+                    # chunk, not just the FA grid: the reduced boundary
+                    # must stay a whole-chunk multiple for coarser
+                    # siblings (recurrent groups at 3x granularity cannot
+                    # cover a 1600-shaved boundary — their partial-chunk
+                    # coverage needs a boundary key that was never
+                    # stored — and loading the full window instead
+                    # overshoots the engine's block allocation on small
+                    # extensions). An LCM-multiple boundary is legal for
+                    # every group, needs no boundary keys, fits the
+                    # allocation the engine derived from the shaved
+                    # count, and its recompute overwrites the FA tail
+                    # chunk the fingerprint indicts.
+                    chunk_lcm = math.lcm(
+                        *(
+                            g.tokens_per_chunk
+                            for g in self.config.kv_group_configs
+                            if g.participates
+                        )
+                    )
                     if (
                         num_computed_tokens == 0
-                        and num_hit_tokens >= fa_chunk
-                        and num_hit_tokens % fa_chunk == 0
+                        and num_hit_tokens >= 2 * chunk_lcm
+                        and num_hit_tokens % chunk_lcm == 0
                     ):
-                        boundary_pre = num_computed_tokens + num_hit_tokens
-                        num_hit_tokens -= fa_chunk
-                        req_status.load_boundary_override = boundary_pre
-        req_status.update_num_hit_chunks(
-            req_status.load_boundary_override
-            if req_status.load_boundary_override is not None
-            else num_computed_tokens + (num_hit_tokens or 0)
-        )
+                        num_hit_tokens -= chunk_lcm
+        req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
         self._touch(req_status)
 
@@ -1238,17 +1244,6 @@ class OffloadingConnectorScheduler:
         partial_tail_boundary = req_status.partial_tail_boundary
         if partial_tail_boundary is not None:
             assert partial_tail_boundary == num_cached_tokens
-        # Fork (alignment shift): when the shift fired, the engine's
-        # num_external_tokens is the shaved count, but the load must cover
-        # the full confirmed window (see RequestOffloadState) so each
-        # group's chunk geometry stays stock-legal.
-        load_boundary = req_status.load_boundary_override
-        req_status.load_boundary_override = None
-        if load_boundary is not None:
-            assert partial_tail_boundary is None
-            num_cached_tokens_for_load = load_boundary
-        else:
-            num_cached_tokens_for_load = num_cached_tokens
 
         keys_to_load: list[OffloadKey] = []
         dst_block_ids: list[int] = []
@@ -1276,7 +1271,7 @@ class OffloadingConnectorScheduler:
             tokens_per_block = group_config.tokens_per_block
             tokens_per_chunk = group_config.tokens_per_chunk
             offload_keys = group_state.offload_keys
-            num_gpu_blocks = cdiv(num_cached_tokens_for_load, tokens_per_block)
+            num_gpu_blocks = cdiv(num_cached_tokens, tokens_per_block)
 
             assert len(group_blocks) >= num_gpu_blocks
             # ``load_start_gpu_block_idx``: the index in ``group_blocks`` where the
@@ -1305,7 +1300,7 @@ class OffloadingConnectorScheduler:
                     + 1
                 )
 
-            num_chunks = cdiv(num_cached_tokens_for_load, tokens_per_chunk)
+            num_chunks = cdiv(num_cached_tokens, tokens_per_chunk)
             if num_pending_gpu_blocks:
                 start_chunk_idx = (
                     load_start_gpu_block_idx // self.config.blocks_per_chunk
