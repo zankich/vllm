@@ -101,6 +101,7 @@ def _make_partial_tail_request(
     request.all_token_ids = list(range(30))
     request.lora_request = None
     request.is_finished.return_value = False
+    request.skip_reading_prefix_cache = False
     scheduler.on_new_request(request)
     return request
 
@@ -4008,8 +4009,10 @@ def test_aligned_pure_tier_restore_drops_last_chunk():
     req_status.update_offload_keys()
 
     scheduler.manager.lookup.return_value = LookupResult.HIT
-    # Pre-shift contract: 28 (7 full chunks of 4). Post-shift: 24.
-    assert scheduler._lookup(req_status) == 24
+    # Pre-shift contract: 28 (7 full chunks of 4, the full stored extent
+    # consumed flush). Post-shift, via the public entry: 24.
+    num_hit, _ = scheduler.get_num_new_matched_tokens(request, 0)
+    assert num_hit == 24
 
 
 def test_local_hit_aligned_restore_untouched():
@@ -4025,7 +4028,8 @@ def test_local_hit_aligned_restore_untouched():
     # Baseline (pre-shift local>0 behavior, verified against the unshifted
     # tree): partial-tail path at 16, converged boundary 12. The shift must
     # leave this value untouched.
-    assert scheduler._lookup(req_status) == 12
+    num_hit, _ = scheduler.get_num_new_matched_tokens(request, 4)
+    assert num_hit == 12
 
 
 def test_shift_leaves_boundary_chunk_scoped_and_single_dropped():
@@ -4038,7 +4042,7 @@ def test_shift_leaves_boundary_chunk_scoped_and_single_dropped():
     req_status.update_offload_keys()
 
     scheduler.manager.lookup.return_value = LookupResult.HIT
-    result = scheduler._lookup(req_status)
+    result, _ = scheduler.get_num_new_matched_tokens(request, 0)
     assert result == 24
     # The boundary the scheduler reports is still chunk-consistent for the
     # load that follows: 6 chunks x 4 tokens.
