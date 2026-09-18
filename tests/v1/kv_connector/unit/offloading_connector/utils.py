@@ -660,7 +660,8 @@ class RequestRunner:
                 stored_gpu_blocks.add(gpu_block)
                 self.offloaded[offloaded_address] = gpu_block
 
-        assert set(expected_stored_gpu_blocks) == stored_gpu_blocks
+        assert set(expected_stored_gpu_blocks) == stored_gpu_blocks, (
+            f'expected={sorted(map(repr, expected_stored_gpu_blocks))!r} actual={sorted(map(repr, stored_gpu_blocks))!r}')
         self.completed_stores.clear()
 
         assert set(expected_flushed_gpu_blocks) == self.flushed_gpu_blocks

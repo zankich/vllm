@@ -3278,11 +3278,12 @@ class TestEagle:
         )
         # Once the request finishes, no spec rejection can rewrite the tail,
         # so the exclusion is lifted (issue #52735): the held-back (1, 3) is
-        # stored. Unlike the upstream base, v0.28.0 also stores the final
-        # partial block 4 for both groups at finish.
+        # stored. The final partial block 4 ends at the last sampled token's
+        # slot, which no forward pass ever wrote (under spec decode it holds
+        # rejected-draft KV) — #54288 excludes it for every group.
         runner.run(
             decoded_tokens=[EOS_TOKEN_ID],
-            expected_stored=((1, 3), (0, 4), (1, 4)),
+            expected_stored=((1, 3),),
         )
 
     @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -3843,11 +3844,10 @@ class TestSharedGroupMTPOffload:
             decoded_tokens=[0] * (block_size * 3 + 2),
             expected_stored=(0, 1, 2, 3, 4, 5),
         )
-        # Unlike the upstream base, v0.28.0 stores the block the EOS token
-        # completes, for both groups.
+        # The EOS token's block (6) ends at the final sampled token's slot,
+        # never written by any forward — #54288 excludes it for both groups.
         runner.run(
             decoded_tokens=[EOS_TOKEN_ID],
-            expected_stored=((0, 6), (1, 6)),
         )
 
         runner.scheduler.reset_prefix_cache()
