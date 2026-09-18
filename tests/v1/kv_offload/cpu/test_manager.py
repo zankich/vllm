@@ -401,6 +401,11 @@ def test_cpu_manager():
     assert cpu_manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.HIT
     assert cpu_manager.lookup(to_key(3), _EMPTY_REQ_CTX) is LookupResult.MISS
 
+    # Lookup pins confirmed hits until load or request finish (fork,
+    # 2026-09-18): release them so the store below has its eviction
+    # candidates — the pin lifecycle is exercised by its own test.
+    cpu_manager.on_request_finished(_EMPTY_REQ_CTX)
+
     # prepare store [2, 3, 4, 5] -> evicts [1]
     prepare_store_output = cpu_manager.prepare_store(
         to_keys([2, 3, 4, 5]), _EMPTY_REQ_CTX
@@ -430,6 +435,10 @@ def test_cpu_manager():
     assert cpu_manager.lookup(to_key(4), _EMPTY_REQ_CTX) is LookupResult.HIT
     assert cpu_manager.lookup(to_key(5), _EMPTY_REQ_CTX) is LookupResult.HIT
     assert cpu_manager.lookup(to_key(0), _EMPTY_REQ_CTX) is LookupResult.MISS
+
+    # Release the lookup pins taken above; the load below re-pins through
+    # its own ref_cnt lifecycle.
+    cpu_manager.on_request_finished(_EMPTY_REQ_CTX)
 
     # prepare load [2, 3]
     prepare_load_output = cpu_manager.prepare_load(to_keys([2, 3]), _EMPTY_REQ_CTX)
@@ -1203,3 +1212,39 @@ def test_integrity_verification_once_per_request_context():
     assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
     # New request: re-verified, rejected, MISS.
     assert manager.lookup(to_key(1), ctx_b) is LookupResult.MISS
+
+
+def test_lookup_confirmed_hit_pinned_until_prepare_load():
+    """Regression (2026-09-18): a key the lookup
+    confirmed HIT was evicted by an asynchronously-completing store before
+    prepare_load pinned it — ref_cnt protection started only at
+    prepare_load, so the transfer threads' interleaving killed the engine
+    at `assert block is not None`. The contract: a lookup-confirmed hit is
+    pinned from the lookup until its load takes the pin over (or the
+    request finishes); eviction pressure against a pinned key surfaces as
+    store refusal, never as the key's disappearance."""
+    manager = make_cpu_manager(num_blocks=2, cache_policy="lru")
+    victim_ctx = make_req_context("victim")
+    churn_ctx = make_req_context("churn")
+
+    # Victim key stored and completed — resident.
+    out = manager.prepare_store(to_keys([1]), victim_ctx)
+    assert out is not None
+    manager.complete_store(to_keys([1]), victim_ctx)
+
+    # The connector's confirming lookup: HIT.
+    assert manager.lookup(to_key(1), victim_ctx) is LookupResult.HIT
+
+    # Interleave: a churn store completes on a transfer thread between the
+    # confirming lookup and prepare_load, and would take the victim's slot.
+    churn = manager.prepare_store(to_keys([2, 3]), churn_ctx)
+
+    # The load catches up. Before the fix this is the engine-killing
+    # assert; after it, the victim is pinned and the churn store was
+    # refused instead.
+    spec = manager.prepare_load(to_keys([1]), victim_ctx)
+    assert spec is not None
+    if churn is None:
+        # Store refusal is the legal pressure outcome; the keys never
+        # landed, so nothing is resident for them.
+        assert manager.lookup(to_key(2), churn_ctx) is not LookupResult.HIT
