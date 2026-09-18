@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from tests.v1.kv_connector.unit.offloading_connector.test_config import (
+    _full_attention_spec,
     _make_mamba_hybrid_kv_cache_config,
     _make_vllm_config,
 )
@@ -3999,52 +4000,87 @@ def test_sliding_window_unaligned_initial_run(middle, expected):
 # ---------------------------------------------------------------------------
 
 
+def _make_single_group_scheduler(chunk: int = 16, alignment_shift: bool = True):
+    """Single full-attention-group scheduler with the alignment shift
+    opt-in set: convergence is trivial and flush-aligned boundaries occur
+    naturally (no mamba co-group rounding the converged boundary off the
+    grid)."""
+    vllm_config = _make_vllm_config(
+        extra_config={
+            "self_describing_kv_events": True,
+            "alignment_shift": alignment_shift,
+        }
+    )
+    vllm_config.cache_config.prefix_match_unit = 4
+    vllm_config.speculative_config = None
+    vllm_config.kv_events_config = KVEventsConfig(
+        enable_kv_cache_events=True, publisher="null"
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full_layer"], _full_attention_spec(block_size=chunk))
+        ],
+    )
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+
+
 def test_aligned_pure_tier_restore_drops_last_chunk():
-    """local==0, full-attention maximal hit: the shift fires — the lookup
-    returns one chunk less than the tier can serve."""
-    scheduler = _make_partial_tail_scheduler()
+    """local==0, full-attention flush-aligned hit (boundary a multiple of
+    the chunk): the shift fires — one chunk less is restored."""
+    scheduler = _make_single_group_scheduler(chunk=16)
     request = _make_partial_tail_request(scheduler)
+    request.num_tokens = 32
+    request.num_prompt_tokens = 32
+    request.all_token_ids = list(range(32))
+    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(8)]
     req_status = scheduler._req_status["req"]
     req_status.num_locally_computed_tokens = 0
     req_status.update_offload_keys()
 
     scheduler.manager.lookup.return_value = LookupResult.HIT
-    # Pre-shift contract: 28 (7 full chunks of 4, the full stored extent
-    # consumed flush). Post-shift, via the public entry: 24.
+    # Pre-shift contract: 32 (2 flush chunks of 16). Post-shift: 16.
     num_hit, _ = scheduler.get_num_new_matched_tokens(request, 0)
-    assert num_hit == 24
+    assert num_hit == 16
 
 
 def test_local_hit_aligned_restore_untouched():
     """local>0 (GPU prefix-cache anchor present): empirically the clean
-    path — the shift must not fire."""
-    scheduler = _make_partial_tail_scheduler()
+    path — the shift must not fire even with the opt-in set."""
+    scheduler = _make_single_group_scheduler(chunk=16, alignment_shift=True)
     request = _make_partial_tail_request(scheduler)
+    request.num_tokens = 32
+    request.num_prompt_tokens = 32
+    request.all_token_ids = list(range(32))
+    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(8)]
     req_status = scheduler._req_status["req"]
     req_status.num_locally_computed_tokens = 4  # one GPU block computed
     req_status.update_offload_keys()
 
     scheduler.manager.lookup.return_value = LookupResult.HIT
-    # Baseline (pre-shift local>0 behavior, verified against the unshifted
-    # tree): partial-tail path at 16, converged boundary 12. The shift must
-    # leave this value untouched.
+    # Full hit 32 minus the 4 local tokens: the shift (ON) must leave
+    # this untouched — boundary arithmetic identical to shift-off.
     num_hit, _ = scheduler.get_num_new_matched_tokens(request, 4)
-    assert num_hit == 12
+    assert num_hit == 28
 
 
 def test_shift_leaves_boundary_chunk_scoped_and_single_dropped():
-    """The shift drops exactly one chunk: 7 stored -> 6 restored, and the
-    partial-tail boundary machinery still engages consistently."""
-    scheduler = _make_partial_tail_scheduler()
+    """The shift drops exactly one chunk: 2 stored -> 1 restored, and the
+    remaining boundary stays chunk-consistent for the load that follows."""
+    scheduler = _make_single_group_scheduler(chunk=16)
     request = _make_partial_tail_request(scheduler)
+    request.num_tokens = 32
+    request.num_prompt_tokens = 32
+    request.all_token_ids = list(range(32))
+    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(8)]
     req_status = scheduler._req_status["req"]
     req_status.num_locally_computed_tokens = 0
     req_status.update_offload_keys()
 
     scheduler.manager.lookup.return_value = LookupResult.HIT
     result, _ = scheduler.get_num_new_matched_tokens(request, 0)
-    assert result == 24
-    # The boundary the scheduler reports is still chunk-consistent for the
-    # load that follows: 6 chunks x 4 tokens.
-    assert result % 4 == 0
-    assert result == 28 - 4
+    assert result == 16
+    assert result % 16 == 0
+    assert result == 32 - 16

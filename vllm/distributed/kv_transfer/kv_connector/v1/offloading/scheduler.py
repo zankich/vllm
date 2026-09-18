@@ -656,6 +656,17 @@ class OffloadingConnectorScheduler:
         # Store-accounting needs the GPU hash-block size (block_hashes are
         # per GPU block); any group's spec carries it.
         self._gpu_block_size = kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+        # Fork-local alignment shift, opt-in via kv_connector_extra_config
+        # {"alignment_shift": true}: pure-tier flush-aligned restores drop
+        # their trailing chunk (corrupt-output mitigation). Default off —
+        # the behavior change is deliberate configuration, not a side effect.
+        # Defensive on spec shape: unit fixtures double the spec without
+        # a config attribute.
+        _spec_config = getattr(spec, "config", None)
+        _extra = getattr(_spec_config, "extra_config", None)
+        self._alignment_shift = bool(
+            (_extra or {}).get("alignment_shift", False)
+        )
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats = OffloadingConnectorStats()
 
@@ -1165,6 +1176,31 @@ class OffloadingConnectorScheduler:
                     req_status.deferred_lookup_start_time = lookup_start
             else:
                 self._maybe_observe_lookup_async_delay(req_status)
+                # Alignment shift (fork, 2026-09-18): every corrupting restore
+                # was pure-tier (local == 0) AND consumed the full-attention
+                # group's stored extent flush (boundary == keys x chunk);
+                # the one clean control with the same shape left extent
+                # unused. Tighten exactly that shape by one chunk so its
+                # tail recomputes — the partial-tail re-prefill overwrites
+                # the would-be-poisoned surface, whichever side the defect
+                # is on. Post-convergence, so the mamba alignment never
+                # re-rounds; scoped off whenever GPU-local hits exist.
+                fa_idx = next(
+                    (
+                        i
+                        for i, g in enumerate(self.config.kv_group_configs)
+                        if isinstance(g.kv_cache_spec, FullAttentionSpec)
+                    ),
+                    None,
+                )
+                if fa_idx is not None and self._alignment_shift:
+                    fa_chunk = self.config.kv_group_configs[fa_idx].tokens_per_chunk
+                    if (
+                        num_computed_tokens == 0
+                        and num_hit_tokens >= fa_chunk
+                        and num_hit_tokens % fa_chunk == 0
+                    ):
+                        num_hit_tokens -= fa_chunk
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
         self._touch(req_status)
