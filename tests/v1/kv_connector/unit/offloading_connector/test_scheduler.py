@@ -4084,3 +4084,68 @@ def test_shift_leaves_boundary_chunk_scoped_and_single_dropped():
     assert result == 16
     assert result % 16 == 0
     assert result == 32 - 16
+
+
+def test_shift_on_mixed_granularity_groups_loads_full_window():
+    """Two participating groups with different chunk granularities (16 and
+    32, lcm-aligned 96-token extent): the shift shaves only what the ENGINE
+    believes cached. The load itself must stay over the full confirmed
+    window so each group's per-chunk geometry remains stock — a reduced
+    boundary is not chunk-legal for the coarser group (its cdiv over-claims
+    chunks past the boundary), the divergence that crashed prepare_load in
+    production on 2026-09-18 (A/B eviction churn, a7aee806e9). The engine
+    recomputes the dropped tail over the restored blocks; causal attention
+    never reads them before the prefill chunk's forward rewrites them."""
+    vllm_config = _make_vllm_config(
+        extra_config={
+            "self_describing_kv_events": True,
+            "alignment_shift": True,
+        }
+    )
+    vllm_config.cache_config.prefix_match_unit = 4
+    vllm_config.speculative_config = None
+    vllm_config.kv_events_config = KVEventsConfig(
+        enable_kv_cache_events=True, publisher="null"
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["fa_layer"], _full_attention_spec(block_size=16)),
+            KVCacheGroupSpec(["coarse_layer"], _full_attention_spec(block_size=32)),
+        ],
+    )
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+
+    request = _make_partial_tail_request(scheduler)
+    request.num_tokens = 96
+    request.num_prompt_tokens = 96
+    request.all_token_ids = list(range(96))
+    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(24)]
+    req_status = scheduler._req_status["req"]
+    req_status.num_locally_computed_tokens = 0
+    req_status.update_offload_keys()
+
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    num_hit, _ = scheduler.get_num_new_matched_tokens(request, 0)
+    # 96 = 6 x 16 = 3 x 32: flush-aligned on the FA grid, shift fires.
+    assert num_hit == 80
+
+    scheduler.update_state_after_alloc(
+        request,
+        KVCacheBlocks(
+            (
+                [KVCacheBlock(i) for i in range(100, 106)],
+                [KVCacheBlock(i) for i in range(200, 203)],
+            )
+        ),
+        num_external_tokens=80,
+    )
+    [load_job_id] = scheduler._current_batch_load_jobs
+    keys = scheduler._jobs[load_job_id].keys
+    # Full confirmed window: 6 chunks of 16 + 3 chunks of 32 = 9 keys.
+    assert len(keys) == 9
+    dst = scheduler._current_batch_load_jobs[load_job_id].dst_spec
+    assert dst.group_sizes == [6, 3]
+    assert req_status.partial_tail_boundary is None
