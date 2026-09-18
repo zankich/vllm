@@ -3984,3 +3984,63 @@ def test_sliding_window_unaligned_initial_run(middle, expected):
         )
         == expected
     )
+
+
+# ---------------------------------------------------------------------------
+# Alignment shift: a pure-tier full-attention restore must never end exactly
+# at its maximal stored-chunk extent. The 2026-09-17/18 corruption fingerprint:
+# every corrupting restore had local==0 and boundary == the full-attention
+# group's own chunk-aligned hit extent; the clean control run's boundary
+# was tightened below it by another group. Dropping the last chunk from
+# the full-attention hit forces that chunk's recompute — the partial-tail
+# re-prefill overwrites exactly the surface that would otherwise be
+# restored verbatim, whichever side (mint or load-path) the defect is on.
+# ---------------------------------------------------------------------------
+
+
+def test_aligned_pure_tier_restore_drops_last_chunk():
+    """local==0, full-attention maximal hit: the shift fires — the lookup
+    returns one chunk less than the tier can serve."""
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.num_locally_computed_tokens = 0
+    req_status.update_offload_keys()
+
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    # Pre-shift contract: 28 (7 full chunks of 4). Post-shift: 24.
+    assert scheduler._lookup(req_status) == 24
+
+
+def test_local_hit_aligned_restore_untouched():
+    """local>0 (GPU prefix-cache anchor present): empirically the clean
+    path — the shift must not fire."""
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.num_locally_computed_tokens = 4  # one GPU block computed
+    req_status.update_offload_keys()
+
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    # Baseline (pre-shift local>0 behavior, verified against the unshifted
+    # tree): partial-tail path at 16, converged boundary 12. The shift must
+    # leave this value untouched.
+    assert scheduler._lookup(req_status) == 12
+
+
+def test_shift_leaves_boundary_chunk_scoped_and_single_dropped():
+    """The shift drops exactly one chunk: 7 stored -> 6 restored, and the
+    partial-tail boundary machinery still engages consistently."""
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.num_locally_computed_tokens = 0
+    req_status.update_offload_keys()
+
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    result = scheduler._lookup(req_status)
+    assert result == 24
+    # The boundary the scheduler reports is still chunk-consistent for the
+    # load that follows: 6 chunks x 4 tokens.
+    assert result % 4 == 0
+    assert result == 28 - 4
