@@ -183,6 +183,46 @@ def _group_participates(spec: Any, idx: int) -> bool:
     return True
 
 
+def store_accounting_summary(
+    req_id: str,
+    watermark: int,
+    num_prompt_tokens: int,
+    num_tokens: int,
+    num_computed_tokens: int,
+    hashed_blocks: int,
+    block_size: int,
+    is_finished: bool,
+) -> tuple[str, list[str]]:
+    """Store-side companion to restore_accounting_summary.
+
+    The hashed-prefix invariant: a store may only reach tokens whose block
+    hashes exist (the request's committed-content watermark). Hashes are of
+    token ids and appended optimistically under spec decode, so this line
+    records — per store job — the arithmetic needed to detect stores past
+    the confirmed boundary, the surviving poison-mint candidate after
+    #54288 (which only clamped the FINISHED branch and is a no-op for
+    offload_prompt_only configs, where the prompt clamp already applied).
+    """
+    hashed_tokens = hashed_blocks * block_size
+    violations: list[str] = []
+    if watermark > hashed_tokens:
+        violations.append(
+            f"store beyond hashed prefix: {watermark} > {hashed_tokens} "
+            f"({hashed_blocks} blocks x {block_size})"
+        )
+    if watermark > num_computed_tokens:
+        violations.append(
+            f"store exceeds computed: {watermark} > {num_computed_tokens}"
+        )
+    line = (
+        f"store-accounting req={req_id} watermark={watermark} "
+        f"prompt={num_prompt_tokens} tokens={num_tokens} "
+        f"computed={num_computed_tokens} hashed={hashed_tokens} "
+        f"finished={is_finished}"
+    )
+    return line, violations
+
+
 def get_sliding_window_size_in_chunks(
     kv_cache_spec: KVCacheSpec, tokens_per_chunk: int
 ) -> int | None:
@@ -613,6 +653,9 @@ class OffloadingConnectorScheduler:
         self.config = SchedulerOffloadConfig.from_spec(
             spec, vllm_config, kv_cache_config
         )
+        # Store-accounting needs the GPU hash-block size (block_hashes are
+        # per GPU block); any group's spec carries it.
+        self._gpu_block_size = kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats = OffloadingConnectorStats()
 
@@ -1517,6 +1560,27 @@ class OffloadingConnectorScheduler:
             num_offloadable_tokens = self._calc_num_offloadable_tokens(
                 req_status, num_tokens_after_batch
             )
+
+            # Store-side accounting (corruption-RCA): the hashed-prefix invariant
+            # detects stores past the request's committed-content watermark.
+            s_line, s_violations = store_accounting_summary(
+                req_id=req_id,
+                watermark=num_offloadable_tokens,
+                num_prompt_tokens=req.num_prompt_tokens,
+                num_tokens=req.num_tokens,
+                num_computed_tokens=req.num_computed_tokens,
+                hashed_blocks=len(req.block_hashes),
+                block_size=self._gpu_block_size,
+                is_finished=req.is_finished(),
+            )
+            logger.info(s_line)
+            for violation in s_violations:
+                logger.error(
+                    "store-accounting VIOLATION req=%s: %s "
+                    "(poison-mint candidate — capture this request)",
+                    req_id,
+                    violation,
+                )
 
             # Filter out chunks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
