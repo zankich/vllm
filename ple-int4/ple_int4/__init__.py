@@ -31,7 +31,7 @@ _INSTALLED = False
 # SHA-256 of the installed vllm/models/qwen4_exp/nvidia/ngram_embedding.py
 # that this plugin was authored against (nightly 0.29.1rc1.dev102+gba2ae9f23;
 # verified byte-identical to checkout c69d5d72a6 on 2026-09-15).
-# nightly wheel pin was f3aaf292... ; v0.29.0-qwen-flashnext e94e5cf6e pin:
+# nightly wheel pin was f3aaf292... ; v0.29.0-qwen pin:
 PINNED_NGRAM_SHA256 = "f3aaf29281b803dcebb4b179d5177704ed7b913170edf8107e33f729be825429"
 
 _ORIGINALS: dict[str, object] = {}

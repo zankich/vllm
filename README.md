@@ -2,12 +2,12 @@
 <!-- fork-preamble-start -->
 # zankich/vllm — fork of vllm-project/vllm
 
-Production fork for Qwen3.8 serving: the 27B mamba-hybrid stack (TP2, MTP
-speculative decoding, prefix caching, fp8 KV, CPU + disk KV-offload
-tiers across two serving instances, fs tier per instance) on
-`v0.29.0-qwen`, and Flash-Next bring-up (TP4+EP, MTP, the PLE n-gram
-table pinned host-side and read through UVA) on
-`v0.29.0-qwen-flashnext`. Upstream vLLM is excellent;
+Production fork for Qwen3.8 serving, all on `v0.29.0-qwen`: the 27B
+mamba-hybrid stack (TP2, MTP speculative decoding, prefix caching, fp8
+KV, CPU + disk KV-offload tiers across two serving instances, fs tier
+per instance), and Flash-Next (TP4+EP, MTP, the PLE n-gram table
+pinned host-side and read through UVA) via the backport chain below.
+Upstream vLLM is excellent;
 this fork exists to carry fixes that had not shipped in a release at
 deploy time. See what this fork changes with:
 
@@ -18,8 +18,7 @@ git log <upstream-tag>..HEAD --stat    # full delta of the last-upstream-tag
 
 ## Branches
 
-- `v0.29.0-qwen` (default) — current, on the v0.29.0 tag
-- `v0.29.0-qwen-flashnext` — `v0.29.0-qwen` plus the upstream PLE-UVA backport chain for Qwen3.8-Flash-Next (patch table below; serving gates passed — int4 PLE, MTP and KV offload in one boot, restart-restore byte-compare PASS, benches within 6% of the reference nightly short-context)
+- `v0.29.0-qwen` (default) — current, on the v0.29.0 tag: the 27B patches below plus the Flash-Next backport chain (serving gates passed — int4 PLE, MTP and KV offload in one boot, restart-restore byte-compare PASS, benches within 6% of the reference nightly short-context)
 - `v0.28.0-qwen` — previous generation, on the v0.28.0 tag
 
 ## Patch set on `v0.29.0-qwen`
@@ -39,13 +38,13 @@ git log <upstream-tag>..HEAD --stat    # full delta of the last-upstream-tag
 | `OffloadingConnector: per-request restore-accounting line` | one INFO line per restore with external hits carrying the assembly arithmetic (`prompt`/`local`/`ext`/`boundary`/`keys`/`chunk`) plus ERROR violations on boundary-exceeds-prompt and keys-cannot-cover — the correlation instrument for restore-shape debugging. The store-side companion was removed with the investigation it served: its invariants misfired on healthy traffic and its line fired per scheduled request per step | fork-local |
 | `CPU tier: pin lookup-confirmed hits until load or finish` | store completions and their LRU evictions run on transfer threads asynchronously from the scheduler thread, so an unpinned lookup-confirmed hit could vanish between the connector's confirming lookup and prepare_load — a fatal `Block ... not found in cache` under restore-heavy load, and the mechanism behind repeated corrupt-output incidents (verified end to end under adversarial load before landing). A confirmed HIT now pins (ref_cnt-like, insertion-ordered per request); prepare_load's ref count takes the pin over, never-loaded pins release at request finish, and the corrupt-block reject path accounts for pins. Pressure against pinned keys surfaces as store refusal, never as key disappearance. Latent in stock | fork-local |
 
-## Patch set on `v0.29.0-qwen-flashnext`
+## Flash-Next backport chain (also on `v0.29.0-qwen`)
 
-`v0.29.0-qwen` plus the PLE-UVA backport: six upstream commits
+The PLE-UVA backport: six upstream commits
 cherry-picked from main and a qwen4_exp cohort sync from upstream
 `c69d5d72a6` that composes #54517 with #54371's split, so
 Qwen3.8-Flash-Next can serve
-with MTP and KV offload on the fork base, where hybrid+MTP+offload is
+with MTP and KV offload on this branch, where hybrid+MTP+offload is
 proven on the 27B stack. Upstream's current line cannot boot this
 model with the OffloadingConnector at all — hybrid block-size assert,
 MTP+offload CUDA failure, CPU-tier shm size mismatch — which is why
@@ -53,9 +52,6 @@ MTP+offload CUDA failure, CPU-tier shm size mismatch — which is why
 PLE formats are BF16 and FP8 only, and the FP8 table pins ~48 GiB of
 host RAM, so memory-constrained hosts need the int4 PLE plugin from
 this repo's `ple-int4/` (`vllm.general_plugins` entry point).
-Everything in the table
-above is inherited bit-identical: the six fork-patched files are 0-diff
-against `v0.29.0-qwen`.
 
 | commit | what it does | origin |
 |---|---|---|
@@ -101,11 +97,11 @@ upstream commits as they landed on main):
 Each upstream release: check which patches upstream has absorbed
 (`git merge-base --is-ancestor <upstream-sha> <tag>`), re-port the rest.
 The commit messages record every hand-adaptation forced by
-intermediate-commit drift; the flashnext chain's adaptations are the
+intermediate-commit drift; the backport chain's adaptations are the
 bullets above, since its picks keep their upstream messages. Patches
 here exist to be deleted — the
 permanent fixes are the fork-local ones until upstream takes them.
-The flashnext chain is six upstream cherry-picks, one graft, one cohort
+The backport chain is six upstream cherry-picks, one graft, one cohort
 sync, and one fork-local offloading fix (which persists until upstream
 grows its own exclusion knob); the upstream part deletes wholesale at
 the first final release the fork rebases onto that contains #54371 and
