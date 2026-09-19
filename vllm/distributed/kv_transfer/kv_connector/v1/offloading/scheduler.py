@@ -133,6 +133,7 @@ def restore_accounting_summary(
     num_external: int,
     keys_loaded: int,
     group_tokens_per_chunk: int,
+    group_detail: str = "",
 ) -> tuple[str, list[str]]:
     """Fork-local restore-accounting instrumentation (2026-09-17).
 
@@ -168,6 +169,8 @@ def restore_accounting_summary(
         f"boundary={boundary} keys={keys_loaded} "
         f"chunk={group_tokens_per_chunk}"
     )
+    if group_detail:
+        line += f" groups={group_detail}"
     return line, violations
 
 
@@ -1146,6 +1149,7 @@ class OffloadingConnectorScheduler:
             assert partial_tail_boundary == num_cached_tokens
 
         keys_to_load: list[OffloadKey] = []
+        group_load_detail: list[str] = []
         dst_block_ids: list[int] = []
         # per group
         group_sizes: list[int] = []
@@ -1214,6 +1218,12 @@ class OffloadingConnectorScheduler:
                             request, group_config.group_idx, partial_tail_boundary
                         )
                     )
+                group_load_detail.append(
+                    f"{tokens_per_chunk}:"
+                    f"{end_chunk_idx - start_chunk_idx}"
+                    f"s{start_chunk_idx}"
+                    + ("+b" if partial_tail_boundary is not None else "")
+                )
 
             dst_block_ids.extend(
                 block.block_id
@@ -1242,6 +1252,7 @@ class OffloadingConnectorScheduler:
             num_external=num_external_tokens,
             keys_loaded=len(keys_to_load),
             group_tokens_per_chunk=self.config.kv_group_configs[0].tokens_per_chunk,
+            group_detail=",".join(group_load_detail),
         )
         logger.info(line)
         for violation in violations:

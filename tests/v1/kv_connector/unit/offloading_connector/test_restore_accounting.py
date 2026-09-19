@@ -61,3 +61,8 @@ def test_keys_loaded_below_restored_chunks_is_a_violation():
     # 14,400 restored tokens need >= 18 chunks of 800; 17 cannot cover it.
     _, violations = _summary(keys_loaded=17)
     assert any("keys cannot cover" in v for v in violations)
+
+
+def test_group_detail_field_carries_per_group_chunk_and_key_counts():
+    line, _ = _summary(group_detail="16:938s0,16:64s874")
+    assert "groups=16:938s0,16:64s874" in line
