@@ -58,9 +58,38 @@ def test_zero_external_tokens_reports_skipped():
 
 
 def test_keys_loaded_below_restored_chunks_is_a_violation():
-    # 14,400 restored tokens need >= 18 chunks of 800; 17 cannot cover it.
-    _, violations = _summary(keys_loaded=17)
-    assert any("keys cannot cover" in v for v in violations)
+    # Non-window groups' capacity must cover the restored extent: 14,400
+    # tokens of capacity against 14,400 restored is clean; less is not.
+    line, violations = _summary(
+        full_group_capacity=14_400, has_full_group=True
+    )
+    assert violations == []
+    _, violations = _summary(
+        full_group_capacity=12_624, has_full_group=True
+    )
+    assert any("cannot cover ext" in v for v in violations)
+
+
+def test_window_groups_do_not_count_toward_coverage_capacity():
+    # Mixed-chunk geometry: five window groups at chunk 16 load only
+    # their sliding windows (64 keys each), one full group at chunk 32
+    # covers the whole extent. Total keys x group-0 chunk undercounts;
+    # the invariant must hold anyway.
+    line, violations = _summary(
+        keys_loaded=883,
+        full_group_capacity=18_016,
+        has_full_group=True,
+        group_detail="16:64s1062,16:64s1062,32:563s0",
+    )
+    assert violations == []
+    assert "groups=16:64s1062,16:64s1062,32:563s0" in line
+
+
+def test_no_full_group_disables_the_capacity_invariant():
+    # All-window geometry: no group owes the full extent, so the
+    # capacity invariant is vacuous rather than violated.
+    _, violations = _summary(full_group_capacity=0, has_full_group=False)
+    assert violations == []
 
 
 def test_group_detail_field_carries_per_group_chunk_and_key_counts():

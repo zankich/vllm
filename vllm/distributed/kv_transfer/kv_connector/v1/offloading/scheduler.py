@@ -134,6 +134,8 @@ def restore_accounting_summary(
     keys_loaded: int,
     group_tokens_per_chunk: int,
     group_detail: str = "",
+    full_group_capacity: int = 0,
+    has_full_group: bool = False,
 ) -> tuple[str, list[str]]:
     """Fork-local restore-accounting instrumentation (2026-09-17).
 
@@ -156,12 +158,13 @@ def restore_accounting_summary(
             f"boundary exceeds prompt: {boundary} > {num_prompt_tokens}"
         )
     if (
-        group_tokens_per_chunk > 0
-        and keys_loaded * group_tokens_per_chunk < num_external
+        has_full_group
+        and full_group_capacity > 0
+        and full_group_capacity < num_external
     ):
         violations.append(
-            f"keys cannot cover ext: {keys_loaded} x "
-            f"{group_tokens_per_chunk} < {num_external}"
+            f"non-window groups cannot cover ext: {full_group_capacity} "
+            f"tokens < {num_external}"
         )
     line = (
         f"restore-accounting req={req_id} prompt={num_prompt_tokens} "
@@ -1150,6 +1153,11 @@ class OffloadingConnectorScheduler:
 
         keys_to_load: list[OffloadKey] = []
         group_load_detail: list[str] = []
+        # Token capacity of non-window groups' loads — window groups cover
+        # only their sliding window and must not count toward the
+        # full-extent coverage invariant.
+        full_group_capacity = 0
+        has_full_group = False
         dst_block_ids: list[int] = []
         # per group
         group_sizes: list[int] = []
@@ -1224,6 +1232,11 @@ class OffloadingConnectorScheduler:
                     f"s{start_chunk_idx}"
                     + ("+b" if partial_tail_boundary is not None else "")
                 )
+                if group_config.sliding_window_size_in_chunks is None:
+                    full_group_capacity += (
+                        end_chunk_idx - start_chunk_idx
+                    ) * tokens_per_chunk
+                    has_full_group = True
 
             dst_block_ids.extend(
                 block.block_id
@@ -1253,6 +1266,8 @@ class OffloadingConnectorScheduler:
             keys_loaded=len(keys_to_load),
             group_tokens_per_chunk=self.config.kv_group_configs[0].tokens_per_chunk,
             group_detail=",".join(group_load_detail),
+            full_group_capacity=full_group_capacity,
+            has_full_group=has_full_group,
         )
         logger.info(line)
         for violation in violations:
