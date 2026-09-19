@@ -31,7 +31,7 @@ _INSTALLED = False
 # SHA-256 of the installed vllm/models/qwen4_exp/nvidia/ngram_embedding.py
 # that this plugin was authored against (nightly 0.29.1rc1.dev102+gba2ae9f23;
 # verified byte-identical to checkout c69d5d72a6 on 2026-09-15).
-# nightly wheel pin was f3aaf292... ; v0.29.0-qwen pin:
+# nightly wheel pin was f3aaf292... ; v0.29.0z pin:
 PINNED_NGRAM_SHA256 = "f3aaf29281b803dcebb4b179d5177704ed7b913170edf8107e33f729be825429"
 
 _ORIGINALS: dict[str, object] = {}
@@ -97,7 +97,7 @@ def _install_offload_hybrid_patch() -> None:
     offloading/config.py build_offloading_config). This patch drops groups
     whose block size does not divide the largest selected block size —
     exactly the drafter group here — before selection, so the main model's
-    context still offloads. the v0.29.0-qwen branch solves the same problem with
+    context still offloads. the v0.29.0z branch solves the same problem with
     drafter-group annotation; upstream has no knob yet.
 
     Harmless when KV offload is off (the function is never called).
@@ -115,7 +115,7 @@ def _install_offload_hybrid_patch() -> None:
     except ImportError:  # pragma: no cover - older wheels
         return
     if not hasattr(_oc, "get_offloading_group_ids"):
-        # The fork (v0.29.0-qwen) predates upstream's group-selection
+        # The fork (v0.29.0z) predates upstream's group-selection
         # refactor; no assert to dodge there. Installing nothing also keeps
         # plugin load from crashing on wheels where the module exists but
         # the symbol does not (observed 2026-09-16: AttributeError

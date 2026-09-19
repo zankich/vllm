@@ -2,15 +2,10 @@
 <!-- fork-preamble-start -->
 # zankich/vllm — fork of vllm-project/vllm
 
-Production fork for Qwen3.8 serving, all on `v0.29.0-qwen`: the 27B
-mamba-hybrid stack (TP2, MTP speculative decoding, prefix caching, fp8
-KV, CPU + disk KV-offload tiers across two serving instances, fs tier
-per instance), and Flash-Next (TP4+EP, MTP, the PLE n-gram table
-pinned host-side and read through UVA). The in-tree PLE formats are
-BF16 and FP8 only, and the FP8 table pins ~48 GiB of host RAM, so
-memory-constrained hosts use the int4 PLE plugin from this repo's
-`ple-int4/` (`vllm.general_plugins` entry point). Upstream vLLM is
-excellent;
+General-purpose serving fork carrying model-specific enablement and
+fixes (Qwen3.8-27B, Qwen3.8-Flash-Next, Gemma-4) plus cross-model
+patches for KV-offload correctness, FlashInfer on SM8x, and the
+Anthropic `/v1/messages` endpoint. Upstream vLLM is excellent;
 this fork exists to carry fixes that had not shipped in a release at
 deploy time. See what this fork changes with:
 
@@ -21,14 +16,15 @@ git log <upstream-tag>..HEAD --stat    # full delta of the last-upstream-tag
 
 ## Branches
 
-- `v0.29.0-qwen` (default) — current, on the v0.29.0 tag; serves the Qwen3.8-27B stack and Qwen3.8-Flash-Next (serving gates passed — int4 PLE, MTP and KV offload in one boot, restart-restore byte-compare PASS, benches within 6% of the reference nightly short-context)
-- `v0.28.0-qwen` — previous generation, on the v0.28.0 tag
+- `v0.29.0z` (default) — current, on the v0.29.0 tag; serves the Qwen3.8-27B stack (TP2, MTP, prefix caching, fp8 KV, tiered CPU + fs KV offload), Qwen3.8-Flash-Next (TP4+EP, MTP, UVA PLE; serving gates passed — int4 PLE, MTP and KV offload in one boot, restart-restore byte-compare PASS, benches within 6% of the reference nightly short-context), and Gemma-4 (TP2, MTP, fp8 KV, tiered offload)
+- `v0.28.0-qwen` — previous generation (Qwen3.8-27B), on the v0.28.0 tag
 
-## Patch set on `v0.29.0-qwen`
+## Cross-model patches
+
+Apply to every model this fork serves.
 
 | commit | what it does | origin |
 |---|---|---|
-| `Enforce thinking-budget wrap-up sentence` | prepends a pre-tokenized wrap-up sentence to the forced `</think>` close at thinking-budget exhaustion, with a spec-decode-resync fix so multi-token wrap-ups survive MTP rejection sampling; Anthropic `/v1/messages` `thinking.budget_tokens` maps to `thinking_token_budget`. dormant unless `VLLM_THINKING_WRAPUP_TOKEN_IDS` is set | fork-local |
 | [`[Bugfix][KV Offload] ... truncate the load boundary` (#52807)](https://github.com/vllm-project/vllm/pull/52807) | mamba/recurrent groups legitimately hold unhashed blocks below the computed mark; the from-zero scan collapsed the load boundary and asserted (upstream [#50454](https://github.com/vllm-project/vllm/issues/50454)) | upstream, merged to main after the v0.29 branch cut |
 | [`[Bugfix] ... stop zeroing offload hits under MTP/EAGLE` (#52771)](https://github.com/vllm-project/vllm/pull/52771) | with no annotated drafter group every group was treated as volatile-tail, zeroing the whole request's offload hit on shared-group MTP models | upstream, merged to main after the branch cut |
 | [`[Bugfix][KV Offload] ... unaligned cache-hit boundaries` (#55712)](https://github.com/vllm-project/vllm/pull/55712) | SWA window coverage validation at unaligned hit boundaries | upstream, merged to main after the branch cut |
@@ -40,6 +36,25 @@ git log <upstream-tag>..HEAD --stat    # full delta of the last-upstream-tag
 | `CPU shm tier: in-memory slot checksums` | post-store slot clobber, aliasing, and torn writers had no detection anywhere in the cascade. `complete_store` records `sha256(key, slot bytes)`; lookup re-verifies once per key per request and a mismatch answers MISS (nothing downstream can crash or misalign), evicts the corrupt block, and emits a removal event. In-memory carrier — the CPU tier has no cross-restart reuse, regions die with their engine | fork-local |
 | `OffloadingConnector: per-request restore-accounting line` | one INFO line per restore with external hits carrying the assembly arithmetic (`prompt`/`local`/`ext`/`boundary`/`keys`/`chunk`) plus ERROR violations on boundary-exceeds-prompt and keys-cannot-cover — the correlation instrument for restore-shape debugging. The store-side companion was removed with the investigation it served: its invariants misfired on healthy traffic and its line fired per scheduled request per step | fork-local |
 | `CPU tier: pin lookup-confirmed hits until load or finish` | store completions and their LRU evictions run on transfer threads asynchronously from the scheduler thread, so an unpinned lookup-confirmed hit could vanish between the connector's confirming lookup and prepare_load — a fatal `Block ... not found in cache` under restore-heavy load, and the mechanism behind repeated corrupt-output incidents (verified end to end under adversarial load before landing). A confirmed HIT now pins (ref_cnt-like, insertion-ordered per request); prepare_load's ref count takes the pin over, never-loaded pins release at request finish, and the corrupt-block reject path accounts for pins. Pressure against pinned keys surfaces as store refusal, never as key disappearance. Latent in stock | fork-local |
+| `flashinfer: widen the SM8 large-head opt-in to fp8 one-byte KV` | FlashInfer gates all one-byte-KV large-head (head_dim > 256) FA2 modules to SM100+ and its only SM8 opt-in is not recognized for fp8, so large-head models under fp8 KV fail JIT on SM8x. `install_sm8_fp8_large_head_optin()` in `vllm.utils.flashinfer` extends the opted-in prefill path to fp8_e4m3/e5m2; nvfp4 semantics and non-opted-in paths unchanged; the FlashInfer backend installs it at import and a layout drift raises instead of silently serving the gate | fork-local |
+
+## Qwen3.8 patches
+
+### 27B stack
+
+| commit | what it does | origin |
+|---|---|---|
+| `Enforce thinking-budget wrap-up sentence` | prepends a pre-tokenized wrap-up sentence to the forced `</think>` close at thinking-budget exhaustion, with a spec-decode-resync fix so multi-token wrap-ups survive MTP rejection sampling; Anthropic `/v1/messages` `thinking.budget_tokens` maps to `thinking_token_budget`. dormant unless `VLLM_THINKING_WRAPUP_TOKEN_IDS` is set | fork-local |
+
+### Flash-Next
+
+The in-tree PLE formats are BF16 and FP8 only, and the FP8 table pins
+~48 GiB of host RAM, so memory-constrained hosts use the int4 PLE
+plugin from this repo's `ple-int4/` (`vllm.general_plugins` entry
+point).
+
+| commit | what it does | origin |
+|---|---|---|
 | [`[Bugfix][Qwen4Exp] ... state index strides in fused PLE conv` (#55375)](https://github.com/vllm-project/vllm/pull/55375) | fixes state index strides in the fused PLE convolution; brings in the new `nvidia/ops/ple.py` split module | upstream, cherry-picked from main |
 | [`[Kernel] Remove unused fake implementation` (#55535)](https://github.com/vllm-project/vllm/pull/55535) | drops unused fake (meta) implementations across the ops wrappers, helion kernels, and qwen4_exp layers | upstream, cherry-picked from main |
 | [`[Qwen3.8-Flash-Next] Remove torch.compile for NVIDIA implementation` (#55272)](https://github.com/vllm-project/vllm/pull/55272) | removes torch.compile from the NVIDIA model path; reshapes `model.py`/`ple_layer.py` to the state #54371's split applies against | upstream, cherry-picked from main |
