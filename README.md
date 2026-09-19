@@ -98,16 +98,20 @@ upstream commits as they landed on main):
 ## Gemma-4 patches
 
 Gemma-4 (31B-it, W8A16 + FP8-KV checkpoints) has a 256-dim QK head and
-512-dim value head — FlashInfer's large-head class. On SM8x GPUs,
-fp8-KV serving dies at JIT without the opt-in below; with it, the full
-stack serves: MTP (the Gemma assistant drafter), fp8 KV, and tiered
-CPU + fs KV offload on the same cross-model integrity and pin patches
-above. Validated under warm/churn/extend restore traffic with the
-restore-accounting instrumentation reading full coverage.
+512-dim value head — FlashInfer's large-head class. Two serving modes
+on SM8x: FlashInfer text-only (`--language-model-only`, e4m3 KV with
+the calibrated scales), or Triton multimodal (image support, e5m2 KV —
+FlashInfer does not support this model's multimodal attention). With
+both opt-ins below, the full stack serves: MTP (the Gemma assistant
+drafter), fp8 KV, and tiered CPU + fs KV offload on the same
+cross-model integrity and pin patches above. Validated under
+warm/churn/extend restore traffic with the restore-accounting
+instrumentation reading full coverage.
 
 | commit | what it does | origin |
 |---|---|---|
 | `flashinfer: widen the SM8 large-head opt-in to fp8 one-byte KV` | FlashInfer gates all one-byte-KV large-head (head_dim > 256 on either QK or VO) FA2 modules to SM100+ and its only SM8 opt-in (`allow_nvfp4_sm8_large_head`) is not recognized for fp8, so Gemma-4's 512-dim value head under fp8 KV fails JIT on SM8x with "No supported CUDA architectures found". `install_sm8_fp8_large_head_optin()` in `vllm.utils.flashinfer` extends the opted-in prefill path to fp8_e4m3/e5m2; nvfp4 semantics and non-opted-in paths unchanged; the FlashInfer backend installs it at import and a layout drift raises instead of silently serving the gate | fork-local |
+| `triton attention: serve FP8 KV on SM80+ via e5m2 storage` | FlashInfer does not support this model's multimodal attention and FLASH_ATTN rejects FP8 KV below SM90, so TRITON_ATTN is the only backend that serves Gemma-4 image support on pre-SM100 GPUs — and stock gates its FP8 KV path to SM89+ (triton cannot compile fp8e4nv below SM89). The gate widens to SM80+; below SM89 the quantized KV serves as e5m2 (selected by `kv_fp8_dtype_for_platform`), the cache-store wrappers quantize in torch with round-to-nearest-even (`quantize_kv_e5m2_sm80` — triton's implicit e5m2 cast rounds ties away from even), and large-head prefill tiles stage within SM80/86 shared memory (num_stages 1, halved tile for head_dim > 256). fp8_e5m2 with a calibrated kv_cache_scheme stays permitted below SM89 (e4m3-calibrated scales add mantissa noise but no range risk) and keeps raising on SM89+ | fork-local |
 
 ## Rebase policy
 
