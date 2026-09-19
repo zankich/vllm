@@ -6,8 +6,11 @@ Production fork for Qwen3.8 serving, all on `v0.29.0-qwen`: the 27B
 mamba-hybrid stack (TP2, MTP speculative decoding, prefix caching, fp8
 KV, CPU + disk KV-offload tiers across two serving instances, fs tier
 per instance), and Flash-Next (TP4+EP, MTP, the PLE n-gram table
-pinned host-side and read through UVA) via the backport chain below.
-Upstream vLLM is excellent;
+pinned host-side and read through UVA). The in-tree PLE formats are
+BF16 and FP8 only, and the FP8 table pins ~48 GiB of host RAM, so
+memory-constrained hosts use the int4 PLE plugin from this repo's
+`ple-int4/` (`vllm.general_plugins` entry point). Upstream vLLM is
+excellent;
 this fork exists to carry fixes that had not shipped in a release at
 deploy time. See what this fork changes with:
 
@@ -18,7 +21,7 @@ git log <upstream-tag>..HEAD --stat    # full delta of the last-upstream-tag
 
 ## Branches
 
-- `v0.29.0-qwen` (default) — current, on the v0.29.0 tag: the 27B patches below plus the Flash-Next backport chain (serving gates passed — int4 PLE, MTP and KV offload in one boot, restart-restore byte-compare PASS, benches within 6% of the reference nightly short-context)
+- `v0.29.0-qwen` (default) — current, on the v0.29.0 tag; serves the Qwen3.8-27B stack and Qwen3.8-Flash-Next (serving gates passed — int4 PLE, MTP and KV offload in one boot, restart-restore byte-compare PASS, benches within 6% of the reference nightly short-context)
 - `v0.28.0-qwen` — previous generation, on the v0.28.0 tag
 
 ## Patch set on `v0.29.0-qwen`
@@ -37,32 +40,19 @@ git log <upstream-tag>..HEAD --stat    # full delta of the last-upstream-tag
 | `CPU shm tier: in-memory slot checksums` | post-store slot clobber, aliasing, and torn writers had no detection anywhere in the cascade. `complete_store` records `sha256(key, slot bytes)`; lookup re-verifies once per key per request and a mismatch answers MISS (nothing downstream can crash or misalign), evicts the corrupt block, and emits a removal event. In-memory carrier — the CPU tier has no cross-restart reuse, regions die with their engine | fork-local |
 | `OffloadingConnector: per-request restore-accounting line` | one INFO line per restore with external hits carrying the assembly arithmetic (`prompt`/`local`/`ext`/`boundary`/`keys`/`chunk`) plus ERROR violations on boundary-exceeds-prompt and keys-cannot-cover — the correlation instrument for restore-shape debugging. The store-side companion was removed with the investigation it served: its invariants misfired on healthy traffic and its line fired per scheduled request per step | fork-local |
 | `CPU tier: pin lookup-confirmed hits until load or finish` | store completions and their LRU evictions run on transfer threads asynchronously from the scheduler thread, so an unpinned lookup-confirmed hit could vanish between the connector's confirming lookup and prepare_load — a fatal `Block ... not found in cache` under restore-heavy load, and the mechanism behind repeated corrupt-output incidents (verified end to end under adversarial load before landing). A confirmed HIT now pins (ref_cnt-like, insertion-ordered per request); prepare_load's ref count takes the pin over, never-loaded pins release at request finish, and the corrupt-block reject path accounts for pins. Pressure against pinned keys surfaces as store refusal, never as key disappearance. Latent in stock | fork-local |
-
-## Flash-Next backport chain (also on `v0.29.0-qwen`)
-
-The PLE-UVA backport: six upstream commits
-cherry-picked from main and a qwen4_exp cohort sync from upstream
-`c69d5d72a6` that composes #54517 with #54371's split, so
-Qwen3.8-Flash-Next can serve
-with MTP and KV offload on this branch, where hybrid+MTP+offload is
-proven on the 27B stack. Upstream's current line cannot boot this
-model with the OffloadingConnector at all — hybrid block-size assert,
-MTP+offload CUDA failure, CPU-tier shm size mismatch — which is why
-#54371 was ported here rather than serving the nightly. The in-tree
-PLE formats are BF16 and FP8 only, and the FP8 table pins ~48 GiB of
-host RAM, so memory-constrained hosts need the int4 PLE plugin from
-this repo's `ple-int4/` (`vllm.general_plugins` entry point).
-
-| commit | what it does | origin |
-|---|---|---|
 | [`[Bugfix][Qwen4Exp] ... state index strides in fused PLE conv` (#55375)](https://github.com/vllm-project/vllm/pull/55375) | fixes state index strides in the fused PLE convolution; brings in the new `nvidia/ops/ple.py` split module | upstream, cherry-picked from main |
 | [`[Kernel] Remove unused fake implementation` (#55535)](https://github.com/vllm-project/vllm/pull/55535) | drops unused fake (meta) implementations across the ops wrappers, helion kernels, and qwen4_exp layers | upstream, cherry-picked from main |
 | [`[Qwen3.8-Flash-Next] Remove torch.compile for NVIDIA implementation` (#55272)](https://github.com/vllm-project/vllm/pull/55272) | removes torch.compile from the NVIDIA model path; reshapes `model.py`/`ple_layer.py` to the state #54371's split applies against | upstream, cherry-picked from main |
 | [`[Qwen3.8-Flash-Next] Support FP8 indexer cache for QSA` (#54890)](https://github.com/vllm-project/vllm/pull/54890) | FP8 cache for the QSA indexer; adds `nvidia/ops/qsa_indexer.py` | upstream, cherry-picked from main |
 | [`Fix block FP8 MTP in ModelOpt mixed checkpoints` (#55513)](https://github.com/vllm-project/vllm/pull/55513) | routes block-FP8 routed experts to `Fp8MoEMethod` so FP8 MTP weights in ModelOpt mixed checkpoints load; hand-adapted, see below | upstream, cherry-picked from main, hand-adapted |
 | [`[Qwen4Exp] Support UVA PLE-offload and Engram tensor parallelism` (#54371)](https://github.com/vllm-project/vllm/pull/54371) | the payload: the PLE n-gram table moves to `nvidia/ngram_embedding.py`, pinned host-side and read through UVA on a side stream, Engram tensor parallelism (ETP=TP); adds `vllm/config/engram.py` | upstream, cherry-picked from main |
-| `Exclude block-misaligned KV groups from offloading` | Flash-Next + MTP forms groups [800 x5, 8]: the QSA indexer `raw_key_cache`'s 8-token block cannot chunk-hash at the 800-token granularity, and the offloading path asserted at config build, then in scheduler key/load/store math once the group was dropped outright. Misaligned groups keep their positional entry with no layers — nothing registers, stores, loads, or lookups for them — while the main-model context offloads normally. Verified by the restart-restore byte-compare protocol (garble PASS, ~3 GiB CPU-to-GPU restore) | fork-local |
+| `Exclude block-misaligned KV groups from offloading` | Flash-Next + MTP forms groups [800 x5, 8]: the QSA indexer `raw_key_cache`'s 8-token block cannot chunk-hash at the 800-token granularity, and the offloading path asserted at config build, then in scheduler key/load/store math once the group was dropped outright. Misaligned groups keep their positional entry with no layers — nothing registers, stores, loads, or lookups for them — while the main-model context offloads normally | fork-local |
 | [`[Qwen3.8-Flash-Next] Fuse Qwen4Exp PLE kernels` (#54517)](https://github.com/vllm-project/vllm/pull/54517) | load-critical for split-projection checkpoints: carries the `ple.key_proj`/`ple.value_proj` → merged `kv_proj` stacked-params remap, without which halt95-class checkpoints fail with `no module or parameter named layers.1.ple.key_proj`; also fuses the PLE kernels | upstream, composed via the cohort sync below |
+
+Upstream's current line cannot boot Flash-Next with the
+OffloadingConnector at all (hybrid block-size assert, MTP+offload CUDA
+failure, CPU-tier shm size mismatch), which is why the #54371 line is
+carried here rather than serving the nightly.
 
 Hand-adaptations forced by intermediate-commit drift (the deltas vs the
 upstream commits as they landed on main):
@@ -97,15 +87,14 @@ upstream commits as they landed on main):
 Each upstream release: check which patches upstream has absorbed
 (`git merge-base --is-ancestor <upstream-sha> <tag>`), re-port the rest.
 The commit messages record every hand-adaptation forced by
-intermediate-commit drift; the backport chain's adaptations are the
-bullets above, since its picks keep their upstream messages. Patches
+intermediate-commit drift; the Flash-Next picks' adaptations are the
+bullets above, since they keep their upstream messages. Patches
 here exist to be deleted — the
 permanent fixes are the fork-local ones until upstream takes them.
-The backport chain is six upstream cherry-picks, one graft, one cohort
-sync, and one fork-local offloading fix (which persists until upstream
-grows its own exclusion knob); the upstream part deletes wholesale at
-the first final release the fork rebases onto that contains #54371 and
-#54517 (both already in v0.29.1rc0).
+The Flash-Next upstream picks (six cherry-picks, one graft, one cohort
+sync) delete wholesale at the first final release the fork rebases onto
+that contains #54371 and #54517 (both already in v0.29.1rc0); the
+misaligned-group exclusion persists until upstream grows its own knob.
 
 ---
 
