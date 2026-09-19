@@ -1141,6 +1141,76 @@ def is_flashinfer_cudnn_fp8_prefill_attn_supported() -> bool:
     return True
 
 
+# Fork-local (2026-09-19): FlashInfer gates all one-byte-KV large-head
+# (head_dim > 256) FA2 modules to SM100+, and its only SM8 opt-in,
+# `allow_nvfp4_sm8_large_head`, is not recognized for fp8 dtypes — the
+# FA2 prefill caller passes the flag unconditionally, but the gate
+# still rejects fp8, so large-head models (Gemma-4 class) under fp8 KV
+# fail JIT on SM8x. The wrapper below extends the opted-in path to
+# fp8_e4m3/e5m2; nvfp4 semantics and every non-opted-in path keep
+# flashinfer's own behavior. Installed by the FlashInfer attention
+# backend at import.
+_ORIG_FA2_HEAD_DIM_NVCC_FLAGS = None
+
+_SM8_FP8_ONE_BYTE_DTYPES = (
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+)
+
+
+def install_sm8_fp8_large_head_optin() -> None:
+    """Widen flashinfer's SM8 large-head opt-in to fp8 one-byte KV.
+
+    Raises:
+        RuntimeError: if flashinfer's gate layout has drifted — the
+            wrapper refuses to leave the SM100+ restriction silently in
+            place.
+    """
+    global _ORIG_FA2_HEAD_DIM_NVCC_FLAGS
+    from flashinfer.jit.attention import modules as _fi_modules
+
+    gate = getattr(_fi_modules, "_fa2_head_dim_nvcc_flags", None)
+    if gate is None or _ORIG_FA2_HEAD_DIM_NVCC_FLAGS is not None:
+        if (
+            _ORIG_FA2_HEAD_DIM_NVCC_FLAGS is not None
+            and gate is _fi_modules._fa2_head_dim_nvcc_flags
+        ):
+            return  # already installed
+        raise RuntimeError(
+            "flashinfer layout changed: _fa2_head_dim_nvcc_flags missing "
+            "or replaced — the SM8 fp8 large-head opt-in needs "
+            "re-porting. Refusing to serve the SM100+ gate silently."
+        )
+    _ORIG_FA2_HEAD_DIM_NVCC_FLAGS = gate
+
+    @functools.wraps(gate)
+    def _fa2_head_dim_nvcc_flags_fp8(
+        head_dim_qk: int,
+        head_dim_vo: int,
+        dtype_kv: torch.dtype,
+        *,
+        allow_nvfp4_sm8_large_head: bool = False,
+    ):
+        if (
+            (head_dim_qk > 256 or head_dim_vo > 256)
+            and dtype_kv.itemsize == 1
+            and allow_nvfp4_sm8_large_head
+            and dtype_kv in _SM8_FP8_ONE_BYTE_DTYPES
+        ):
+            return _fi_modules.current_compilation_context.get_nvcc_flags_list(
+                supported_major_versions=[8, 9, 10, 11, 12]
+            )
+        return gate(
+            head_dim_qk,
+            head_dim_vo,
+            dtype_kv,
+            allow_nvfp4_sm8_large_head=allow_nvfp4_sm8_large_head,
+        )
+
+    _fa2_head_dim_nvcc_flags_fp8._vllm_sm8_fp8_optin = True
+    _fi_modules._fa2_head_dim_nvcc_flags = _fa2_head_dim_nvcc_flags_fp8
+
+
 __all__ = [
     "has_flashinfer",
     "flashinfer_bf16_mm",

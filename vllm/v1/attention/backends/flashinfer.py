@@ -43,9 +43,17 @@ from vllm.utils.flashinfer import (
     can_use_trtllm_attention,
     flashinfer_xqa_batch_decode_with_kv_cache,
     force_use_trtllm_attention,
+    install_sm8_fp8_large_head_optin,
     supports_trtllm_attention,
     use_trtllm_attention,
 )
+
+# Fork-local: large-head (head_dim > 256) fp8-KV models on SM8x fail
+# FlashInfer JIT without the widened opt-in (see
+# vllm.utils.flashinfer.install_sm8_fp8_large_head_optin). Installed at
+# import so every engine using this backend carries it; raises on
+# flashinfer layout drift rather than silently serving the SM100+ gate.
+install_sm8_fp8_large_head_optin()
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import (
