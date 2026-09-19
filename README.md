@@ -35,7 +35,6 @@ Apply to every model this fork serves.
 | `CPU shm tier: in-memory slot checksums` | post-store slot clobber, aliasing, and torn writers had no detection anywhere in the cascade. `complete_store` records `sha256(key, slot bytes)`; lookup re-verifies once per key per request and a mismatch answers MISS (nothing downstream can crash or misalign), evicts the corrupt block, and emits a removal event. In-memory carrier — the CPU tier has no cross-restart reuse, regions die with their engine | fork-local |
 | `OffloadingConnector: per-request restore-accounting line` | one INFO line per restore with external hits carrying the assembly arithmetic (`prompt`/`local`/`ext`/`boundary`/`keys`/`chunk`) plus ERROR violations on boundary-exceeds-prompt and keys-cannot-cover — the correlation instrument for restore-shape debugging. The store-side companion was removed with the investigation it served: its invariants misfired on healthy traffic and its line fired per scheduled request per step | fork-local |
 | `CPU tier: pin lookup-confirmed hits until load or finish` | store completions and their LRU evictions run on transfer threads asynchronously from the scheduler thread, so an unpinned lookup-confirmed hit could vanish between the connector's confirming lookup and prepare_load — a fatal `Block ... not found in cache` under restore-heavy load, and the mechanism behind repeated corrupt-output incidents (verified end to end under adversarial load before landing). A confirmed HIT now pins (ref_cnt-like, insertion-ordered per request); prepare_load's ref count takes the pin over, never-loaded pins release at request finish, and the corrupt-block reject path accounts for pins. Pressure against pinned keys surfaces as store refusal, never as key disappearance. Latent in stock | fork-local |
-| `flashinfer: widen the SM8 large-head opt-in to fp8 one-byte KV` | FlashInfer gates all one-byte-KV large-head (head_dim > 256) FA2 modules to SM100+ and its only SM8 opt-in is not recognized for fp8, so large-head models under fp8 KV fail JIT on SM8x. `install_sm8_fp8_large_head_optin()` in `vllm.utils.flashinfer` extends the opted-in prefill path to fp8_e4m3/e5m2; nvfp4 semantics and non-opted-in paths unchanged; the FlashInfer backend installs it at import and a layout drift raises instead of silently serving the gate | fork-local |
 
 ## Qwen3.8 patches
 
@@ -95,6 +94,20 @@ upstream commits as they landed on main):
 - `nvidia/ops/qsa.py` and `ops/hc.py` ride the cohort sync to their
   upstream states; `vllm/config/engram.py` and `nvidia/ngram_embedding.py`
   are new files.
+
+## Gemma-4 patches
+
+Gemma-4 (31B-it, W8A16 + FP8-KV checkpoints) has a 256-dim QK head and
+512-dim value head — FlashInfer's large-head class. On SM8x GPUs,
+fp8-KV serving dies at JIT without the opt-in below; with it, the full
+stack serves: MTP (the Gemma assistant drafter), fp8 KV, and tiered
+CPU + fs KV offload on the same cross-model integrity and pin patches
+above. Validated under warm/churn/extend restore traffic with the
+restore-accounting instrumentation reading full coverage.
+
+| commit | what it does | origin |
+|---|---|---|
+| `flashinfer: widen the SM8 large-head opt-in to fp8 one-byte KV` | FlashInfer gates all one-byte-KV large-head (head_dim > 256 on either QK or VO) FA2 modules to SM100+ and its only SM8 opt-in (`allow_nvfp4_sm8_large_head`) is not recognized for fp8, so Gemma-4's 512-dim value head under fp8 KV fails JIT on SM8x with "No supported CUDA architectures found". `install_sm8_fp8_large_head_optin()` in `vllm.utils.flashinfer` extends the opted-in prefill path to fp8_e4m3/e5m2; nvfp4 semantics and non-opted-in paths unchanged; the FlashInfer backend installs it at import and a layout drift raises instead of silently serving the gate | fork-local |
 
 ## Rebase policy
 
