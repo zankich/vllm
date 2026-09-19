@@ -2,7 +2,7 @@
 <!-- fork-preamble-start -->
 # zankich/vllm — fork of vllm-project/vllm
 
-General-purpose serving fork carrying model-specific enablement and
+Fork of vLLM carrying model-specific enablement and
 fixes (Qwen3.8-27B, Qwen3.8-Flash-Next, Gemma-4) plus cross-model
 patches for KV-offload correctness, FlashInfer on SM8x, and the
 Anthropic `/v1/messages` endpoint. Upstream vLLM is excellent;
@@ -17,7 +17,6 @@ git log <upstream-tag>..HEAD --stat    # full delta of the last-upstream-tag
 ## Branches
 
 - `v0.29.0z` (default) — current, on the v0.29.0 tag; serves the Qwen3.8-27B stack (TP2, MTP, prefix caching, fp8 KV, tiered CPU + fs KV offload), Qwen3.8-Flash-Next (TP4+EP, MTP, UVA PLE; serving gates passed — int4 PLE, MTP and KV offload in one boot, restart-restore byte-compare PASS, benches within 6% of the reference nightly short-context), and Gemma-4 (TP2, MTP, fp8 KV, tiered offload)
-- `v0.28.0-qwen` — previous generation (Qwen3.8-27B), on the v0.28.0 tag
 
 ## Cross-model patches
 
