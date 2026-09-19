@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import math
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -182,46 +181,6 @@ def _group_participates(spec: Any, idx: int) -> bool:
     if groups is not None and idx < len(groups):
         return bool(getattr(groups[idx], "layer_names", None))
     return True
-
-
-def store_accounting_summary(
-    req_id: str,
-    watermark: int,
-    num_prompt_tokens: int,
-    num_tokens: int,
-    num_computed_tokens: int,
-    hashed_blocks: int,
-    block_size: int,
-    is_finished: bool,
-) -> tuple[str, list[str]]:
-    """Store-side companion to restore_accounting_summary.
-
-    The hashed-prefix invariant: a store may only reach tokens whose block
-    hashes exist (the request's committed-content watermark). Hashes are of
-    token ids and appended optimistically under spec decode, so this line
-    records — per store job — the arithmetic needed to detect stores past
-    the confirmed boundary, the surviving poison-mint candidate after
-    #54288 (which only clamped the FINISHED branch and is a no-op for
-    offload_prompt_only configs, where the prompt clamp already applied).
-    """
-    hashed_tokens = hashed_blocks * block_size
-    violations: list[str] = []
-    if watermark > hashed_tokens:
-        violations.append(
-            f"store beyond hashed prefix: {watermark} > {hashed_tokens} "
-            f"({hashed_blocks} blocks x {block_size})"
-        )
-    if watermark > num_computed_tokens:
-        violations.append(
-            f"store exceeds computed: {watermark} > {num_computed_tokens}"
-        )
-    line = (
-        f"store-accounting req={req_id} watermark={watermark} "
-        f"prompt={num_prompt_tokens} tokens={num_tokens} "
-        f"computed={num_computed_tokens} hashed={hashed_tokens} "
-        f"finished={is_finished}"
-    )
-    return line, violations
 
 
 def get_sliding_window_size_in_chunks(
@@ -657,17 +616,6 @@ class OffloadingConnectorScheduler:
         # Store-accounting needs the GPU hash-block size (block_hashes are
         # per GPU block); any group's spec carries it.
         self._gpu_block_size = kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
-        # Fork-local alignment shift, opt-in via kv_connector_extra_config
-        # {"alignment_shift": true}: pure-tier flush-aligned restores drop
-        # their trailing chunk (corrupt-output mitigation). Default off —
-        # the behavior change is deliberate configuration, not a side effect.
-        # Defensive on spec shape: unit fixtures double the spec without
-        # a config attribute.
-        _spec_config = getattr(spec, "config", None)
-        _extra = getattr(_spec_config, "extra_config", None)
-        self._alignment_shift = bool(
-            (_extra or {}).get("alignment_shift", False)
-        )
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats = OffloadingConnectorStats()
 
@@ -1177,54 +1125,6 @@ class OffloadingConnectorScheduler:
                     req_status.deferred_lookup_start_time = lookup_start
             else:
                 self._maybe_observe_lookup_async_delay(req_status)
-                # Alignment shift (fork, 2026-09-18): every corrupting restore
-                # was pure-tier (local == 0) AND consumed the full-attention
-                # group's stored extent flush (boundary == keys x chunk);
-                # the one clean control with the same shape left extent
-                # unused. Tighten exactly that shape by one chunk so its
-                # tail recomputes — the partial-tail re-prefill overwrites
-                # the would-be-poisoned surface, whichever side the defect
-                # is on. Post-convergence, so the mamba alignment never
-                # re-rounds; scoped off whenever GPU-local hits exist.
-                fa_idx = next(
-                    (
-                        i
-                        for i, g in enumerate(self.config.kv_group_configs)
-                        if isinstance(g.kv_cache_spec, FullAttentionSpec)
-                    ),
-                    None,
-                )
-                if (
-                    fa_idx is not None
-                    and self._alignment_shift
-                    and req_status.partial_tail_boundary is None
-                ):
-                    # Shave by the LCM of every participating group's
-                    # chunk, not just the FA grid: the reduced boundary
-                    # must stay a whole-chunk multiple for coarser
-                    # siblings (recurrent groups at 3x granularity cannot
-                    # cover a 1600-shaved boundary — their partial-chunk
-                    # coverage needs a boundary key that was never
-                    # stored — and loading the full window instead
-                    # overshoots the engine's block allocation on small
-                    # extensions). An LCM-multiple boundary is legal for
-                    # every group, needs no boundary keys, fits the
-                    # allocation the engine derived from the shaved
-                    # count, and its recompute overwrites the FA tail
-                    # chunk the fingerprint indicts.
-                    chunk_lcm = math.lcm(
-                        *(
-                            g.tokens_per_chunk
-                            for g in self.config.kv_group_configs
-                            if g.participates
-                        )
-                    )
-                    if (
-                        num_computed_tokens == 0
-                        and num_hit_tokens >= 2 * chunk_lcm
-                        and num_hit_tokens % chunk_lcm == 0
-                    ):
-                        num_hit_tokens -= chunk_lcm
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
         self._touch(req_status)
@@ -1620,27 +1520,6 @@ class OffloadingConnectorScheduler:
             num_offloadable_tokens = self._calc_num_offloadable_tokens(
                 req_status, num_tokens_after_batch
             )
-
-            # Store-side accounting (corruption-RCA): the hashed-prefix invariant
-            # detects stores past the request's committed-content watermark.
-            s_line, s_violations = store_accounting_summary(
-                req_id=req_id,
-                watermark=num_offloadable_tokens,
-                num_prompt_tokens=req.num_prompt_tokens,
-                num_tokens=req.num_tokens,
-                num_computed_tokens=req.num_computed_tokens,
-                hashed_blocks=len(req.block_hashes),
-                block_size=self._gpu_block_size,
-                is_finished=req.is_finished(),
-            )
-            logger.info(s_line)
-            for violation in s_violations:
-                logger.error(
-                    "store-accounting VIOLATION req=%s: %s "
-                    "(poison-mint candidate — capture this request)",
-                    req_id,
-                    violation,
-                )
 
             # Filter out chunks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
