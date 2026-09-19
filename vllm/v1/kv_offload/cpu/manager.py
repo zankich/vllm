@@ -77,7 +77,7 @@ class CPUOffloadingManager(OffloadingManager):
         # disables checking entirely (unit construction, legacy behavior).
         # Corruption between the GPU->CPU copy and the recording lands
         # recorded-torn and is not detectable here — same store-time limit
-        # as the fs tier's sidecar carrier.
+        # as the fs tier's xattr carrier.
         self._kv_bytes: memoryview | None = (
             kv_memoryview.cast("B") if kv_memoryview is not None else None
         )
@@ -178,7 +178,7 @@ class CPUOffloadingManager(OffloadingManager):
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
         # Release lookup pins for keys the request never loaded (scanned
-        # hits beyond the converged boundary, eagle/shift-popped chunks):
+        # hits beyond the converged boundary, eagle-popped chunks):
         # without this, every confirmed-but-unloaded hit would stay
         # non-evictable forever.
         pins: list[OffloadKey] | None = getattr(req_context, "_load_pins", None)
