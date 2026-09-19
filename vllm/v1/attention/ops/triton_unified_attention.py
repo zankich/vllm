@@ -982,6 +982,16 @@ def unified_attention(
         head_size, sliding_window_val, q.element_size(), is_prefill=False
     )
 
+    # PATCH triton-fp8kv-sm80: SM80/86 shared memory (100KB per block) cannot
+    # hold the default head_dim-512 prefill tiles with Triton's default
+    # pipelining (required ~112KB, limit 101376). Cap num_stages at 1 and
+    # halve the prefill tile for large heads on sub-SM90 devices only.
+    if current_platform.is_cuda() and not current_platform.has_device_capability(90):
+        if launch_num_stages is None:
+            launch_num_stages = 1
+        if head_size > 256:
+            TILE_SIZE_PREFILL = 16
+
     # Wider KV tile for the tuned large-head path (see above). Only the 2D
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
     if tuned_large_head:
