@@ -25,8 +25,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends libsndfile1 \
 # vllm[audio] resolves the patched vllm as already-satisfied and pip
 # adds only the extras; if vllm ever gets reinstalled the diff below
 # fails the build loud.
+# vllm 0.29.0's wheel metadata pins nvidia-nccl-cu13==2.29.7 but this
+# image ships 2.30.7; `pip install "vllm[audio]"` re-resolves vllm's
+# full dep tree to fix that contradiction — silently downgrading NCCL
+# (kills DeepEP v2, changes TP collectives) or, if NCCL is pinned,
+# replacing vllm with an old PyPI version entirely. The drift diff
+# below catches both, but the only install that leaves the env correct
+# is naming the extras directly. librosa explicit: mistral_common is
+# preinstalled without its [audio] extra, so pip skips expanding it.
 RUN pip show vllm > /tmp/vllm-before.txt \
-    && pip install --no-cache-dir "vllm[audio]" \
+    && pip install --no-cache-dir av scipy soundfile soxr "mistral_common[audio]" librosa \
     && pip show vllm > /tmp/vllm-after.txt \
     && diff -u /tmp/vllm-before.txt /tmp/vllm-after.txt > /dev/null \
     && rm /tmp/vllm-before.txt /tmp/vllm-after.txt
