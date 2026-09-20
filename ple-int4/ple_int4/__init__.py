@@ -82,7 +82,6 @@ def install() -> None:
         ng.Qwen4ExpPLEPinnedHostEmbedding = Qwen4ExpPLEPinnedHostInt4Embedding
         ng.Qwen4ExpNGramEmbedding.load_weights = patched_load_weights
 
-        _install_tp4_allreduce_patch()
         _install_offload_hybrid_patch()
         _INSTALLED = True
 
@@ -156,44 +155,12 @@ def _install_offload_hybrid_patch() -> None:
     _oc.get_offloading_group_ids = _aligned_group_ids
 
 
-def _install_tp4_allreduce_patch() -> None:
-    """Force CudaPlatform.is_fully_connected() -> True (TP4 without NVLink).
-
-    vLLM gates the CUSTOM all-reduce path on `world_size > 2 and not
-    fully_connected`, and that probe asks for NVLink specifically. Four
-    PCIe-only 3090 Ti with working P2P across every pair (`nvidia-smi topo
-    -p2p r/w` OK), so the gate rejects a path the hardware supports and TP4
-    falls back to PYNCCL alone. Measured +4.5% single-stream decode at TP2
-    on this box; the win is decode's small-message latency, not prefill.
-
-    The in-image equivalent is the `sed` in the deploy repo's TP4 composes; doing it here keeps the zero-vLLM-tree-edit property
-    and reaches every worker through the same plugin entry point.
-
-    HARD CONSTRAINT: mutually exclusive with
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments — VMM ranges break
-    cudaIpcGetMemHandle and workers die at custom_all_reduce.cuh:164
-    'invalid argument'. Never set that env with this patch active.
-
-    Disable with PLE_INT4_TP4_ALLREDUCE=0.
-    """
-    import os
-
-    if os.environ.get("PLE_INT4_TP4_ALLREDUCE", "1") == "0":
-        return
-    if os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "").find("expandable_segments") >= 0:
-        raise RuntimeError(
-            "ple_int4: expandable_segments is mutually exclusive with the CUSTOM "
-            "all-reduce path (custom_all_reduce.cuh:164). Unset "
-            "PYTORCH_CUDA_ALLOC_CONF or set PLE_INT4_TP4_ALLREDUCE=0."
-        )
-    try:
-        from vllm.platforms.cuda import CudaPlatform
-    except ImportError:  # pragma: no cover
-        return
-    _ORIGINALS["is_fully_connected"] = CudaPlatform.is_fully_connected
-    CudaPlatform.is_fully_connected = classmethod(
-        lambda cls, physical_device_ids: True
-    )
+# The TP4 all-reduce force moved into the fork source (2026-09-20):
+# NvmlCudaPlatform.is_fully_connected accepts P2P read/write when NVLink
+# is absent, and cuda_communicator allows the ep group. The plugin no
+# longer patches it — the probe in source asks the hardware instead of
+# forcing True, and the expandable_segments exclusion stays documented
+# in the composes (custom_all_reduce.cuh:164).
 
 
 def uninstall() -> None:
@@ -209,10 +176,6 @@ def uninstall() -> None:
         ]
         ng.Qwen4ExpPLEPinnedHostEmbedding = _ORIGINALS["pinned_host_embedding"]
         ng.Qwen4ExpNGramEmbedding.load_weights = _ORIGINALS["load_weights"]
-        if "is_fully_connected" in _ORIGINALS:
-            from vllm.platforms.cuda import CudaPlatform
-
-            CudaPlatform.is_fully_connected = _ORIGINALS.pop("is_fully_connected")
         if "offload_group_ids" in _ORIGINALS:
             from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
                 config as _oc,

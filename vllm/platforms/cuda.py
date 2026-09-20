@@ -791,6 +791,11 @@ class NvmlCudaPlatform(CudaPlatformBase):
     def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
         """
         query if the set of gpus are fully connected by nvlink (1 hop)
+
+        The fork falls back to the generic P2P capability when NVLink is
+        absent: the CUSTOM all-reduce path needs direct peer access, not
+        NVLink specifically, and PCIe-only boxes with P2P across every
+        pair (nvidia-smi topo -p2p OK) run the one-shot IPC kernel fine.
         """
         handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
         for i, handle in enumerate(handles):
@@ -803,7 +808,19 @@ class NvmlCudaPlatform(CudaPlatformBase):
                             pynvml.NVML_P2P_CAPS_INDEX_NVLINK,
                         )
                         if p2p_status != pynvml.NVML_P2P_STATUS_OK:
-                            return False
+                            # No NVLink; the custom all-reduce kernel needs
+                            # direct peer read/write, not NVLink specifically.
+                            for caps in (
+                                pynvml.NVML_P2P_CAPS_INDEX_READ,
+                                pynvml.NVML_P2P_CAPS_INDEX_WRITE,
+                            ):
+                                p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+                                    handle,
+                                    peer_handle,
+                                    caps,
+                                )
+                                if p2p_status != pynvml.NVML_P2P_STATUS_OK:
+                                    return False
                     except pynvml.NVMLError:
                         logger.exception(
                             "NVLink detection failed. This is normal if"
