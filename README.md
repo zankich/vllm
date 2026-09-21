@@ -48,9 +48,14 @@ Apply to every model this fork serves.
 ### Flash-Next
 
 The in-tree PLE formats are BF16 and FP8 only, and the FP8 table pins
-~48 GiB of host RAM, so memory-constrained hosts use the int4 PLE
-plugin from this repo's `ple-int4/` (`vllm.general_plugins` entry
-point).
+~48 GiB of host RAM — and its pinned-lookup kernel is fp8e4nv-native
+Triton, which SM8x rejects at compile (no fallback; `_reduce_etp_`
+all-reduces raw fp8 bytes on the same Hopper assumption), so on Ampere
+the stock FP8 PLE is unservable outright. Both reasons point
+memory-constrained Ampere hosts at the int4 PLE plugin from this
+repo's `ple-int4/` (`vllm.general_plugins` entry point; on a non-int4
+config set `VLLM_PLUGINS=""` to unbind it and get truly stock
+behavior).
 
 | commit | what it does | origin |
 |---|---|---|
