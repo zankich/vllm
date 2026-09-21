@@ -22,6 +22,11 @@ multiply and Qwen4ExpPLEInt4EmbeddingMethod.dequantize is a plain cast).
 import triton
 import triton.language as tl
 
+from ple_int4.probe import _maybe_build
+
+# None unless PLE_INT4_PROBE=1; see probe.py.
+_PROBE = _maybe_build()
+
 
 @triton.jit
 def _lookup_ple_int4_from_pinned_kernel(
@@ -88,6 +93,8 @@ def lookup_ple_int4_from_pinned(
     block_d = triton.next_power_of_2(embedding_dim)
     numel = flat_ids.numel()
     if numel:
+        if _PROBE is not None:
+            _PROBE.record(flat_ids, vocab_start, vocab_end)
         _lookup_ple_int4_from_pinned_kernel[(numel,)](
             uva_weight,
             uva_scale,
