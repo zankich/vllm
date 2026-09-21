@@ -66,20 +66,25 @@ def install() -> None:
             )
 
         original_fqc = ng.Qwen4ExpPLEEmbeddingMethod.from_quant_config
+        stock_pinned_host = ng.Qwen4ExpPLEPinnedHostEmbedding
 
         def _from_quant_config(quant_config, prefix, embedding_dtype=None):
             if embedding_dtype == "int4":
+                # Bind the int4 pinned-host backend before the construction
+                # site resolves the module global.
+                ng.Qwen4ExpPLEPinnedHostEmbedding = Qwen4ExpPLEPinnedHostInt4Embedding
                 return Qwen4ExpPLEInt4EmbeddingMethod()
+            # Non-int4 config: restore stock so this plugin changes nothing.
+            ng.Qwen4ExpPLEPinnedHostEmbedding = stock_pinned_host
             return original_fqc(quant_config, prefix, embedding_dtype)
 
         _ORIGINALS["from_quant_config"] = original_fqc
-        _ORIGINALS["pinned_host_embedding"] = ng.Qwen4ExpPLEPinnedHostEmbedding
+        _ORIGINALS["pinned_host_embedding"] = stock_pinned_host
         _ORIGINALS["load_weights"] = ng.Qwen4ExpNGramEmbedding.load_weights
 
         ng.Qwen4ExpPLEEmbeddingMethod.from_quant_config = staticmethod(
             _from_quant_config
         )
-        ng.Qwen4ExpPLEPinnedHostEmbedding = Qwen4ExpPLEPinnedHostInt4Embedding
         ng.Qwen4ExpNGramEmbedding.load_weights = patched_load_weights
 
         _install_offload_hybrid_patch()

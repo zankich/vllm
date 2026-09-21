@@ -162,9 +162,12 @@ def test_dispatch_marker_and_env():
         # unknown marker with a None quant_config routes to stock unquantized
         mu = ng.Qwen4ExpPLEEmbeddingMethod.from_quant_config(None, "prefix", None)
         assert type(mu).__name__ == "Qwen4ExpPLEUnquantizedEmbeddingMethod"
-        # the rebind is visible on the module
+        # binding follows the last-seen dtype (config-driven): stock after mu
         from ple_int4.method import Qwen4ExpPLEPinnedHostInt4Embedding
 
+        assert ng.Qwen4ExpPLEPinnedHostEmbedding is not Qwen4ExpPLEPinnedHostInt4Embedding
+        # and flips to the int4 backend on the int4 marker
+        ng.Qwen4ExpPLEEmbeddingMethod.from_quant_config(None, "prefix", "int4")
         assert ng.Qwen4ExpPLEPinnedHostEmbedding is Qwen4ExpPLEPinnedHostInt4Embedding
     finally:
         uninstall()
