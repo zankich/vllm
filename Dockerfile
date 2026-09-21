@@ -22,19 +22,17 @@ RUN pip install --no-cache-dir /opt/ple-int4 \
 # Step 3: install Gemma-4 audio support (libsndfile is soundfile's system dep)
 RUN apt-get update && apt-get install -y --no-install-recommends libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
-# vllm[audio] resolves the patched vllm as already-satisfied and pip
-# adds only the extras; if vllm ever gets reinstalled the diff below
-# fails the build loud.
-# vllm 0.29.0's wheel metadata pins nvidia-nccl-cu13==2.29.7 but this
-# image ships 2.30.7; `pip install "vllm[audio]"` re-resolves vllm's
-# full dep tree to fix that contradiction — silently downgrading NCCL
-# (kills DeepEP v2, changes TP collectives) or, if NCCL is pinned,
-# replacing vllm with an old PyPI version entirely. The drift diff
-# below catches both, but the only install that leaves the env correct
-# is naming the extras directly. librosa explicit: mistral_common is
-# preinstalled without its [audio] extra, so pip skips expanding it.
+# torch 2.13.0+cu130 pins nvidia-nccl-cu13==2.29.7 in its metadata, but
+# this image deliberately ships 2.30.7 (DeepEP v2 needs >= 2.30.4).
+# Installing vllm[audio] re-resolves against torch's pin and downgrades
+# NCCL, so the second install restores the version the base image came
+# with. They must be separate invocations: asking one resolver pass for
+# both backtracks to vllm 0.19.1 from PyPI, replacing the patched tree.
+# librosa explicit: mistral_common is preinstalled without its [audio]
+# extra, so pip's already-satisfied check skips expanding it.
 RUN pip show vllm > /tmp/vllm-before.txt \
-    && pip install --no-cache-dir av scipy soundfile soxr "mistral_common[audio]" librosa \
+    && pip install --no-cache-dir "vllm[audio]" librosa \
+    && pip install --no-cache-dir "nvidia-nccl-cu13==2.30.7" \
     && pip show vllm > /tmp/vllm-after.txt \
     && diff -u /tmp/vllm-before.txt /tmp/vllm-after.txt > /dev/null \
     && rm /tmp/vllm-before.txt /tmp/vllm-after.txt
