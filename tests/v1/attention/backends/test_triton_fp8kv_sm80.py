@@ -35,6 +35,12 @@ class _FakePlatform:
     def has_device_capability(self, major):
         return self._cap >= major
 
+    def is_device_capability_family(self, family):
+        return False
+
+    def fp8_dtype(self):
+        return torch.float8_e4m3fn
+
 
 # --- gate: FP8 KV supported from SM80 on CUDA ---
 
@@ -143,6 +149,81 @@ def test_triton_backend_keeps_default_dtype_on_sm89_plus():
 
 
 # --- unified attention staging ---
+
+
+class _KernelCapture:
+    """Records the kwargs of a mocked triton kernel launch."""
+
+    def __init__(self):
+        self.kwargs: dict | None = None
+
+    def __getitem__(self, grid):
+        def launch(**kwargs):
+            self.kwargs = kwargs
+
+        return launch
+
+
+def _launch_prefill_below_sm90(kv_dtype: torch.dtype, head_size: int) -> dict:
+    """Run one prefill through unified_attention on a mocked sub-SM90 CUDA
+    platform and return the kwargs the kernel launch received."""
+    from vllm.v1.attention.ops import triton_unified_attention as tua
+
+    block_size, num_blocks, num_tokens = 16, 8, 64
+    q = torch.zeros(num_tokens, 1, head_size, dtype=torch.bfloat16)
+    k_cache = torch.zeros(num_blocks, block_size, 1, head_size, dtype=kv_dtype)
+    v_cache = torch.zeros_like(k_cache)
+    out = torch.zeros_like(q)
+    cu_seqlens_q = torch.tensor([0, num_tokens], dtype=torch.int32)
+    seqused_k = torch.tensor([64], dtype=torch.int32)
+    block_table = torch.zeros(1, num_blocks, dtype=torch.int32)
+
+    capture = _KernelCapture()
+    with (
+        patch.object(tua, "current_platform", _FakePlatform(80)),
+        patch.object(tua, "kernel_unified_attention", capture),
+    ):
+        tua.unified_attention(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            cu_seqlens_q,
+            num_tokens,  # max_seqlen_q > 1: prefill, 2D kernel
+            seqused_k,
+            64,
+            1.0,
+            True,
+            (-1, -1),
+            block_table,
+            0.0,
+            None,
+            None,
+            None,
+        )
+    assert capture.kwargs is not None
+    return capture.kwargs
+
+
+def test_non_fp8_prefill_below_sm90_keeps_default_launch_stages():
+    """The stage cap and tile halving are the fp8-KV large-head shared-memory
+    workaround; a bf16 sub-SM90 prefill must stay on stock launch behavior
+    (Triton's default num_stages, default prefill tile)."""
+    kwargs = _launch_prefill_below_sm90(torch.bfloat16, head_size=128)
+    assert "num_stages" not in kwargs
+    assert kwargs["TILE_SIZE"] == 32
+
+    kwargs = _launch_prefill_below_sm90(torch.bfloat16, head_size=512)
+    assert "num_stages" not in kwargs
+    assert kwargs["TILE_SIZE"] == 32
+
+
+def test_fp8_large_head_prefill_below_sm90_keeps_stage_cap():
+    """The workaround itself stays: fp8 KV with a large head on sub-SM90
+    launches with num_stages=1 and the halved prefill tile."""
+    kwargs = _launch_prefill_below_sm90(torch.float8_e5m2, head_size=512)
+    assert kwargs.get("num_stages") == 1
+    assert kwargs["TILE_SIZE"] == 16
 
 
 def test_unified_attention_caps_stages_for_large_head_below_sm90():

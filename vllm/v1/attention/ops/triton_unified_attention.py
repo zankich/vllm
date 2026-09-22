@@ -990,8 +990,14 @@ def unified_attention(
     # PATCH triton-fp8kv-sm80: SM80/86 shared memory (100KB per block) cannot
     # hold the default head_dim-512 prefill tiles with Triton's default
     # pipelining (required ~112KB, limit 101376). Cap num_stages at 1 and
-    # halve the prefill tile for large heads on sub-SM90 devices only.
-    if current_platform.is_cuda() and not current_platform.has_device_capability(90):
+    # halve the prefill tile for large heads on sub-SM90 devices — only for
+    # fp8-KV serving, the workload the constraint was measured on; every
+    # other sub-SM90 prefill keeps stock launch behavior.
+    if (
+        current_platform.is_cuda()
+        and not current_platform.has_device_capability(90)
+        and k.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
+    ):
         if launch_num_stages is None:
             launch_num_stages = 1
         if head_size > 256:
