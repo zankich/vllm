@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import fcntl
 import functools
 import time
 from collections import deque
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -198,6 +200,26 @@ def _canonical_block_sizes(
 MAX_HOST_REGISTER_CHUNK_BYTES = 64 * 1024**3
 
 
+@contextmanager
+def _region_registration_lock(region: SharedOffloadRegion):
+    """Serialize chunked cudaHostRegister and its rollback across ranks.
+
+    Concurrent registrations over the same pages intermittently fail with
+    cudaErrorInvalidValue on some drivers (observed on RTX 3090 Ti, TP2,
+    where one rank succeeded while the other failed). flock on the region's
+    own fd orders the ranks without introducing a named lock file that
+    could itself be orphaned by a crash.
+    """
+    if region.fd is None:
+        yield
+        return
+    fcntl.flock(region.fd, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        fcntl.flock(region.fd, fcntl.LOCK_UN)
+
+
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
     """Register row-aligned chunks, rolling back on failure."""
     if not current_platform.is_cuda_alike():
@@ -231,34 +253,35 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     # Register, drain and roll back through the same runtime handle, so a
     # failed chunk leaves neither a pending error nor a partly pinned region.
     addresses: list[int] = []
-    for offset in range(0, total_size, chunk_size):
-        address = base_ptr + offset
-        size = min(chunk_size, total_size - offset)
-        result = cudart.cudaHostRegister(address, size)
-        if result == 0:
-            addresses.append(address)
-            continue
-        cudart.cudaGetLastError()
-        logger.warning(
-            "cudaHostRegister failed for rank=%d at %.2f of %.2f GB (code=%d); "
-            "the offload region stays pageable",
-            rank,
-            offset / 1e9,
-            total_size / 1e9,
-            result,
-        )
-        for registered in reversed(addresses):
-            unregister_result = cudart.cudaHostUnregister(registered)
-            if unregister_result != 0:
-                cudart.cudaGetLastError()
-                logger.warning(
-                    "cudaHostUnregister failed for rank=%d at %#x (code=%d); "
-                    "that chunk stays registered until the process exits",
-                    rank,
-                    registered,
-                    unregister_result,
-                )
-        return
+    with _region_registration_lock(region):
+        for offset in range(0, total_size, chunk_size):
+            address = base_ptr + offset
+            size = min(chunk_size, total_size - offset)
+            result = cudart.cudaHostRegister(address, size)
+            if result == 0:
+                addresses.append(address)
+                continue
+            cudart.cudaGetLastError()
+            logger.warning(
+                "cudaHostRegister failed for rank=%d at %.2f of %.2f GB (code=%d); "
+                "the offload region stays pageable",
+                rank,
+                offset / 1e9,
+                total_size / 1e9,
+                result,
+            )
+            for registered in reversed(addresses):
+                unregister_result = cudart.cudaHostUnregister(registered)
+                if unregister_result != 0:
+                    cudart.cudaGetLastError()
+                    logger.warning(
+                        "cudaHostUnregister failed for rank=%d at %#x (code=%d); "
+                        "that chunk stays registered until the process exits",
+                        rank,
+                        registered,
+                        unregister_result,
+                    )
+            return
 
     region.pinned_addresses.extend(addresses)
     region.is_pinned = True
