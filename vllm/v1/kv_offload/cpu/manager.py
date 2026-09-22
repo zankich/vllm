@@ -8,6 +8,7 @@ from typing_extensions import override
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
+from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     LookupResult,
@@ -25,6 +26,17 @@ from vllm.v1.kv_offload.cpu.common import (
 )
 from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
+
+logger = init_logger(__name__)
+
+
+class _IntegrityVerified:
+    """ReqContext state: keys whose slot checksum was verified this request."""
+
+    __slots__ = ("keys",)
+
+    def __init__(self) -> None:
+        self.keys: set[OffloadKey] = set()
 
 
 class CPUOffloadingManager(OffloadingManager):
@@ -62,6 +74,18 @@ class CPUOffloadingManager(OffloadingManager):
         # Track chunks with an in-flight store (ref_cnt -1, not yet completed).
         self._num_write_pending_chunks: int = 0
 
+        # Fork-local integrity (2026-09-17): when armed with a view of the
+        # shm tier's bytes (CPUPrimaryTierOffloadingManager), every completed
+        # store records sha256(key, slot) and every lookup re-verifies;
+        # post-recording corruption answers MISS and the chunk is evicted
+        # instead of serving wrong bytes silently. None disables checking
+        # entirely (plain-spec construction has no buffer to checksum).
+        # Corruption between the GPU->CPU copy and the recording lands
+        # recorded-torn and is not detectable here — same store-time limit
+        # as the fs tier's sidecar carrier.
+        self._kv_bytes: memoryview | None = None
+        self._integrity: dict[OffloadKey, bytes] | None = None
+
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
         self.stores_skipped_in_current_batch: int = 0
@@ -71,6 +95,38 @@ class CPUOffloadingManager(OffloadingManager):
         self.counts: OrderedDict[OffloadKey, int] | None = (
             OrderedDict() if store_threshold >= 2 else None
         )
+
+    def _slot_checksum(self, key: OffloadKey, chunk_id: int) -> bytes:
+        # Imported lazily: the integrity helpers live under the tiering
+        # package, which imports this module.
+        from vllm.v1.kv_offload.tiering.fs.integrity import block_checksum
+
+        assert self._kv_bytes is not None, "checksums require armed kv bytes"
+        size = len(self._kv_bytes) // self._num_chunks
+        slot = self._kv_bytes[chunk_id * size : (chunk_id + 1) * size]
+        return block_checksum(key, slot)
+
+    def _reject_corrupt_chunk(self, key: OffloadKey, chunk: ChunkStatus) -> None:
+        """Evict a chunk whose bytes no longer match its recorded checksum."""
+        assert self._integrity is not None, "rejection requires armed integrity"
+        logger.warning(
+            "CPU offload tier: slot %d for key %.16s failed its integrity "
+            "check; evicting and answering MISS (corruption class: "
+            "post-store clobber, aliasing, or torn writers)",
+            chunk.chunk_id,
+            key,
+        )
+        # The chunk was ready and unreferenced (callers gate on ref_cnt),
+        # so it is counted as evictable.
+        self._num_evictable_cache_chunks -= 1
+        assert self._num_evictable_cache_chunks >= 0
+        self._policy.remove(key)
+        self._free_chunk(chunk)
+        self._integrity.pop(key, None)
+        if self.events is not None:
+            self.events.append(
+                OffloadingEvent(keys=[key], medium=self.medium, removed=True)
+            )
 
     # --- chunk pool ---
 
@@ -137,6 +193,30 @@ class CPUOffloadingManager(OffloadingManager):
             return LookupResult.MISS
         if not chunk.is_ready:
             return LookupResult.HIT_PENDING
+        if self._integrity is not None and chunk.ref_cnt == 0:
+            # Verify each key once per request: the scheduler thread hashes
+            # the slot on the request's first lookup of the key and trusts
+            # the verdict for the request's lifetime. Unmitigated, a
+            # restore-heavy request re-hashing 10k+ MB-scale slots per step
+            # would dominate TTFT.
+            verified = req_context.get_state(_IntegrityVerified)
+            if verified is None:
+                verified = _IntegrityVerified()
+                req_context.set_state(verified)
+            if key not in verified.keys:
+                recorded = self._integrity.get(key)
+                if (
+                    recorded is None
+                    or self._slot_checksum(key, chunk.chunk_id) != recorded
+                ):
+                    # Never serve silently-wrong bytes: the corrupt chunk
+                    # leaves the cache and the caller recomputes. Chunks
+                    # referenced by an in-flight load (ref_cnt > 0) are left
+                    # alone here; the copy already in flight completes, and
+                    # the next request's first lookup rejects.
+                    self._reject_corrupt_chunk(key, chunk)
+                    return LookupResult.MISS
+                verified.keys.add(key)
         return LookupResult.HIT
 
     @override
@@ -221,6 +301,8 @@ class CPUOffloadingManager(OffloadingManager):
             for key, chunk in evicted:
                 self._free_chunk(chunk)
                 to_evict.append(key)
+                if self._integrity is not None:
+                    self._integrity.pop(key, None)
 
         if to_evict and self.events is not None:
             self.events.append(
@@ -267,6 +349,8 @@ class CPUOffloadingManager(OffloadingManager):
                     self._num_evictable_cache_chunks += 1
                     self._policy.mark_evictable(key)
                     stored_keys.append(key)
+                    if self._integrity is not None:
+                        self._integrity[key] = self._slot_checksum(key, chunk.chunk_id)
         else:
             for key in keys:
                 chunk = self._policy.get(key)
@@ -294,6 +378,8 @@ class CPUOffloadingManager(OffloadingManager):
         self._policy.clear()
         self._num_evictable_cache_chunks = 0
         self._num_write_pending_chunks = 0
+        if self._integrity is not None:
+            self._integrity.clear()
 
         self._free_list.clear()
         self._num_allocated_chunks = 0
