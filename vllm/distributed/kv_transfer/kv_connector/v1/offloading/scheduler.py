@@ -141,6 +141,55 @@ def get_sliding_window_size_in_chunks(
     return None
 
 
+def restore_accounting_summary(
+    req_id: str,
+    num_prompt_tokens: int,
+    num_locally_computed: int,
+    num_external: int,
+    keys_loaded: int,
+    group_tokens_per_chunk: int,
+    group_detail: str = "",
+    full_group_capacity: int = 0,
+    has_full_group: bool = False,
+) -> tuple[str, list[str]]:
+    """Fork-local restore-accounting instrumentation (2026-09-17).
+
+    One log line per offload restore carrying the restore-assembly
+    arithmetic, plus loud violations when the assembly
+    over-claims, misaligns, or under-covers — the byte-faithful tiers
+    cannot catch a wrong SET of correctly-hashed blocks, but these
+    invariants can.
+    """
+    boundary = num_locally_computed + num_external
+    violations: list[str] = []
+    if num_external == 0:
+        return (
+            f"restore-accounting req={req_id} prompt={num_prompt_tokens} "
+            f"local={num_locally_computed} ext=0 skipped",
+            violations,
+        )
+    if boundary > num_prompt_tokens:
+        violations.append(f"boundary exceeds prompt: {boundary} > {num_prompt_tokens}")
+    if (
+        has_full_group
+        and full_group_capacity > 0
+        and full_group_capacity < num_external
+    ):
+        violations.append(
+            f"non-window groups cannot cover ext: {full_group_capacity} "
+            f"tokens < {num_external}"
+        )
+    line = (
+        f"restore-accounting req={req_id} prompt={num_prompt_tokens} "
+        f"local={num_locally_computed} ext={num_external} "
+        f"boundary={boundary} keys={keys_loaded} "
+        f"chunk={group_tokens_per_chunk}"
+    )
+    if group_detail:
+        line += f" groups={group_detail}"
+    return line, violations
+
+
 def resolve_mamba_align_size(
     spec: "OffloadingSpec", kv_cache_config: KVCacheConfig
 ) -> int | None:
@@ -1092,6 +1141,9 @@ class OffloadingConnectorScheduler:
         # per group
         group_sizes: list[int] = []
         block_indices: list[int] = []
+        group_load_detail: list[str] = []
+        full_group_capacity = 0
+        has_full_group = False
         for group_config, group_state in zip(
             self.config.kv_group_configs,
             req_status.group_states,
@@ -1147,6 +1199,17 @@ class OffloadingConnectorScheduler:
                             request, group_config.group_idx, partial_tail_boundary
                         )
                     )
+                group_load_detail.append(
+                    f"{tokens_per_chunk}:"
+                    f"{end_chunk_idx - start_chunk_idx}"
+                    f"s{start_chunk_idx}"
+                    + ("+b" if partial_tail_boundary is not None else "")
+                )
+                if group_config.sliding_window_size_in_chunks is None:
+                    full_group_capacity += (
+                        end_chunk_idx - start_chunk_idx
+                    ) * tokens_per_chunk
+                    has_full_group = True
 
             dst_block_ids.extend(
                 block.block_id
@@ -1165,6 +1228,28 @@ class OffloadingConnectorScheduler:
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
+
+        # Fork-local instrumentation: the assembly arithmetic, one line per
+        # restore (restore-shape correlation fields) with loud invariant checks.
+        line, violations = restore_accounting_summary(
+            req_id=request.request_id,
+            num_prompt_tokens=request.num_prompt_tokens,
+            num_locally_computed=num_locally_computed_tokens,
+            num_external=num_external_tokens,
+            keys_loaded=len(keys_to_load),
+            group_tokens_per_chunk=self.config.kv_group_configs[0].tokens_per_chunk,
+            group_detail=",".join(group_load_detail),
+            full_group_capacity=full_group_capacity,
+            has_full_group=has_full_group,
+        )
+        logger.info(line)
+        for violation in violations:
+            logger.error(
+                "restore-accounting VIOLATION req=%s: %s "
+                "(corruption-class assembly error candidate — capture this request)",
+                request.request_id,
+                violation,
+            )
 
         load_job_id = self._generate_job_id()
         self._current_batch_load_jobs[load_job_id] = TransferJob(
