@@ -243,3 +243,52 @@ async def test_anthropic_streaming_cache_usage(client: anthropic.AsyncAnthropic)
     warm_usage = await get_stream_usage(await client.messages.create(**request))
     assert warm_usage.cache_read_input_tokens is not None
     assert warm_usage.cache_read_input_tokens > 0
+
+
+def test_metrics_round_trips_on_stream_event_and_response():
+    # Pure-Pydantic wiring test: the per-request metrics field, including
+    # `speculative_decoding`, must survive construction and serialization on
+    # both the streaming event and the non-streaming response.
+    from vllm.entrypoints.anthropic.protocol import (
+        AnthropicMessagesResponse,
+        AnthropicStreamEvent,
+    )
+    from vllm.entrypoints.generate.base.protocol import (
+        PerRequestMetrics,
+        SpeculativeDecodingMetrics,
+    )
+
+    spec_metrics = SpeculativeDecodingMetrics(
+        mean_acceptance_length=1.0,
+        draft_acceptance_rate=0.5,
+        acceptance_histogram=[0, 1],
+        num_spec_steps=1,
+        num_accepted_draft_tokens=1,
+        num_draft_tokens=2,
+        num_spec_tokens=1,
+    )
+    metrics = PerRequestMetrics(speculative_decoding=spec_metrics)
+
+    stream_event = AnthropicStreamEvent(
+        type="message_delta",
+        metrics=metrics,
+    )
+    assert stream_event.metrics is not None
+    assert stream_event.metrics.speculative_decoding is not None
+    assert stream_event.metrics.speculative_decoding.num_accepted_draft_tokens == 1
+    dumped = stream_event.model_dump(exclude_none=True)
+    assert "metrics" in dumped
+    assert dumped["metrics"]["speculative_decoding"]["num_spec_steps"] == 1
+
+    response = AnthropicMessagesResponse(
+        id="msg_test",
+        type="message",
+        role="assistant",
+        model="claude-3-7-sonnet-latest",
+        content=[],
+        stop_reason="end_turn",
+        usage=None,
+        metrics=metrics,
+    )
+    assert response.metrics is not None
+    assert response.metrics.speculative_decoding is spec_metrics
