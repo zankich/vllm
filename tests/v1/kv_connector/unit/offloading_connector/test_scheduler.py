@@ -662,6 +662,45 @@ def test_partial_lookup_requires_every_cache_group():
     assert req_status.partial_tail_boundary is None
 
 
+def test_partial_lookup_skips_excluded_group_boundary_keys():
+    """A misaligned group never stores a boundary key, so the partial-tail
+    lookup must not demand one.
+
+    Touch and both boundary-store surfaces filter to participating groups;
+    demanding the excluded group's key here makes every candidate boundary
+    miss and silently disables partial-tail restores.
+    """
+    scheduler = _make_partial_tail_scheduler()
+    excluded = scheduler.config.kv_group_configs[0]._replace(
+        group_idx=2,
+        tokens_per_block=8,
+        hashes_per_chunk=0,
+        participates=False,
+    )
+    scheduler.config = scheduler.config._replace(
+        kv_group_configs=scheduler.config.kv_group_configs + (excluded,)
+    )
+    _make_partial_tail_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.num_locally_computed_tokens = 0
+    req_status.update_offload_keys()
+
+    demanded_group_idxs = []
+
+    def lookup(key, req_context):
+        group_idx = get_offload_group_idx(key)
+        demanded_group_idxs.append(group_idx)
+        # The excluded group stores no key, so any demand is a guaranteed
+        # miss on a real manager.
+        return LookupResult.MISS if group_idx == 2 else LookupResult.HIT
+
+    scheduler.manager.lookup.side_effect = lookup
+
+    assert scheduler._lookup(req_status) == 28
+    assert req_status.partial_tail_boundary == 28
+    assert 2 not in demanded_group_idxs
+
+
 def test_scheduler_reports_allocation_failure(request_runner):
     runner = request_runner(
         block_size=4,
