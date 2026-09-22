@@ -662,6 +662,33 @@ def test_partial_lookup_requires_every_cache_group():
     assert req_status.partial_tail_boundary is None
 
 
+def test_update_num_hit_chunks_skips_excluded_groups():
+    """Symmetry with the sibling iteration sites: every consumer of
+    num_hit_chunks filters on participates, so the write must too — an
+    excluded group's value is a dead store today and a misread waiting
+    for the next consumer."""
+    config = SimpleNamespace(
+        kv_group_configs=(
+            SimpleNamespace(participates=True, tokens_per_chunk=16),
+            SimpleNamespace(participates=False, tokens_per_chunk=8),
+        )
+    )
+    state = RequestOffloadState(
+        config=config,
+        req=SimpleNamespace(kv_transfer_params=None),
+        req_context=ReqContext(req_id="r"),
+        offloading_context=RequestOffloadingContext(),
+    )
+    sentinel = object()
+    state.group_states[0].num_hit_chunks = -1
+    state.group_states[1].num_hit_chunks = sentinel
+
+    state.update_num_hit_chunks(32)
+
+    assert state.group_states[0].num_hit_chunks == 2  # 32 // 16
+    assert state.group_states[1].num_hit_chunks is sentinel
+
+
 def test_partial_lookup_skips_excluded_group_boundary_keys():
     """A misaligned group never stores a boundary key, so the partial-tail
     lookup must not demand one.

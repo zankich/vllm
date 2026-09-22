@@ -561,6 +561,8 @@ class RequestOffloadState:
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
+            if not group_config.participates:
+                continue
             group_state.num_hit_chunks = (
                 num_cached_tokens // group_config.tokens_per_chunk
             )
