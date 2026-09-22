@@ -663,6 +663,7 @@ def test_external_cache_hit_sources_reconcile_different_group_chunk_sizes(
     )
     scheduler = runner.connector_scheduler
     request = MagicMock(request_id="mixed")
+    request.num_prompt_tokens = 2 * block_size
     req_status = RequestOffloadState(
         config=scheduler.config,
         req=request,
@@ -798,6 +799,7 @@ def test_external_cache_hit_sources_use_loaded_attention_ranges(
     spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
     scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
     request = MagicMock(request_id="sparse")
+    request.num_prompt_tokens = 4 * chunk_size
     req_status = RequestOffloadState(
         config=scheduler.config,
         req=request,
