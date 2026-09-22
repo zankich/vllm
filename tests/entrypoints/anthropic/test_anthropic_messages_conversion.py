@@ -1727,3 +1727,44 @@ class TestClientErrorResponses:
 
         assert response.status_code == HTTPStatus.BAD_REQUEST
         assert response.json()["error"]["type"] == "BadRequestError"
+
+
+# ======================================================================
+# _build_base_request: thinking budget mapping
+# ======================================================================
+
+
+class TestBuildBaseRequestThinkingBudget:
+    """The Anthropic ``thinking`` dict maps to the engine's
+    ``thinking_token_budget`` only for an enabled config; anything else
+    (absent, disabled, malformed) must map to None."""
+
+    @staticmethod
+    def _build(thinking):
+        req = _make_request([{"role": "user", "content": "hi"}], thinking=thinking)
+        return AnthropicServingMessages._build_base_request(
+            req, [{"role": "user", "content": "hi"}]
+        )
+
+    def test_enabled_thinking_maps_budget_tokens(self):
+        assert (
+            self._build(
+                {"type": "enabled", "budget_tokens": 2048}
+            ).thinking_token_budget
+            == 2048
+        )
+
+    def test_absent_thinking_maps_to_none(self):
+        assert self._build(None).thinking_token_budget is None
+
+    def test_disabled_thinking_maps_to_none(self):
+        assert (
+            self._build(
+                {"type": "disabled", "budget_tokens": 2048}
+            ).thinking_token_budget
+            is None
+        )
+
+    def test_malformed_thinking_maps_to_none(self):
+        # A budget without type="enabled" must not leak through.
+        assert self._build({"budget_tokens": 2048}).thinking_token_budget is None
