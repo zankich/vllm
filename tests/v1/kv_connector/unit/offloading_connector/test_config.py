@@ -434,10 +434,9 @@ def test_excluded_group_sizing_matches_across_scheduler_flattening():
         block_size=16, kv_cache_specs={"wide": wide, "narrow": narrow}
     )
     # Buckets and strides as the glm5 tensor layout builds them: one tensor
-    # per spec bucket, layer stride = page * num_blocks, every tensor's size
-    # the whole allocation. The generic path cannot build this shape for
-    # mixed page sizes: it rejects layer-outer layouts for them, so its
-    # buckets carry per-block strides and the sizing bails to the spec sum.
+    # per spec bucket, layer stride = page * num_blocks with block stride =
+    # page (the layer-outer form), every tensor's size the whole
+    # allocation.
     bytes_per_block = max(wrapper.page_size_bytes, indexer.page_size_bytes)
     size = bytes_per_block * num_blocks
 
@@ -446,7 +445,7 @@ def test_excluded_group_sizing_matches_across_scheduler_flattening():
             size=size,
             layers=layers,
             layer_stride=page * num_blocks,
-            block_stride=bytes_per_block,
+            block_stride=page,
             offset=offset,
         )
 
@@ -584,6 +583,131 @@ def test_hisparse_refuses_tensor_total_sizing():
     offloading_config = build_offloading_config(_make_vllm_config(), kv_cache_config)
 
     assert offloading_config.worker_kv_bytes_per_block == wrapped.page_size_bytes
+
+
+def test_worker_cell_covers_registered_tensors_live_shape():
+    """The per-rank cell must cover what registration actually registers.
+
+    The live Flash-Next TP4 shape: five selected groups (one dominant plus
+    small ones) and one excluded 8-token indexer, block-outer bucket
+    strides from the generic layout path. Workers register one region per
+    deduped selected-layer view — the sum of those views exceeds the
+    max-group allocation figure by exactly the small groups' bytes
+    (256000 per chunk on the live boot), so the allocation-derived cell
+    underflows and the worker-view assert kills the boot. Sizing must sum
+    the selected buckets instead, identically in both roles.
+    """
+    num_blocks = 64
+    bpc = 100  # blocks per chunk
+
+    def full(page: int) -> FullAttentionSpec:
+        # page = 2 * num_kv_heads * head_size * dtype_size * block_size
+        return FullAttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=page // 128, dtype=torch.float32
+        )
+
+    # One dominant group (four equal layers) plus four single-layer small
+    # groups; the selected sum exceeds the max group by 2560 bytes/block —
+    # the live boot's 256000-per-chunk shortfall at bpc = 100.
+    dom_spec = full(4096)
+    dominant = UniformTypeKVCacheSpecs(
+        block_size=16,
+        kv_cache_specs={f"dom{i}": dom_spec for i in range(4)},
+    )
+    dominant_bytes = 4 * dom_spec.page_size_bytes
+    small_pages = [256, 512, 768, 1024]
+    indexer = CircularBufferSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=1,
+        head_size_v=0,
+        dtype=torch.float32,
+    )
+    indexer_bytes = indexer.page_size_bytes
+    bytes_per_block = max(dominant_bytes, indexer_bytes)
+    size = bytes_per_block * num_blocks
+
+    def bucket(layers: list[str], page: int) -> KVCacheTensor:
+        # Generic block-outer form: layer_stride is the per-block page.
+        return KVCacheTensor(
+            size=size,
+            layers=layers,
+            layer_stride=page,
+            block_stride=bytes_per_block,
+        )
+
+    kv_cache_tensors = [bucket([f"dom{i}"], dom_spec.page_size_bytes) for i in range(4)]
+    group_specs: list[KVCacheGroupSpec] = [
+        KVCacheGroupSpec([f"dom{i}" for i in range(4)], dominant)
+    ]
+    for i, page in enumerate(small_pages):
+        spec = full(page)
+        kv_cache_tensors.append(bucket([f"small{i}"], spec.page_size_bytes))
+        group_specs.append(KVCacheGroupSpec([f"small{i}"], spec))
+    kv_cache_tensors.append(bucket(["indexer"], indexer_bytes))
+    group_specs.append(KVCacheGroupSpec(["indexer"], indexer))
+
+    worker_cfg = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=kv_cache_tensors,
+        kv_cache_groups=group_specs,
+    )
+    scheduler_cfg = generate_scheduler_kv_cache_config([worker_cfg])
+
+    selected_sum = dominant_bytes + sum(
+        full(page).page_size_bytes for page in small_pages
+    )
+    registered_per_chunk = selected_sum * bpc
+
+    config = _make_vllm_config()
+    worker = build_offloading_config(config, worker_cfg)
+    scheduler = build_offloading_config(config, scheduler_cfg)
+
+    # Both roles must derive the same per-block figure...
+    assert worker.worker_kv_bytes_per_block == scheduler.worker_kv_bytes_per_block
+    # ...and that figure must size the per-rank cell over what registration
+    # places in it (the live boot's cell fell 256000/chunk short).
+    assert worker.worker_kv_bytes_per_block * bpc >= registered_per_chunk
+    assert worker.worker_kv_bytes_per_block == selected_sum
+
+
+def test_lhbnc_multi_head_bails_to_spec_sum():
+    """LHBNC multi-head buckets must not be read as block-outer.
+
+    With the H axis between L and B, layer_stride = page * num_blocks and
+    block_stride = page // heads, so the layer_stride carries a heads
+    factor the block-outer reading would count per block — overcounting
+    by num_blocks per layer. The stride-form rule must bail this class to
+    the spec-derived sum, in both roles.
+    """
+    num_blocks = 4
+    heads = 4
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=heads, head_size=1, dtype=torch.float32
+    )
+    page = spec.page_size_bytes  # per-block page across all heads
+    kv_cache_tensors = [
+        KVCacheTensor(
+            size=page * num_blocks,
+            layers=["layer"],
+            layer_stride=page * num_blocks,
+            block_stride=page // heads,
+        )
+    ]
+    kv_cache_groups = [KVCacheGroupSpec(["layer"], spec)]
+    worker_cfg = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=kv_cache_tensors,
+        kv_cache_groups=kv_cache_groups,
+    )
+    scheduler_cfg = generate_scheduler_kv_cache_config([worker_cfg])
+
+    config = _make_vllm_config()
+    worker = build_offloading_config(config, worker_cfg)
+    scheduler = build_offloading_config(config, scheduler_cfg)
+
+    assert worker.worker_kv_bytes_per_block == scheduler.worker_kv_bytes_per_block
+    assert worker.worker_kv_bytes_per_block == page
 
 
 def test_zero_blocks_skips_tensor_layout_validation():

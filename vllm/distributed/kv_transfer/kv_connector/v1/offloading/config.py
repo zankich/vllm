@@ -108,31 +108,32 @@ def _selected_kv_bytes_per_block_from_tensors(
 ) -> int | None:
     """Per-block bytes of the selected groups, from the tensor layout.
 
-    The tensor-total path in ``build_offloading_config`` takes every
-    non-HiSparse config that has tensors, so this derivation carries only
-    the residue that path refuses; both of its bail classes land here and
-    continue to the spec-derived sum.
+    Registration places one region per deduped selected-layer view into
+    each per-rank cell, and views that alias the same storage with
+    different strides still need separate slots, so the cell must be
+    sized by the selected bucket sum — which can exceed the max-group
+    allocation figure (the live Flash-Next TP4 shape overflows it by
+    256000 bytes per chunk).
 
-    ``generate_scheduler_kv_cache_config`` flattens every
-    ``UniformTypeKVCacheSpecs`` group to one arbitrary representative layer
-    spec, so a spec-derived sum is not invariant across the worker and
-    scheduler representations when members differ in size: the scheduler
-    sizes the offload region by the representative instead of the member
-    sum and the two processes build differently sized mmaps over the same
-    deterministic path.  The tensor layout is deep-copied unchanged by
-    that flattening and buckets layers by spec, so both representations
-    yield the same exact sum here.
+    A bucket whose ``layer_stride == block_stride * num_blocks`` is
+    layer-outer: the stride spans the whole per-layer run and the bucket
+    contributes ``len(layers) * block_stride`` per block.  A bucket whose
+    ``layer_stride`` is a whole multiple of ``block_stride * num_blocks``
+    by a factor > 1 has a per-head axis between L and B (the LHBNC
+    layout): its strides carry a ``num_heads`` factor that no per-block
+    reading can strip, so it bails to the spec-derived sum.  Any other
+    bucket is block-outer — its L-axis stride is a per-block quantity
+    (the generic mixed-page layout stores the page there) — and
+    contributes ``len(layers) * layer_stride``.  All of this is read off
+    the tensor list, which ``generate_scheduler_kv_cache_config``
+    deep-copies unchanged while flattening group specs, so both roles
+    derive the same figure.
 
-    Returns None when the tensors cannot serve as the source: when no
-    tensors are present; on HiSparse layouts (their hot/resident pages
-    use per-block strides); for any selected layer no single-group
-    bucket covers exactly; and on the generic block-outer layout, whose
-    mixed-page buckets carry a per-block L-axis stride
-    (``page_size_bytes``, not ``page * num_blocks``) so the
-    divisibility check bails them -- mixed-size wrappers on that path
-    still size through the spec-derived sum and can diverge across the
-    scheduler flattening.  The caller falls back to the spec-derived
-    sum.
+    Returns None when the tensors cannot serve as the source — HiSparse
+    layouts (their tensor list is prepended with host tensors sized by a
+    different block count), no tensors at all, the LHBNC multi-head
+    class, or any selected layer no single-group bucket covers exactly —
+    leaving the caller on the spec-derived sum.
     """
     if kv_cache_config.hisparse_host_num_blocks is not None:
         return None
@@ -150,17 +151,13 @@ def _selected_kv_bytes_per_block_from_tensors(
             continue
         if len({layer_to_group[name] for name in bucket}) != 1:
             return None
-        if tensor.layer_stride % num_blocks != 0:
-            group = kv_cache_config.kv_cache_groups[layer_to_group[next(iter(bucket))]]
-            logger.debug(
-                "offloading: sizing group %s through group specs: tensor "
-                "layer_stride=%d does not scale with num_blocks=%d",
-                group.layer_names[0],
-                tensor.layer_stride,
-                num_blocks,
-            )
-            return None
-        total += len(bucket) * (tensor.layer_stride // num_blocks)
+        layer_run = tensor.block_stride * num_blocks
+        if tensor.layer_stride % layer_run == 0:
+            if tensor.layer_stride > layer_run:
+                return None
+            total += len(bucket) * tensor.block_stride
+        else:
+            total += len(bucket) * tensor.layer_stride
         covered |= bucket
     if covered != set(layer_to_group):
         return None
@@ -271,23 +268,14 @@ def build_offloading_config(
             )
 
     worker_kv_bytes_per_block = 0
-    if (
-        kv_cache_config.num_blocks > 0
-        and kv_cache_config.kv_cache_tensors
-        and kv_cache_config.hisparse_host_num_blocks is None
-    ):
-        # Every KVCacheTensor describes placement within the same backing
-        # allocation, so its size is the total, not a per-tensor share.
-        # The tensor list is deep-copied unchanged by the scheduler config
-        # flattening, so both roles compute the same number from it — the
-        # fork's production semantics. Excluded groups leave the region
-        # sized for the whole allocation, over-provisioned but identical
-        # across processes. HiSparse configs must not take this path:
-        # their tensor list is prepended with host tensors sized by
-        # host_num_blocks, a different block count.
-        total_gpu_kv_bytes = kv_cache_config.kv_cache_tensors[0].size
-        worker_kv_bytes_per_block = total_gpu_kv_bytes // kv_cache_config.num_blocks
-    elif kv_cache_config.num_blocks > 0:
+    if kv_cache_config.num_blocks > 0:
+        # Size by what registration places in each per-rank cell: the
+        # selected bucket sum off the tensor list. The tensor list is
+        # deep-copied unchanged by the scheduler config flattening, so
+        # both roles compute the same figure — superseding the fork's
+        # tensor-total form, whose max-group figure undercounts configs
+        # whose aliasing views need separate slots. HiSparse and
+        # tensor-less shapes fall back to the spec-derived sum.
         selected_bytes = _selected_kv_bytes_per_block_from_tensors(
             kv_cache_config, selected_group_ids
         )
