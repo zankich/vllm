@@ -89,6 +89,10 @@ def _single_rank_vllm_config(total_kv_heads: int):
     parallel_config.cp_kv_cache_interleave_size = 1
     parallel_config.world_size = 1
     parallel_config.rank = 0
+    # Group selection reads the cache config for hash granularity; a mock
+    # value would poison the divisibility check and exclude every group.
+    vllm_config.cache_config.block_size = BLOCK_SIZE
+    vllm_config.cache_config.prefix_match_unit = None
     vllm_config.model_config.get_total_num_kv_heads.return_value = total_kv_heads
     return vllm_config
 

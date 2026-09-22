@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     ReqId,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+    get_misaligned_offloading_group_ids,
     get_offloading_group_ids,
 )
 from vllm.logger import init_logger
@@ -68,7 +69,7 @@ class OffloadingConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         kv_cache_config = self.kv_cache_config
-        selected_group_ids = get_offloading_group_ids(kv_cache_config)
+        selected_group_ids = get_offloading_group_ids(kv_cache_config, self.vllm_config)
         selected_groups = tuple(
             kv_cache_config.kv_cache_groups[group_id] for group_id in selected_group_ids
         )
@@ -200,10 +201,17 @@ class OffloadingConnectorWorker:
                     )
 
         group_data_refs: list[list[CanonicalKVCacheRef]] = []
-        for kv_cache_group in selected_groups:
+        # Misaligned groups contribute an empty positional entry: the
+        # scheduler-side transfer geometry keeps one slot per config group,
+        # and a zero-size group transfers nothing.
+        misaligned_ids = frozenset(
+            get_misaligned_offloading_group_ids(kv_cache_config, self.vllm_config)
+        )
+        for group_id in sorted(tuple(selected_group_ids) + tuple(misaligned_ids)):
             group_refs: list[CanonicalKVCacheRef] = []
-            for layer_name in kv_cache_group.layer_names:
-                group_refs += block_data_refs[layer_name]
+            if group_id not in misaligned_ids:
+                for layer_name in kv_cache_config.kv_cache_groups[group_id].layer_names:
+                    group_refs += block_data_refs[layer_name]
             group_data_refs.append(group_refs)
 
         canonical_kv_caches = CanonicalKVCaches(

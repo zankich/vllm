@@ -4,6 +4,7 @@
 
 from typing import TYPE_CHECKING
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
 from vllm.v1.core.kv_cache_utils import (
     resolve_dcp_kv_block_size,
@@ -32,14 +33,57 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
 
+logger = init_logger(__name__)
 
-def get_offloading_group_ids(kv_cache_config: "KVCacheConfig") -> tuple[int, ...]:
+
+def _get_role_selected_group_ids(kv_cache_config: "KVCacheConfig") -> tuple[int, ...]:
     if kv_cache_config.hisparse_host_num_blocks is None:
         return tuple(range(len(kv_cache_config.kv_cache_groups)))
     return tuple(
         group_id
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
         if group.role is KVCacheGroupRole.HISPARSE_INDEXER
+    )
+
+
+def get_misaligned_offloading_group_ids(
+    kv_cache_config: "KVCacheConfig", vllm_config: "VllmConfig"
+) -> tuple[int, ...]:
+    """Role-selected groups whose blocks cannot be chunk-hashed for offload.
+
+    Hybrid + MTP configs can form such groups (e.g. the QSA indexer's
+    8-token raw_key_cache against an 800-token hash). Their KV is
+    request-lifetime and worthless to offload; callers keep it GPU-resident.
+    """
+    dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+    _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+    return tuple(
+        group_id
+        for group_id in _get_role_selected_group_ids(kv_cache_config)
+        if resolve_dcp_kv_block_size(
+            kv_cache_config.kv_cache_groups[group_id].kv_cache_spec, dcp_size
+        )
+        % tokens_per_hash
+        != 0
+    )
+
+
+def get_offloading_group_ids(
+    kv_cache_config: "KVCacheConfig", vllm_config: "VllmConfig"
+) -> tuple[int, ...]:
+    """Group ids that participate in offloading.
+
+    Role selection minus misaligned groups: a group whose tokens_per_block
+    does not divide the cross-group tokens_per_hash cannot be chunk-hashed,
+    so it neither registers layers nor transfers.
+    """
+    misaligned_ids = frozenset(
+        get_misaligned_offloading_group_ids(kv_cache_config, vllm_config)
+    )
+    return tuple(
+        group_id
+        for group_id in _get_role_selected_group_ids(kv_cache_config)
+        if group_id not in misaligned_ids
     )
 
 
@@ -68,32 +112,53 @@ def build_offloading_config(
     engine_id = kv_transfer_config.engine_id
 
     parallel_config = vllm_config.parallel_config
+    _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+    misaligned_ids = frozenset(
+        get_misaligned_offloading_group_ids(kv_cache_config, vllm_config)
+    )
+    selected_group_ids = get_offloading_group_ids(kv_cache_config, vllm_config)
+    if not selected_group_ids:
+        if misaligned_ids:
+            raise ValueError(
+                f"no KV cache group has tokens_per_block divisible by "
+                f"tokens_per_hash={tokens_per_hash}; offloading cannot proceed"
+            )
+        raise ValueError("KV offloading found no eligible cache groups.")
     selected_groups = tuple(
         (group_id, kv_cache_config.kv_cache_groups[group_id])
-        for group_id in get_offloading_group_ids(kv_cache_config)
+        for group_id in selected_group_ids
     )
-    if not selected_groups:
-        raise ValueError("KV offloading found no eligible cache groups.")
+    # Misaligned groups keep a positional entry with no layers: the worker
+    # spec and the scheduler index groups in parallel, so dropping the entry
+    # would shift every later group. Such a group registers nothing on the
+    # worker, never stores or loads, and its KV stays GPU-resident.
+    for group_id in sorted(misaligned_ids):
+        group = kv_cache_config.kv_cache_groups[group_id]
+        logger.warning(
+            "offloading: group %s has tokens_per_block=%d not divisible "
+            "by tokens_per_hash=%d; keeping it GPU-resident, no layers "
+            "registered for offload",
+            group.layer_names[0],
+            resolve_dcp_kv_block_size(
+                group.kv_cache_spec, parallel_config.decode_context_parallel_size
+            ),
+            tokens_per_hash,
+        )
     groups = tuple(
         OffloadingGroupConfig(
             group_id=group_id,
             tokens_per_block=resolve_dcp_kv_block_size(
-                group.kv_cache_spec,
+                kv_cache_config.kv_cache_groups[group_id].kv_cache_spec,
                 parallel_config.decode_context_parallel_size,
             ),
-            layer_names=tuple(group.layer_names),
+            layer_names=(
+                ()
+                if group_id in misaligned_ids
+                else tuple(kv_cache_config.kv_cache_groups[group_id].layer_names)
+            ),
         )
-        for group_id, group in selected_groups
+        for group_id in sorted(selected_group_ids + tuple(misaligned_ids))
     )
-
-    _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
-    for group in groups:
-        assert group.tokens_per_block % tokens_per_hash == 0, (
-            f"tokens_per_block={group.tokens_per_block} not divisible by "
-            f"tokens_per_hash={tokens_per_hash}. "
-            f"Hybrid models (e.g. Mamba+Attention) need "
-            f"--enable-prefix-caching to align block sizes."
-        )
 
     blocks_per_chunk = 1
     blocks_per_chunk_config = extra_config.get("blocks_per_chunk")
@@ -114,7 +179,11 @@ def build_offloading_config(
     elif tokens_per_chunk is not None:
         tokens_per_chunk_int = int(tokens_per_chunk)
 
-        unique_tokens_per_block = {group.tokens_per_block for group in groups}
+        # Only groups that offload constrain the chunk size; misaligned
+        # groups never chunk-hash at any size.
+        unique_tokens_per_block = {
+            group.tokens_per_block for group in groups if group.layer_names
+        }
 
         assert len(unique_tokens_per_block) == 1, (
             "If 'block_size' is specified in kv_connector_extra_config, "

@@ -24,6 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
     build_offloading_config,
+    get_offloading_group_ids,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
@@ -52,9 +53,11 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheTensor,
     MambaSpec,
     SlidingWindowSpec,
 )
@@ -179,6 +182,164 @@ def test_swa_offload_window_covers_unaligned_hit(boundary, eagle, left_state):
     if boundary == 3904:
         assert {swa[14], swa[15]} <= job.keys
     manager.complete_load(job.keys, state.req_context)
+
+
+def _make_misaligned_kv_cache_config() -> KVCacheConfig:
+    """Full attention at 16 tokens plus an 8-token indexer-style ring group.
+
+    The ring group (the spec the QSA indexer's raw_key_cache produces) is
+    not prefix-cacheable, so the cross-group hash granularity follows the
+    full-attention group alone (16) and the ring's 8-token blocks cannot be
+    chunk-hashed: the [800 x5, 8] shape hybrid + MTP produces.
+    """
+    num_blocks = 4
+    full_spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    indexer_spec = CircularBufferSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=1,
+        head_size_v=0,
+        dtype=torch.float32,
+    )
+    window = max(full_spec.page_size_bytes, indexer_spec.page_size_bytes)
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=window * num_blocks,
+                layers=["full_layer"],
+                layer_stride=full_spec.page_size_bytes,
+                block_stride=window,
+            ),
+            KVCacheTensor(
+                size=window * num_blocks,
+                layers=["indexer_layer"],
+                layer_stride=indexer_spec.page_size_bytes,
+                block_stride=window,
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full_layer"], full_spec),
+            KVCacheGroupSpec(["indexer_layer"], indexer_spec),
+        ],
+    )
+
+
+def test_misaligned_group_keeps_gpu_resident_positional_entry():
+    """A block size that cannot be chunk-hashed excludes the group, not the boot.
+
+    The misaligned group keeps its positional entry with no layers so group
+    indices stay aligned across the connector, while the main-model groups
+    offload normally.
+    """
+    config = _make_vllm_config()
+    kv_cache_config = _make_misaligned_kv_cache_config()
+
+    offloading_config = build_offloading_config(config, kv_cache_config)
+
+    assert get_offloading_group_ids(kv_cache_config, config) == (0,)
+    assert [group.group_id for group in offloading_config.groups] == [0, 1]
+    assert offloading_config.groups[0].layer_names == ("full_layer",)
+    assert offloading_config.groups[0].tokens_per_block == 16
+    assert offloading_config.groups[1].layer_names == ()
+    assert offloading_config.groups[1].tokens_per_block == 8
+    assert offloading_config.cache.tokens_per_hash == 16
+
+
+def test_all_groups_misaligned_fails_loudly():
+    """Offloading every group being misaligned is a config error, not a boot."""
+    config = _make_vllm_config()
+    full_spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    # Non-align Mamba backs the hash granularity off to the LCM (48), which
+    # neither group's block size divides.
+    mamba_spec = MambaSpec(
+        block_size=24,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="all",
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full_layer"], full_spec),
+            KVCacheGroupSpec(["mamba_layer"], mamba_spec),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="tokens_per_hash"):
+        build_offloading_config(config, kv_cache_config)
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_misaligned_group_offloads_nothing_main_group_normal(
+    request_runner, async_scheduling: bool
+):
+    """The excluded group never keys, stores, or loads; its entry stays aligned.
+
+    The runner's own length asserts pin the positional entry (one config
+    entry per KV cache group); the store/load sets pin that only the
+    main-model group transfers.
+    """
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            CircularBufferSpec(
+                block_size=8,
+                num_kv_heads=1,
+                head_size=1,
+                head_size_v=0,
+                dtype=torch.float32,
+            ),
+        ),
+    ]
+    runner = request_runner(
+        block_size=16,
+        num_gpu_blocks=200,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    kv_group_configs = runner.connector_scheduler.config.kv_group_configs
+    assert len(kv_group_configs) == 2
+    assert kv_group_configs[0].participates
+    assert not kv_group_configs[1].participates
+    assert kv_group_configs[1].tokens_per_block == 8
+    assert kv_group_configs[1].hashes_per_chunk == 0
+    assert 1 not in runner.connector_scheduler._lookup_groups
+
+    # 32 tokens = 2 full-attention blocks = 4 indexer blocks: only the two
+    # full-attention blocks are stored.
+    runner.new_request(token_ids=[0] * 32)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(list(keys))
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=((0, 0), (0, 1)))
+
+    req_status = runner.connector_scheduler._req_status.get("0")
+    if req_status is not None:
+        assert req_status.group_states[0].offload_keys
+        assert not req_status.group_states[1].offload_keys
+
+    # A second request over the same prefix loads only the main group's
+    # blocks; the excluded group contributes zero-size load geometry.
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * 32)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 2
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=((0, 0), (0, 1)))
 
 
 def _make_partial_tail_scheduler() -> OffloadingConnectorScheduler:
