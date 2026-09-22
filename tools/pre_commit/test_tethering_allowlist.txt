@@ -70,3 +70,7 @@ tests/platforms/test_cpu.py  # CPU-only unit test; no job targets tests/platform
 
 # tests/tools/
 tests/tools/test_config_validator.py  # logic covered by the validate-config pre-commit hook; no test_areas job
+
+# fork-local
+tests/v1/distributed/test_custom_allreduce_group_policy.py  # fork-local suite, not run by upstream Buildkite
+tests/v1/platforms/test_cuda_fully_connected_p2p.py  # fork-local suite, not run by upstream Buildkite

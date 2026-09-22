@@ -26,6 +26,20 @@ from .base_device_communicator import DeviceCommunicatorBase
 logger = init_logger(__name__)
 
 
+def group_allows_custom_allreduce(unique_name: str) -> bool:
+    """Whether a process group may build CustomAllreduce.
+
+    #54371 gated TP-only backends behind the 'tp' prefix so Engram (etp)
+    groups would not register IPC buffers. The fork also allows 'ep':
+    decode-time MoE combine all-reduces on the expert-parallel group then
+    take the one-shot IPC path instead of the NCCL latency floor. The
+    dispatch chain still falls through to PYNCCL on any size/dtype gate,
+    so large EP combines keep the ring path.
+    """
+    prefix = unique_name.split(":")[0]
+    return prefix in ("tp", "ep")
+
+
 class CudaCommunicator(DeviceCommunicatorBase):
     def __init__(
         self,
@@ -47,9 +61,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             global_world_size,
             use_all2all=use_all2all,
         )
-        # Match the group name exactly so ETP does not enable TP-only backends.
-        if unique_name.split(":")[0] != "tp":
-            # custom allreduce or torch symm mem can be used only by tp
+        # Match the group prefix so ETP does not enable TP-only backends;
+        # the fork also allows 'ep' (see group_allows_custom_allreduce).
+        if not group_allows_custom_allreduce(unique_name):
+            # custom allreduce or torch symm mem can be used only by tp/ep
             use_custom_allreduce = False
             use_torch_symm_mem = False
             use_flashinfer_allreduce = False
