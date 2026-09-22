@@ -73,6 +73,9 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_evictable_cache_chunks: int = 0
         # Track chunks with an in-flight store (ref_cnt -1, not yet completed).
         self._num_write_pending_chunks: int = 0
+        # Keys pinned by a confirming lookup, awaiting their load's ref_cnt
+        # handoff or the request-finish release (fork, 2026-09-18).
+        self._lookup_pinned: set[OffloadKey] = set()
 
         # Fork-local integrity (2026-09-17): when armed with a view of the
         # shm tier's bytes (CPUPrimaryTierOffloadingManager), every completed
@@ -82,7 +85,7 @@ class CPUOffloadingManager(OffloadingManager):
         # entirely (plain-spec construction has no buffer to checksum).
         # Corruption between the GPU->CPU copy and the recording lands
         # recorded-torn and is not detectable here — same store-time limit
-        # as the fs tier's sidecar carrier.
+        # as the fs tier's xattr carrier.
         self._kv_bytes: memoryview | None = None
         self._integrity: dict[OffloadKey, bytes] | None = None
 
@@ -117,9 +120,13 @@ class CPUOffloadingManager(OffloadingManager):
             key,
         )
         # The chunk was ready and unreferenced (callers gate on ref_cnt),
-        # so it is counted as evictable.
-        self._num_evictable_cache_chunks -= 1
-        assert self._num_evictable_cache_chunks >= 0
+        # so it is counted as evictable — unless a lookup pin already
+        # moved it out of the evictable count.
+        if key in self._lookup_pinned:
+            self._lookup_pinned.discard(key)
+        else:
+            self._num_evictable_cache_chunks -= 1
+            assert self._num_evictable_cache_chunks >= 0
         self._policy.remove(key)
         self._free_chunk(chunk)
         self._integrity.pop(key, None)
@@ -187,6 +194,25 @@ class CPUOffloadingManager(OffloadingManager):
         return RequestOffloadingContext()
 
     @override
+    def on_request_finished(self, req_context: ReqContext) -> None:
+        # Release lookup pins for keys the request never loaded (scanned
+        # hits beyond the converged boundary, eagle-popped chunks):
+        # without this, every confirmed-but-unloaded hit would stay
+        # non-evictable forever.
+        pins: list[OffloadKey] | None = getattr(req_context, "_load_pins", None)
+        if pins:
+            for key in pins:
+                if key not in self._lookup_pinned:
+                    continue
+                self._lookup_pinned.discard(key)
+                chunk = self._policy.get(key)
+                if chunk is not None and chunk.ref_cnt == 0:
+                    self._policy.mark_evictable(key)
+                    self._num_evictable_cache_chunks += 1
+            pins.clear()
+        super().on_request_finished(req_context)
+
+    @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         chunk = self._policy.get(key)
         if chunk is None:
@@ -217,6 +243,26 @@ class CPUOffloadingManager(OffloadingManager):
                     self._reject_corrupt_chunk(key, chunk)
                     return LookupResult.MISS
                 verified.keys.add(key)
+        if chunk.ref_cnt == 0 and key not in self._lookup_pinned:
+            # Pin confirmed hits (fork, 2026-09-18): store completions —
+            # and their LRU evictions — run on transfer threads
+            # asynchronously from the scheduler thread, so an unpinned
+            # confirmed hit could vanish between this lookup and
+            # prepare_load (fatal `Block ... not found in cache` under
+            # restore-heavy load). The pin hands off to the load's ref_cnt
+            # in prepare_load; never-loaded pins release at request finish.
+            # The context's pin list is insertion-ordered so a release
+            # re-marks keys at MRU in lookup-scan order, deterministic
+            # for the LRU.
+            self._lookup_pinned.add(key)
+            pins: list[OffloadKey] | None = getattr(req_context, "_load_pins", None)
+            if pins is None:
+                pins = []
+                req_context._load_pins = pins  # type: ignore[attr-defined]
+            pins.append(key)
+            self._policy.mark_non_evictable(key)
+            self._num_evictable_cache_chunks -= 1
+            assert self._num_evictable_cache_chunks >= 0
         return LookupResult.HIT
 
     @override
@@ -226,11 +272,18 @@ class CPUOffloadingManager(OffloadingManager):
         req_context: ReqContext,
     ) -> LoadStoreSpec:
         chunks = []
+        pins: list[OffloadKey] | None = getattr(req_context, "_load_pins", None)
         for key in keys:
             chunk = self._policy.get(key)
             assert chunk is not None, f"Chunk {key!r} not found in cache"
             assert chunk.is_ready, f"Chunk {key!r} is not ready for reading"
-            if chunk.ref_cnt == 0:
+            if pins is not None and key in self._lookup_pinned:
+                # Already pinned (and counted non-evictable) by the
+                # confirming lookup; the load's ref_cnt takes over.
+                if key in pins:
+                    pins.remove(key)
+                self._lookup_pinned.discard(key)
+            elif chunk.ref_cnt == 0:
                 self._policy.mark_non_evictable(key)
                 self._num_evictable_cache_chunks -= 1  # ref_cnt 0 -> 1
                 assert self._num_evictable_cache_chunks >= 0
@@ -378,6 +431,7 @@ class CPUOffloadingManager(OffloadingManager):
         self._policy.clear()
         self._num_evictable_cache_chunks = 0
         self._num_write_pending_chunks = 0
+        self._lookup_pinned.clear()
         if self._integrity is not None:
             self._integrity.clear()
 

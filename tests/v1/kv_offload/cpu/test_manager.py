@@ -3,6 +3,7 @@
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -23,6 +24,7 @@ from vllm.v1.kv_offload.cpu.common import (
 )
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
+from vllm.v1.kv_offload.tiering.manager import CPUPrimaryTierOffloadingManager
 
 
 def make_req_context(
@@ -50,6 +52,22 @@ def make_cpu_manager(
         enable_events=enable_events,
         store_threshold=store_threshold,
         max_tracker_size=max_tracker_size,
+    )
+
+
+def make_tiering_cpu_manager(
+    num_chunks: int = 4,
+    cache_policy: str = "lru",
+    enable_events: bool = False,
+    mmap_region: MagicMock | None = None,
+) -> CPUPrimaryTierOffloadingManager:
+    """Construct over a (mocked) region, arming slot-checksum integrity."""
+    assert mmap_region is not None
+    return CPUPrimaryTierOffloadingManager(
+        num_chunks=num_chunks,
+        mmap_region=mmap_region,
+        cache_policy=cache_policy,
+        enable_events=enable_events,
     )
 
 
@@ -399,6 +417,11 @@ def test_cpu_manager():
     assert cpu_manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.HIT
     assert cpu_manager.lookup(to_key(3), _EMPTY_REQ_CTX) is LookupResult.MISS
 
+    # Lookup pins confirmed hits until load or request finish (fork,
+    # 2026-09-18): release them so the store below has its eviction
+    # candidates — the pin lifecycle is exercised by its own test.
+    cpu_manager.on_request_finished(_EMPTY_REQ_CTX)
+
     # prepare store [2, 3, 4, 5] -> evicts [1]
     prepare_store_output = cpu_manager.prepare_store(
         to_keys([2, 3, 4, 5]), _EMPTY_REQ_CTX
@@ -428,6 +451,10 @@ def test_cpu_manager():
     assert cpu_manager.lookup(to_key(4), _EMPTY_REQ_CTX) is LookupResult.HIT
     assert cpu_manager.lookup(to_key(5), _EMPTY_REQ_CTX) is LookupResult.HIT
     assert cpu_manager.lookup(to_key(0), _EMPTY_REQ_CTX) is LookupResult.MISS
+
+    # Release the lookup pins taken above; the load below re-pins through
+    # its own ref_cnt lifecycle.
+    cpu_manager.on_request_finished(_EMPTY_REQ_CTX)
 
     # prepare load [2, 3]
     prepare_load_output = cpu_manager.prepare_load(to_keys([2, 3]), _EMPTY_REQ_CTX)
@@ -1156,3 +1183,167 @@ def test_touch_forwards_req_context_to_policy(monkeypatch):
     assert len(received) == 1
     assert received[0][0] == keys
     assert received[0][1] is ctx
+
+
+# ---------------------------------------------------------------------------
+# Integrity: the CPU shm tier must not serve silently-wrong bytes.
+# Fork-local (2026-09-17): a corruption recurrence —
+# fs exonerated by construction (checksummed), CPU shm is the only
+# silently-wrong-capable tier in the cascade. Same KVMI treatment as the
+# fs tier, in-memory carrier (the CPU tier has no cross-restart reuse):
+# hash at store completion, verify at lookup, mismatch = MISS + evict.
+# ---------------------------------------------------------------------------
+
+
+def _make_integrity_region(num_chunks: int = 4, chunk_size: int = 64):
+    """A mocked region whose kv view the test can tamper with, plus helpers.
+
+    Mirrors the CPUPrimaryTierOffloadingManager arming path: the region's
+    create_kv_memoryview() supplies the bytes the checksums are taken over.
+    """
+    buf = np.zeros(num_chunks * chunk_size, dtype=np.uint8)
+    view = memoryview(buf)
+    region = MagicMock()
+    region.create_kv_memoryview.return_value = view
+
+    def write_slot(chunk_id: int, key: int) -> None:
+        view[chunk_id * chunk_size : (chunk_id + 1) * chunk_size] = bytes(
+            ([(key + chunk_id) % 251] * 3 + [0x41]) * (chunk_size // 4)
+        )
+
+    def tamper_slot(chunk_id: int) -> None:
+        view[chunk_id * chunk_size] ^= 0xFF
+
+    return region, write_slot, tamper_slot
+
+
+def _store_and_complete(manager, keys, ctx, write_slot):
+    out = manager.prepare_store(keys, ctx)
+    assert out is not None
+    for key, chunk in zip(out.keys_to_store, out.store_spec.chunk_ids):
+        write_slot(int(chunk), int.from_bytes(key[:4], "big") % 1000)
+    manager.complete_store(out.keys_to_store, ctx)
+
+
+def test_lookup_miss_and_evict_when_slot_corrupt_after_store():
+    """The 19:00Z shape: stored clean, bytes clobbered later (aliasing,
+    torn writes, pinning-failure class). A later request's lookup must
+    answer MISS, not HIT, and the corrupt chunk must leave the cache."""
+    region, write_slot, tamper_slot = _make_integrity_region()
+    manager = make_tiering_cpu_manager(num_chunks=4, mmap_region=region)
+    _store_and_complete(manager, to_keys([1, 2]), _EMPTY_REQ_CTX, write_slot)
+
+    assert (
+        manager.lookup(to_key(1), make_req_context(req_id="first")) is LookupResult.HIT
+    )
+
+    # Corrupt chunk 0's bytes behind the manager's back.
+    tamper_slot(0)
+
+    assert (
+        manager.lookup(to_key(1), make_req_context(req_id="second"))
+        is LookupResult.MISS
+    )
+    # Evicted: a subsequent store reuses the freed slot without error.
+    _store_and_complete(manager, to_keys([3]), _EMPTY_REQ_CTX, write_slot)
+    assert (
+        manager.lookup(to_key(3), make_req_context(req_id="third")) is LookupResult.HIT
+    )
+
+
+def test_integrity_rejection_emits_removal_event():
+    """A rejected chunk must announce its death (removed=True event) so
+    event consumers learn the key is gone, mirroring eviction semantics.
+
+    Known carrier limit, deliberately not tested as detection: corruption
+    BETWEEN the GPU->CPU copy and the store-time recording lands recorded
+    — the checksum anchors truth at complete_store, same as the fs tier's
+    store-time limit. Post-recording corruption is the detectable class.
+    """
+    region, write_slot, tamper_slot = _make_integrity_region()
+    manager = make_tiering_cpu_manager(
+        num_chunks=4, enable_events=True, mmap_region=region
+    )
+    _store_and_complete(manager, to_keys([1, 2]), _EMPTY_REQ_CTX, write_slot)
+    list(manager.take_events())
+
+    tamper_slot(0)
+    assert (
+        manager.lookup(to_key(1), make_req_context(req_id="detects"))
+        is LookupResult.MISS
+    )
+
+    events = list(manager.take_events())
+    assert len(events) == 1
+    assert events[0].removed is True
+    assert set(events[0].keys) == set(to_keys([1]))
+
+
+def test_integrity_silent_without_memoryview():
+    """No view armed (plain-spec construction has no buffer to checksum):
+    behavior is exactly the legacy contract — corruption is not detectable
+    and lookup still answers HIT. This is what every pre-existing test
+    runs with."""
+    manager = make_cpu_manager(num_chunks=4)
+    out = manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
+    assert out is not None
+    manager.complete_store(out.keys_to_store, _EMPTY_REQ_CTX)
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.HIT
+
+
+def test_integrity_verification_once_per_request_context():
+    """Scheduler-thread cost bound: a request verifies each key's bytes on
+    its first lookup and trusts that verdict for the request's lifetime;
+    a different request re-verifies. Intra-request corruption after the
+    first lookup is answered HIT by design (the request's own generation
+    would already carry any such corruption); cross-request corruption
+    is caught by the next request's first lookup."""
+    region, write_slot, tamper_slot = _make_integrity_region()
+    manager = make_tiering_cpu_manager(num_chunks=4, mmap_region=region)
+    _store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
+
+    ctx_a = make_req_context(req_id="req-a")
+    ctx_b = make_req_context(req_id="req-b")
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+
+    tamper_slot(0)
+    # Same request: cached verdict, still HIT (documented design limit).
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+    # New request: re-verified, rejected, MISS.
+    assert manager.lookup(to_key(1), ctx_b) is LookupResult.MISS
+
+
+def test_lookup_confirmed_hit_pinned_until_prepare_load():
+    """Regression (2026-09-18): a key the lookup
+    confirmed HIT was evicted by an asynchronously-completing store before
+    prepare_load pinned it — ref_cnt protection started only at
+    prepare_load, so the transfer threads' interleaving killed the engine
+    at `assert chunk is not None`. The contract: a lookup-confirmed hit is
+    pinned from the lookup until its load takes the pin over (or the
+    request finishes); eviction pressure against a pinned key surfaces as
+    store refusal, never as the key's disappearance."""
+    manager = make_cpu_manager(num_chunks=2, cache_policy="lru")
+    victim_ctx = make_req_context("victim")
+    churn_ctx = make_req_context("churn")
+
+    # Victim key stored and completed — resident.
+    out = manager.prepare_store(to_keys([1]), victim_ctx)
+    assert out is not None
+    manager.complete_store(to_keys([1]), victim_ctx)
+
+    # The connector's confirming lookup: HIT.
+    assert manager.lookup(to_key(1), victim_ctx) is LookupResult.HIT
+
+    # Interleave: a churn store completes on a transfer thread between the
+    # confirming lookup and prepare_load, and would take the victim's slot.
+    churn = manager.prepare_store(to_keys([2, 3]), churn_ctx)
+
+    # The load catches up. Before the fix this is the engine-killing
+    # assert; after it, the victim is pinned and the churn store was
+    # refused instead.
+    spec = manager.prepare_load(to_keys([1]), victim_ctx)
+    assert spec is not None
+    if churn is None:
+        # Store refusal is the legal pressure outcome; the keys never
+        # landed, so nothing is resident for them.
+        assert manager.lookup(to_key(2), churn_ctx) is not LookupResult.HIT
