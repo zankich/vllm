@@ -472,6 +472,120 @@ def test_excluded_group_sizing_matches_across_scheduler_flattening():
     assert worker.worker_kv_bytes_per_block == wrapper.page_size_bytes
 
 
+def test_excluded_group_sizing_generic_layout_matches_across_flattening():
+    """Excluded-group sizing must agree on the generic tensor layout too.
+
+    The generic path forces a block-outer layout for mixed page sizes
+    (Flash-Next's live shape: a wrapper of wide and narrow layers plus an
+    excluded misaligned group), so buckets carry per-block L-axis strides.
+    Stride-derived sizing bails on those and both roles fall to the spec
+    sum, which diverges worker-wrapper vs scheduler-representative — the
+    byte-identical repeat of the live failure. The tensor total serves
+    both roles identically: the scheduler flattening deep-copies tensors
+    unchanged.
+    """
+    num_blocks = 4
+    wide = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=2, dtype=torch.float32
+    )
+    narrow = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    indexer = CircularBufferSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=1,
+        head_size_v=0,
+        dtype=torch.float32,
+    )
+    wrapper = UniformTypeKVCacheSpecs(
+        block_size=16, kv_cache_specs={"wide": wide, "narrow": narrow}
+    )
+    # Generic path: one tensor per spec bucket with the per-block L-axis
+    # stride, every tensor's size the whole max-group-sized allocation
+    # (groups alias inside it).
+    bytes_per_block = max(wrapper.page_size_bytes, indexer.page_size_bytes)
+    size = bytes_per_block * num_blocks
+
+    def bucket(layers: list[str], page: int, offset: int) -> KVCacheTensor:
+        return KVCacheTensor(
+            size=size,
+            layers=layers,
+            layer_stride=page,
+            block_stride=bytes_per_block,
+            offset=offset,
+        )
+
+    worker_cfg = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            bucket(["wide"], wide.page_size_bytes, 0),
+            bucket(["narrow"], narrow.page_size_bytes, wide.page_size_bytes),
+            bucket(["indexer"], indexer.page_size_bytes, 0),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["wide", "narrow"], wrapper),
+            KVCacheGroupSpec(["indexer"], indexer),
+        ],
+    )
+    scheduler_cfg = generate_scheduler_kv_cache_config([worker_cfg])
+
+    config = _make_vllm_config()
+    worker = build_offloading_config(config, worker_cfg)
+    scheduler = build_offloading_config(config, scheduler_cfg)
+
+    assert worker.worker_kv_bytes_per_block == scheduler.worker_kv_bytes_per_block
+    assert worker.worker_kv_bytes_per_block == bytes_per_block
+
+
+def test_hisparse_refuses_tensor_total_sizing():
+    """HiSparse host tensors must not feed the tensor-total sizing path.
+
+    The HiSparse config prepends host tensors sized by host_num_blocks —
+    a different block count — into ``kv_cache_tensors[0]``, so the
+    tensor-total form would mix host geometry into device sizing. Sizing
+    must fall to the spec-derived sum of the selected indexer groups.
+    """
+    num_blocks = 4
+    host_blocks = 7  # deliberately different from the device block count
+    layer_specs = {name: _full_attention_spec() for name in ("indexer.0", "indexer.1")}
+    wrapped = UniformTypeKVCacheSpecs.from_specs(layer_specs)
+    assert wrapped is not None
+    source = KVCacheGroupSpec(
+        ["source"],
+        _full_attention_spec(),
+        host_resident=True,
+        role=KVCacheGroupRole.HISPARSE_SOURCE,
+    )
+    indexer_group = KVCacheGroupSpec(
+        list(layer_specs), wrapped, role=KVCacheGroupRole.HISPARSE_INDEXER
+    )
+    page = _full_attention_spec().page_size_bytes
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=page * host_blocks,
+                layers=["source"],
+                layer_stride=page,
+                block_stride=page,
+            ),
+            KVCacheTensor(
+                size=page * num_blocks,
+                layers=list(layer_specs),
+                layer_stride=page * num_blocks,
+                block_stride=page,
+            ),
+        ],
+        kv_cache_groups=[source, indexer_group],
+        hisparse_host_num_blocks=host_blocks,
+    )
+
+    offloading_config = build_offloading_config(_make_vllm_config(), kv_cache_config)
+
+    assert offloading_config.worker_kv_bytes_per_block == wrapped.page_size_bytes
+
+
 def test_zero_blocks_skips_tensor_layout_validation():
     kv_cache_config = _make_sizing_kv_cache_config(packed=False)
     kv_cache_config.num_blocks = 0

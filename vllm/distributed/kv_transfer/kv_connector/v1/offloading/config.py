@@ -108,6 +108,11 @@ def _selected_kv_bytes_per_block_from_tensors(
 ) -> int | None:
     """Per-block bytes of the selected groups, from the tensor layout.
 
+    The tensor-total path in ``build_offloading_config`` takes every
+    non-HiSparse config that has tensors, so this derivation carries only
+    the residue that path refuses; both of its bail classes land here and
+    continue to the spec-derived sum.
+
     ``generate_scheduler_kv_cache_config`` flattens every
     ``UniformTypeKVCacheSpecs`` group to one arbitrary representative layer
     spec, so a spec-derived sum is not invariant across the worker and
@@ -266,14 +271,20 @@ def build_offloading_config(
             )
 
     worker_kv_bytes_per_block = 0
-    all_groups_selected = len(selected_groups) == len(kv_cache_config.kv_cache_groups)
     if (
-        all_groups_selected
-        and kv_cache_config.num_blocks > 0
+        kv_cache_config.num_blocks > 0
         and kv_cache_config.kv_cache_tensors
+        and kv_cache_config.hisparse_host_num_blocks is None
     ):
-        # Every KVCacheTensor describes placement within the same backing allocation,
-        # so its size is the total, not a per-tensor share.
+        # Every KVCacheTensor describes placement within the same backing
+        # allocation, so its size is the total, not a per-tensor share.
+        # The tensor list is deep-copied unchanged by the scheduler config
+        # flattening, so both roles compute the same number from it — the
+        # fork's production semantics. Excluded groups leave the region
+        # sized for the whole allocation, over-provisioned but identical
+        # across processes. HiSparse configs must not take this path:
+        # their tensor list is prepended with host tensors sized by
+        # host_num_blocks, a different block count.
         total_gpu_kv_bytes = kv_cache_config.kv_cache_tensors[0].size
         worker_kv_bytes_per_block = total_gpu_kv_bytes // kv_cache_config.num_blocks
     elif kv_cache_config.num_blocks > 0:
