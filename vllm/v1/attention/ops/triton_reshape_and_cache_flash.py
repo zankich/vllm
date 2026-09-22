@@ -50,6 +50,35 @@ def quantize_kv_e5m2_sm80(
     return key, value
 
 
+def _quantize_kv_e5m2_for_sm80(
+    kv_cache_dtype: str,
+    kv_cache_torch_dtype: torch.dtype,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+    *caches: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
+    """PATCH triton-fp8kv-sm80, shared by both cache-store wrappers: below
+    SM89 triton cannot compile fp8e4nv, and its implicit e5m2 cast rounds
+    ties away from even. Quantize in torch (RNE) and let the kernel's
+    is_fp8 input branch store raw bytes. Returns the (key, value) pair to
+    store and the caches viewed as e5m2 when the branch fires; the inputs
+    unchanged otherwise."""
+    if not (
+        is_quantized_kv_cache(kv_cache_dtype)
+        and current_platform.is_cuda()
+        and not current_platform.has_device_capability(89)
+        and key.dtype
+        not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
+    ):
+        return key, value, caches
+    if kv_cache_torch_dtype != torch.float8_e5m2:
+        caches = tuple(cache.view(torch.float8_e5m2) for cache in caches)
+    key, value = quantize_kv_e5m2_sm80(key, value, k_scale, v_scale)
+    return key, value, caches
+
+
 @triton.jit
 def reshape_and_cache_kernel_flash(
     key_ptr,  # [num_tokens, num_heads, head_size]
@@ -433,21 +462,18 @@ def triton_reshape_and_cache_flash(
         key_cache = key_cache.view(kv_cache_torch_dtype)
         value_cache = value_cache.view(kv_cache_torch_dtype)
     FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype)
-    # PATCH triton-fp8kv-sm80: below SM89 triton cannot compile fp8e4nv, and
-    # its implicit e5m2 cast rounds ties away from even. Quantize in torch
-    # (RNE) and let the kernel's is_fp8 input branch store raw bytes.
-    if (
-        FP8_KV_CACHE
-        and current_platform.is_cuda()
-        and not current_platform.has_device_capability(89)
-        and key.dtype
-        not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
-    ):
-        if kv_cache_torch_dtype != torch.float8_e5m2:
-            kv_cache_torch_dtype = torch.float8_e5m2
-            key_cache = key_cache.view(kv_cache_torch_dtype)
-            value_cache = value_cache.view(kv_cache_torch_dtype)
-        key, value = quantize_kv_e5m2_sm80(key, value, k_scale, v_scale)
+    # PATCH triton-fp8kv-sm80: torch-side RNE quantize and e5m2 cache views
+    # below SM89; the branch lives once in _quantize_kv_e5m2_for_sm80.
+    key, value, (key_cache, value_cache) = _quantize_kv_e5m2_for_sm80(
+        kv_cache_dtype,
+        kv_cache_torch_dtype,
+        key,
+        value,
+        k_scale,
+        v_scale,
+        key_cache,
+        value_cache,
+    )
     # heuristics instead of autotuning
     TILE_SIZE = min(2048, triton.next_power_of_2(n))
     if current_platform.is_rocm() or current_platform.is_xpu():
@@ -606,17 +632,15 @@ def triton_reshape_and_cache_flash_diffkv(
         kv_cache = kv_cache.view(kv_cache_torch_dtype)
     FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype)
     # PATCH triton-fp8kv-sm80: torch-side RNE quantize, see main wrapper.
-    if (
-        FP8_KV_CACHE
-        and current_platform.is_cuda()
-        and not current_platform.has_device_capability(89)
-        and key.dtype
-        not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
-    ):
-        if kv_cache_torch_dtype != torch.float8_e5m2:
-            kv_cache_torch_dtype = torch.float8_e5m2
-            kv_cache = kv_cache.view(kv_cache_torch_dtype)
-        key, value = quantize_kv_e5m2_sm80(key, value, k_scale, v_scale)
+    key, value, (kv_cache,) = _quantize_kv_e5m2_for_sm80(
+        kv_cache_dtype,
+        kv_cache_torch_dtype,
+        key,
+        value,
+        k_scale,
+        v_scale,
+        kv_cache,
+    )
     # heuristics instead of autotuning
     TILE_SIZE = max(head_size_k, head_size_v)
     TILE_SIZE = triton.next_power_of_2(TILE_SIZE)
