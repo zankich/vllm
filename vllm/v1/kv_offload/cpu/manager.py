@@ -275,6 +275,22 @@ class CPUOffloadingManager(OffloadingManager):
         pins: list[OffloadKey] | None = getattr(req_context, "_load_pins", None)
         for key in keys:
             chunk = self._policy.get(key)
+            if chunk is None and pins is not None and key in pins:
+                # This request's confirming lookup pinned the key, but a
+                # later integrity rejection evicted it in between (pins do
+                # not refcount, so the rejector's ref_cnt==0 gate passes).
+                # Degrade to a miss for this key: drop the stale pin (the
+                # rejection already settled its non-evictable count) and
+                # skip, instead of asserting mid-batch. The corrupt bytes
+                # were evicted by the reject path and stay evicted.
+                logger.warning(
+                    "CPU offload tier: pinned key %.16s vanished before its "
+                    "load (rejected by another request's integrity check); "
+                    "degrading to a miss for this key",
+                    key,
+                )
+                pins.remove(key)
+                continue
             assert chunk is not None, f"Chunk {key!r} not found in cache"
             assert chunk.is_ready, f"Chunk {key!r} is not ready for reading"
             if pins is not None and key in self._lookup_pinned:

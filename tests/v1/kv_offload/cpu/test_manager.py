@@ -1313,6 +1313,68 @@ def test_integrity_verification_once_per_request_context():
     assert manager.lookup(to_key(1), ctx_b) is LookupResult.MISS
 
 
+def test_prepare_load_degrades_pinned_key_to_miss_after_rejection(caplog):
+    """Pin-vs-reject race: request A's confirming lookup pins a hit, the
+    slot corrupts, and request B's fresh lookup rejects and evicts the
+    chunk (pins do not refcount, so the rejector's ref_cnt==0 gate
+    passes). A's prepare_load must answer a graceful miss for the key —
+    skip it and keep loading the rest — instead of hitting
+    `assert chunk is not None` and killing the engine. The reject path
+    stays intact: the corrupt bytes are gone and the slot is reusable."""
+    region, write_slot, tamper_slot = _make_integrity_region()
+    manager = make_tiering_cpu_manager(num_chunks=2, mmap_region=region)
+    _store_and_complete(manager, to_keys([1, 2]), _EMPTY_REQ_CTX, write_slot)
+
+    ctx_a = make_req_context(req_id="req-a")
+    ctx_b = make_req_context(req_id="req-b")
+
+    # A's confirming lookup: both keys HIT and pinned for A's load.
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+    assert manager.lookup(to_key(2), ctx_a) is LookupResult.HIT
+    assert set(manager._lookup_pinned) == set(to_keys([1, 2]))
+
+    # The slot corrupts after A's verification; B's fresh lookup rejects
+    # and evicts key 1, silently discarding A's pin on it.
+    tamper_slot(0)
+    assert manager.lookup(to_key(1), ctx_b) is LookupResult.MISS
+    assert manager._policy.get(to_key(1)) is None
+
+    # A's load catches up. Before the fix this is the engine-killing assert.
+    with caplog.at_level("WARNING", logger="vllm.v1.kv_offload.cpu.manager"):
+        spec = manager.prepare_load(to_keys([1, 2]), ctx_a)
+    assert isinstance(spec, CPULoadStoreSpec)
+    # The rejected key is a graceful miss: only the surviving key loads.
+    assert len(spec.chunk_ids) == 1
+
+    # The stale pin is discarded, not leaked to request finish.
+    assert to_key(1) not in ctx_a._load_pins
+    # Accounting symmetry: completing the one real load restores the idle
+    # count for it alone — a leaked pin count would leave usage nonzero.
+    manager.complete_load(to_keys([2]), ctx_a)
+    assert manager._num_evictable_cache_chunks == 1
+    stats = manager.get_stats()
+    assert stats is not None
+    assert stats.reduce()[CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC] == (
+        pytest.approx(0.0)
+    )
+
+    # One warning names the degraded key.
+    degrade_warnings = [
+        record for record in caplog.records if "degrad" in record.message
+    ]
+    assert len(degrade_warnings) == 1
+
+    # The reject path is unweakened: key 1 stays a MISS and its slot was
+    # freed for reuse by the next store.
+    assert manager.lookup(to_key(1), make_req_context(req_id="req-c")) is (
+        LookupResult.MISS
+    )
+    _store_and_complete(manager, to_keys([3]), _EMPTY_REQ_CTX, write_slot)
+    assert manager.lookup(to_key(3), make_req_context(req_id="req-d")) is (
+        LookupResult.HIT
+    )
+
+
 def test_lookup_confirmed_hit_pinned_until_prepare_load():
     """Regression (2026-09-18): a key the lookup
     confirmed HIT was evicted by an asynchronously-completing store before
