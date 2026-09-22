@@ -49,6 +49,24 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 
+def kv_fp8_dtype_for_platform(
+    default_dtype: torch.dtype,
+    platform=None,
+) -> torch.dtype:
+    """The fp8 dtype to serve quantized KV with on this platform.
+
+    Below SM89 on CUDA, e5m2 replaces the default e4m3: triton cannot
+    compile fp8e4nv there, so quantized KV serves as e5m2 (native in
+    triton on SM80+), quantized in torch (RNE) by the cache-store
+    wrapper; decode loads e5m2 and dequantizes in-kernel as usual.
+    """
+    if platform is None:
+        platform = current_platform
+    if platform.is_cuda() and not platform.has_device_capability(89):
+        return torch.float8_e5m2
+    return default_dtype
+
+
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
@@ -483,8 +501,11 @@ class TritonAttentionImpl(AttentionImpl):
             cap = current_platform.get_device_capability()
             cap_str = cap.as_version_str() if cap is not None else "unknown"
             dev = current_platform.get_device_name()
+            # PATCH triton-fp8kv-sm80: widen the FP8 KV gate to SM80+; the
+            # kernel dequantizes FP8 K/V in software (_cast_kv_tile), and the
+            # cache is stored as e5m2 below SM89 where triton lacks fp8e4nv.
             if self.kv_cache_dtype.startswith("fp8") and not (
-                current_platform.has_device_capability(89)
+                current_platform.has_device_capability(80)
             ):
                 suggested = (
                     "float16" if (cap is None or cap.to_int() < 80) else "bfloat16"
@@ -492,7 +513,8 @@ class TritonAttentionImpl(AttentionImpl):
                 raise ValueError(
                     f"FP8 KV cache is not supported by the Triton attention backend "
                     f"on {dev} (compute capability {cap_str}); native FP8 (fp8e4nv) "
-                    f"requires SM89+. Re-run with --kv-cache-dtype {suggested}."
+                    f"requires SM89+ and the e5m2 fallback requires SM80+. "
+                    f"Re-run with --kv-cache-dtype {suggested}."
                 )
             if self.kv_cache_dtype == "bfloat16" and not (
                 current_platform.has_device_capability(80)
@@ -512,6 +534,10 @@ class TritonAttentionImpl(AttentionImpl):
 
         self.attn_type = attn_type
         self.fp8_dtype = current_platform.fp8_dtype()
+        # PATCH triton-fp8kv-sm80: below SM89 triton cannot compile
+        # fp8e4nv; see kv_fp8_dtype_for_platform.
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            self.fp8_dtype = kv_fp8_dtype_for_platform(self.fp8_dtype)
 
         self.sinks = sinks
         if sinks is not None:
