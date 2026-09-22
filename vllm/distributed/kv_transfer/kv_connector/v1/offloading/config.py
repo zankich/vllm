@@ -91,13 +91,75 @@ def _group_kv_bytes_per_block(group: "KVCacheGroupSpec") -> int:
     """Return the physical bytes occupied by one block of a cache group.
 
     Worker configs may retain ``UniformTypeKVCacheSpecs`` while scheduler
-    configs flatten that wrapper to one representative per-layer spec.  Keep
-    the result invariant across those two representations.
+    configs flatten that wrapper to one representative per-layer spec.  The
+    result is invariant across those two representations only when every
+    member has the same page size; mixed-size wrappers must size through
+    ``_selected_kv_bytes_per_block_from_tensors`` instead.
     """
     spec = group.kv_cache_spec
     if isinstance(spec, UniformTypeKVCacheSpecs):
         return spec.page_size_bytes
     return spec.page_size_bytes * len(group.layer_names)
+
+
+def _selected_kv_bytes_per_block_from_tensors(
+    kv_cache_config: "KVCacheConfig",
+    selected_group_ids: tuple[int, ...],
+) -> int | None:
+    """Per-block bytes of the selected groups, from the tensor layout.
+
+    ``generate_scheduler_kv_cache_config`` flattens every
+    ``UniformTypeKVCacheSpecs`` group to one arbitrary representative layer
+    spec, so a spec-derived sum is not invariant across the worker and
+    scheduler representations when members differ in size: the scheduler
+    sizes the offload region by the representative instead of the member
+    sum and the two processes build differently sized mmaps over the same
+    deterministic path.  The tensor layout is deep-copied unchanged by
+    that flattening and buckets layers by spec, so both representations
+    yield the same exact sum here.
+
+    Returns None when the tensors cannot serve as the source: when no
+    tensors are present; on HiSparse layouts (their hot/resident pages
+    use per-block strides); for any selected layer no single-group
+    bucket covers exactly; and on the generic block-outer layout, whose
+    mixed-page buckets carry a per-block L-axis stride
+    (``page_size_bytes``, not ``page * num_blocks``) so the
+    divisibility check bails them -- mixed-size wrappers on that path
+    still size through the spec-derived sum and can diverge across the
+    scheduler flattening.  The caller falls back to the spec-derived
+    sum.
+    """
+    if kv_cache_config.hisparse_host_num_blocks is not None:
+        return None
+    layer_to_group = {
+        layer_name: group_id
+        for group_id in selected_group_ids
+        for layer_name in kv_cache_config.kv_cache_groups[group_id].layer_names
+    }
+    num_blocks = kv_cache_config.num_blocks
+    covered: set[str] = set()
+    total = 0
+    for tensor in kv_cache_config.kv_cache_tensors:
+        bucket = set(tensor.layers)
+        if not bucket or not bucket <= layer_to_group.keys():
+            continue
+        if len({layer_to_group[name] for name in bucket}) != 1:
+            return None
+        if tensor.layer_stride % num_blocks != 0:
+            group = kv_cache_config.kv_cache_groups[layer_to_group[next(iter(bucket))]]
+            logger.debug(
+                "offloading: sizing group %s through group specs: tensor "
+                "layer_stride=%d does not scale with num_blocks=%d",
+                group.layer_names[0],
+                tensor.layer_stride,
+                num_blocks,
+            )
+            return None
+        total += len(bucket) * (tensor.layer_stride // num_blocks)
+        covered |= bucket
+    if covered != set(layer_to_group):
+        return None
+    return total
 
 
 def build_offloading_config(
@@ -215,9 +277,14 @@ def build_offloading_config(
         total_gpu_kv_bytes = kv_cache_config.kv_cache_tensors[0].size
         worker_kv_bytes_per_block = total_gpu_kv_bytes // kv_cache_config.num_blocks
     elif kv_cache_config.num_blocks > 0:
-        worker_kv_bytes_per_block = sum(
-            _group_kv_bytes_per_block(group) for _, group in selected_groups
+        selected_bytes = _selected_kv_bytes_per_block_from_tensors(
+            kv_cache_config, selected_group_ids
         )
+        if selected_bytes is None:
+            selected_bytes = sum(
+                _group_kv_bytes_per_block(group) for _, group in selected_groups
+            )
+        worker_kv_bytes_per_block = selected_bytes
 
     single_group_spec = (
         kv_cache_config.kv_cache_groups[0].kv_cache_spec

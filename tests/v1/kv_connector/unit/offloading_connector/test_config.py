@@ -17,7 +17,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     SchedulerOffloadConfig,
 )
 from vllm.platforms import current_platform
+from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
@@ -401,6 +403,73 @@ def test_hisparse_partial_group_size_survives_scheduler_flattening():
 
     assert worker.worker_kv_bytes_per_block == scheduler.worker_kv_bytes_per_block
     assert worker.worker_kv_bytes_per_block == wrapped.page_size_bytes
+
+
+def test_excluded_group_sizing_matches_across_scheduler_flattening():
+    """Excluded-group sizing must be identical in both processes.
+
+    The scheduler's config flattens each UniformTypeKVCacheSpecs group to one
+    representative layer spec, so a spec-derived sum over a wrapper whose
+    members differ in size cannot match the worker's member sum: the
+    representative is arbitrary. The Flash-Next TP4 boot died on that split —
+    workers created the region at their sum while EngineCore waited for its
+    larger one. The tensor layout survives flattening unchanged and must be
+    the sizing source for both processes.
+    """
+    num_blocks = 4
+    wide = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=2, dtype=torch.float32
+    )
+    narrow = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    indexer = CircularBufferSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=1,
+        head_size_v=0,
+        dtype=torch.float32,
+    )
+    wrapper = UniformTypeKVCacheSpecs(
+        block_size=16, kv_cache_specs={"wide": wide, "narrow": narrow}
+    )
+    # Buckets and strides as the glm5 tensor layout builds them: one tensor
+    # per spec bucket, layer stride = page * num_blocks, every tensor's size
+    # the whole allocation. The generic path cannot build this shape for
+    # mixed page sizes: it rejects layer-outer layouts for them, so its
+    # buckets carry per-block strides and the sizing bails to the spec sum.
+    bytes_per_block = max(wrapper.page_size_bytes, indexer.page_size_bytes)
+    size = bytes_per_block * num_blocks
+
+    def bucket(layers: list[str], page: int, offset: int) -> KVCacheTensor:
+        return KVCacheTensor(
+            size=size,
+            layers=layers,
+            layer_stride=page * num_blocks,
+            block_stride=bytes_per_block,
+            offset=offset,
+        )
+
+    worker_cfg = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            bucket(["wide"], wide.page_size_bytes, 0),
+            bucket(["narrow"], narrow.page_size_bytes, wide.page_size_bytes),
+            bucket(["indexer"], indexer.page_size_bytes, wrapper.page_size_bytes),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["wide", "narrow"], wrapper),
+            KVCacheGroupSpec(["indexer"], indexer),
+        ],
+    )
+    scheduler_cfg = generate_scheduler_kv_cache_config([worker_cfg])
+
+    config = _make_vllm_config()
+    worker = build_offloading_config(config, worker_cfg)
+    scheduler = build_offloading_config(config, scheduler_cfg)
+
+    assert worker.worker_kv_bytes_per_block == scheduler.worker_kv_bytes_per_block
+    assert worker.worker_kv_bytes_per_block == wrapper.page_size_bytes
 
 
 def test_zero_blocks_skips_tensor_layout_validation():

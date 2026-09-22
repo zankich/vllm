@@ -722,6 +722,71 @@ def test_multiprocess_race_construct_and_write(iid):
         assert p.exitcode == 0
 
 
+def test_loser_of_create_race_opens_existing_full_size_file(iid):
+    """A constructor that finds the file already at full size — it lost the
+    O_EXCL race to a concurrent process that has already ftruncated — must
+    open the existing file with its own fd and reach working state, never a
+    recovery path that references an fd the failed create never set."""
+    num_chunks = 4
+    path = f"/dev/shm/vllm_offload_{iid}.mmap"
+    winner_fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.ftruncate(winner_fd, num_chunks * PAGE_SIZE)
+    try:
+        loser = SharedOffloadRegion(
+            engine_id=iid,
+            num_chunks=num_chunks,
+            rank=None,
+            kv_bytes_per_chunk=PAGE_SIZE,
+            cpu_page_size=PAGE_SIZE,
+        )
+        try:
+            assert not loser._creator
+            assert loser.fd is not None and loser.fd != winner_fd
+            assert not loser.mmap_obj.closed
+            assert os.fstat(loser.fd).st_size == num_chunks * PAGE_SIZE
+            loser.mmap_obj[0:1] = b"\x5a"
+            assert memoryview(loser.mmap_obj)[0:1] == b"\x5a"
+        finally:
+            loser.cleanup()
+    finally:
+        os.close(winner_fd)
+        _cleanup_file(path)
+
+
+def test_loser_waits_for_creator_mid_creation_then_succeeds(iid):
+    """A constructor arriving between the winner's O_EXCL create and its
+    ftruncate must wait for the file to reach full size, then succeed."""
+    num_chunks = 2
+    path = f"/dev/shm/vllm_offload_{iid}.mmap"
+    creator_fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+
+    def finish_creation():
+        time.sleep(0.25)
+        os.ftruncate(creator_fd, num_chunks * PAGE_SIZE)
+
+    creator = threading.Thread(target=finish_creation)
+    creator.start()
+    try:
+        loser = SharedOffloadRegion(
+            engine_id=iid,
+            num_chunks=num_chunks,
+            rank=None,
+            kv_bytes_per_chunk=PAGE_SIZE,
+            cpu_page_size=PAGE_SIZE,
+        )
+        creator.join()
+        try:
+            assert not loser._creator
+            assert os.fstat(loser.fd).st_size == num_chunks * PAGE_SIZE
+            assert not loser.mmap_obj.closed
+        finally:
+            loser.cleanup()
+    finally:
+        creator.join()
+        os.close(creator_fd)
+        _cleanup_file(path)
+
+
 # ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
