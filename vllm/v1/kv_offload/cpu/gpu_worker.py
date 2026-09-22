@@ -201,6 +201,13 @@ def _region_registration_lock(region: SharedOffloadRegion):
     where one rank succeeded while the other failed). flock on the region's
     own fd orders the ranks without introducing a named lock file that
     could itself be orphaned by a crash.
+
+    The LOCK_EX conversion replaces the fd's boot-time LOCK_SH liveness
+    mark, and LOCK_UN releases the lock without restoring it: the fd ends
+    this context unlocked. Safe because registration runs after the
+    creator's post-barrier unlink of the region path, so the orphan
+    reclaimer has no path to probe; both locks matter only inside the
+    boot window.
     """
     if region.fd is None:
         yield

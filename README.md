@@ -66,9 +66,10 @@ the calibrated scales), or Triton multimodal (image support, e5m2 KV —
 FlashInfer does not support this model's multimodal attention). With
 both opt-ins below, the full stack serves: MTP (the Gemma assistant
 drafter), fp8 KV, and tiered CPU + fs KV offload on the same
-cross-model integrity and pin patches above. Validated under
-warm/churn/extend restore traffic with the restore-accounting
-instrumentation reading full coverage.
+cross-model integrity and pin patches above. Validated on v0.29.0z
+under warm/churn/extend restore traffic with the restore-accounting
+instrumentation reading full coverage; v0.30.0z has not booted Gemma-4
+(weights absent) and awaits revalidation.
 
 | commit | what it does | origin |
 |---|---|---|

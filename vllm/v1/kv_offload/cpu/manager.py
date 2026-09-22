@@ -397,13 +397,16 @@ class CPUOffloadingManager(OffloadingManager):
             for key in keys:
                 chunk = self._policy.get(key)
                 if chunk is not None and not chunk.is_ready:
+                    # Record before flipping readiness: the bytes are final
+                    # once the transfer completes, and a ready chunk with no
+                    # recorded checksum reads as corruption in lookup.
+                    if self._integrity is not None:
+                        self._integrity[key] = self._slot_checksum(key, chunk.chunk_id)
                     chunk.ref_cnt = 0
                     self._num_write_pending_chunks -= 1
                     self._num_evictable_cache_chunks += 1
                     self._policy.mark_evictable(key)
                     stored_keys.append(key)
-                    if self._integrity is not None:
-                        self._integrity[key] = self._slot_checksum(key, chunk.chunk_id)
         else:
             for key in keys:
                 chunk = self._policy.get(key)

@@ -154,6 +154,14 @@ def _selected_kv_bytes_per_block_from_tensors(
         layer_run = tensor.block_stride * num_blocks
         if tensor.layer_stride % layer_run == 0:
             if tensor.layer_stride > layer_run:
+                logger.debug(
+                    "offloading: group %s has a per-head axis between layers "
+                    "and blocks (layer_stride=%d, layer_run=%d); bailing to "
+                    "spec-derived sizing",
+                    min(bucket),
+                    tensor.layer_stride,
+                    layer_run,
+                )
                 return None
             total += len(bucket) * tensor.block_stride
         else:
