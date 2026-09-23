@@ -11,6 +11,10 @@ import torch
 import triton
 import triton.language as tl
 
+# Production import order: model.py imports .qsa, never the reverse entry.
+# Importing qsa first trips a pre-existing partial-init cycle.
+import vllm.models.qwen4_exp.nvidia.model  # noqa: F401
+from vllm.models.qwen4_exp.nvidia import qsa as qsa_mod
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.platforms import current_platform
 
@@ -189,3 +193,147 @@ def test_fp8_kv_rejects_bad_scales_and_mixed_dtypes():
             token_to_req,
             False,
         )
+
+
+# --- static sidecar loader and dtype gates -----------------------------------
+
+
+def _fake_qsa_layer(name, kv_cache_dtype="fp8_e4m3"):
+
+    layer = qsa_mod.Qwen4ExpQSAAttention.__new__(qsa_mod.Qwen4ExpQSAAttention)
+    layer.layer_name = name
+    layer.kv_cache_dtype = kv_cache_dtype
+    layer._k_scale = torch.ones(1)
+    layer._v_scale = torch.ones(1)
+    return layer
+
+
+def _sidecar(tmp_path, entries):
+    p = tmp_path / "scales.json"
+    p.write_text(json.dumps(entries), encoding="utf-8")
+    return p
+
+
+def test_loader_strict_applies_scales(tmp_path):
+
+    layers = {
+        "model.layers.3.self_attn.attn": _fake_qsa_layer(
+            "model.layers.3.self_attn.attn"
+        ),
+        "model.layers.7.self_attn.attn": _fake_qsa_layer(
+            "model.layers.7.self_attn.attn"
+        ),
+    }
+    p = _sidecar(
+        tmp_path,
+        {
+            "model.layers.3.self_attn.attn": {"k_scale": 0.02, "v_scale": 0.04},
+            "model.layers.7.self_attn.attn": {"k_scale": 0.03, "v_scale": 0.05},
+        },
+    )
+    applied = qsa_mod.load_qsa_static_kv_scales(layers, p, strict=True)
+    assert applied == [
+        "model.layers.3.self_attn.attn",
+        "model.layers.7.self_attn.attn",
+    ]
+    # _k_scale is float32: 0.02 is not exactly representable
+    assert layers["model.layers.3.self_attn.attn"]._k_scale.item() == pytest.approx(
+        0.02, rel=1e-6
+    )
+    assert layers["model.layers.7.self_attn.attn"]._v_scale.item() == pytest.approx(
+        0.05, rel=1e-6
+    )
+
+
+def test_loader_strict_rejects_partial_and_unknown(tmp_path):
+
+    layers = {"a.attn": _fake_qsa_layer("a.attn"), "b.attn": _fake_qsa_layer("b.attn")}
+    with pytest.raises(ValueError, match="Unknown QSA layer names"):
+        qsa_mod.load_qsa_static_kv_scales(
+            layers,
+            _sidecar(
+                tmp_path,
+                {
+                    "a.attn": {"k_scale": 1.0, "v_scale": 1.0},
+                    "ghost.attn": {"k_scale": 1.0, "v_scale": 1.0},
+                },
+            ),
+        )
+    with pytest.raises(ValueError, match="Missing QSA layer scales"):
+        qsa_mod.load_qsa_static_kv_scales(
+            layers,
+            _sidecar(tmp_path, {"a.attn": {"k_scale": 1.0, "v_scale": 1.0}}),
+            strict=True,
+        )
+    with pytest.raises(ValueError, match="Missing QSA layer scales"):
+        qsa_mod.load_qsa_static_kv_scales(layers, _sidecar(tmp_path, {}), strict=True)
+
+
+def test_loader_rejects_bad_values_and_non_fp8_layers(tmp_path):
+
+    layers = {"a.attn": _fake_qsa_layer("a.attn")}
+    with pytest.raises(ValueError, match="finite and positive"):
+        qsa_mod.load_qsa_static_kv_scales(
+            layers,
+            _sidecar(tmp_path, {"a.attn": {"k_scale": 0.0, "v_scale": 1.0}}),
+        )
+    with pytest.raises(ValueError, match="exactly k_scale and v_scale"):
+        qsa_mod.load_qsa_static_kv_scales(
+            layers, _sidecar(tmp_path, {"a.attn": {"k_scale": 1.0}})
+        )
+    bf16_layer = {"a.attn": _fake_qsa_layer("a.attn", kv_cache_dtype="auto")}
+    with pytest.raises(ValueError, match="non-FP8 layers"):
+        qsa_mod.load_qsa_static_kv_scales(
+            bf16_layer,
+            _sidecar(tmp_path, {"a.attn": {"k_scale": 1.0, "v_scale": 1.0}}),
+        )
+
+
+def test_fp8_dtype_validation_gates_on_sm86(monkeypatch):
+
+    class _Cap:
+        def to_int(self):
+            return 86
+
+        def as_version_str(self):
+            return "8.6"
+
+    class _Plat:
+        @staticmethod
+        def is_cuda():
+            return True
+
+        @staticmethod
+        def get_device_capability():
+            return _Cap()
+
+        @staticmethod
+        def get_device_name():
+            return "fake"
+
+        @staticmethod
+        def fp8_dtype():
+            return torch.float8_e4m3fn
+
+    monkeypatch.setattr(qsa_mod, "current_platform", _Plat)
+    assert qsa_mod._validated_qsa_fp8_dtype("fp8_e4m3") == torch.float8_e4m3fn
+    assert qsa_mod._validated_qsa_fp8_dtype("bfloat16") is None
+
+    class _Cap89(_Cap):
+        def to_int(self):
+            return 89
+
+    monkeypatch.setattr(_Plat, "get_device_capability", staticmethod(lambda: _Cap89()))
+    with pytest.raises(ValueError, match="validated only on SM86"):
+        qsa_mod._validated_qsa_fp8_dtype("fp8")
+
+
+def test_backend_supports_kv_cache_dtype_bypasses_fa_hardware_check():
+    # The inherited FlashAttentionBackend.supports_kv_cache_dtype defers
+    # quantized dtypes to flash_attn_supports_kv_cache_dtype, which is False
+    # for fp8 on sm_86; QSA never dispatches to an FA kernel, so the backend
+    # must answer from its own supported_kv_cache_dtypes.
+    assert qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype("fp8_e4m3")
+    assert qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype("fp8")
+    assert qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype(None)
+    assert not qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype("fp8_e5m2")
