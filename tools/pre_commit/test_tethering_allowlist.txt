@@ -74,3 +74,4 @@ tests/tools/test_config_validator.py  # logic covered by the validate-config pre
 # fork-local
 tests/v1/distributed/test_custom_allreduce_group_policy.py  # fork-local suite, not run by upstream Buildkite
 tests/v1/platforms/test_cuda_fully_connected_p2p.py  # fork-local suite, not run by upstream Buildkite
+tests/models/qwen4_exp/test_qsa_fp8_kv.py  # fork-local suite, not run by upstream Buildkite

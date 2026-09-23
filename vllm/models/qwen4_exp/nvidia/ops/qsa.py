@@ -28,6 +28,35 @@ def _is_sm90() -> bool:
     return current_platform.get_device_capability() == (9, 0)
 
 
+def _qsa_kv_mode(kv_dtype: torch.dtype, device: torch.device) -> int:
+    """KV_DTYPE for the sparse kernel: 0 bf16, 1 e5m2, 2 e4m3 decoded in
+    software, 3 e4m3 cast natively. Triton lowers e4m3 casts through
+    fp8e4nv, which only compiles on SM89+."""
+    if kv_dtype == torch.bfloat16:
+        return 0
+    if kv_dtype == torch.float8_e5m2:
+        return 1
+    if kv_dtype in (torch.float8_e4m3fn, torch.uint8):
+        return 2 if torch.cuda.get_device_capability(device) < (8, 9) else 3
+    raise ValueError(f"QSA sparse attention does not support KV dtype {kv_dtype}")
+
+
+@triton.jit
+def _decode_e4m3_to_bf16(b):
+    # Shift the 7 magnitude bits left by 7 to land the E4M3 exponent in the
+    # FP16 exponent field and the mantissa at the top of the FP16 mantissa
+    # field: the right number under the wrong bias (E4M3 7 vs FP16 15), a
+    # constant factor of 2^8 fixed by the *256. E4M3 subnormals land on FP16
+    # subnormals and renormalize under the same factor, which holds only
+    # because sm_86 does not flush FP16 subnormals. Bit-exact against torch
+    # on all 254 finite codepoints. Deviation: 0x7F/0xFF are NaN in e4m3fn
+    # but decode to +-480 here; the CUDA writer clamps to +-448 so those
+    # bytes are unreachable from a cache written by reshape_and_cache_flash.
+    b = b.to(tl.uint16)
+    bits = ((b & 0x80) << 8) | ((b & 0x7F) << 7)
+    return (bits.to(tl.uint16).to(tl.float16, bitcast=True) * 256.0).to(tl.bfloat16)
+
+
 @triton.jit(do_not_specialize=["num_rows", "num_requests"])
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
@@ -67,9 +96,9 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_QUERY_HEADS: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     NUM_TILES: tl.constexpr,
+    KV_DTYPE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    IS_FP8: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -101,7 +130,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
     # softmax_scale is the host-side attention scale (1/sqrt(head_dim), with the
     # fp8 K dequant scale already pre-multiplied in); convert to log2 units once
-    # here for the exp2-based online softmax.
+    # here for the exp2-based online softmax. v_scale is folded into output_scale
+    # on the host too, so the kernel never loads a scale.
     score_scale = softmax_scale * 1.4426950408889634
 
     tile_end = tl.minimum(NUM_TILES, tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N))
@@ -132,32 +162,79 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_page[None, :] * stride_k_block
-            + page_offset[None, :] * stride_k_token
-            + kv_head * stride_k_head
-            + dim_offsets[:, None],
-            mask=valid[None, :],
-            other=0.0,
-        )
-        values = tl.load(
-            v_cache_ptr
-            + safe_page[:, None] * stride_v_block
-            + page_offset[:, None] * stride_v_token
-            + kv_head * stride_v_head
-            + dim_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
-        if IS_FP8:
-            # e4m3 -> Q dtype is exact; keep the QK dot in Q's dtype (fp8 QK
-            # measured slower here and less accurate).
+        if KV_DTYPE == 2:
+            # Below SM89: read the e4m3 cache as raw uint8 and decode into BF16
+            # in software, since fp8e4nv cannot lower. Cache bytes are written
+            # by reshape_and_cache_flash and clamped to +-448, so NaN codepoints
+            # are unreachable and the bit-exact _decode_e4m3_to_bf16 applies.
+            key_bytes = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0,
+            )
+            value_bytes = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0,
+            )
+            keys = _decode_e4m3_to_bf16(key_bytes)
+            values = _decode_e4m3_to_bf16(value_bytes)
+        elif KV_DTYPE in (1, 3):
+            # Native e4m3 cast on SM89+ (mode 3) and the e5m2 path (mode 1).
+            # e4m3/e5m2 -> Q dtype is exact; keep the QK dot in Q's dtype (fp8
+            # QK measured slower and less accurate).
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
             keys = keys.to(query.dtype)
+            values = values.to(query.dtype)
+        else:
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
         scores = tl.dot(query, keys)
-        # Scaling scores avoids re-quantizing a scaled query to BF16; for fp8
+        # Scaling scores avoids re-quantizing a scaled query to BF16. For fp8
         # caches the K dequant scale is already folded into softmax_scale on the
-        # host.
+        # host (every non-zero KV_DTYPE mode), so the kernel never touches a
+        # scale device pointer.
         scores *= score_scale
         scores = tl.where(valid[None, :], scores, -1.0e20)
         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
@@ -165,10 +242,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
-        if IS_FP8:
-            # Dequant V to fp16 (not bf16) for the PV dot: P <= 1 (online
-            # softmax) so fp16 has the range, its wider mantissa is more
-            # accurate, and the fp8->fp16 upcast with an fp16 PV dot is faster.
+        if KV_DTYPE in (1, 3):
+            # Dequant V to fp16 (not bf16) for the PV dot on the native fp8
+            # modes. The mode-2 software decode path has already produced BF16
+            # values from _decode_e4m3_to_bf16, so it skips this upcast and
+            # goes straight into the BF16 PV dot.
             values = values.to(tl.float16)
         accumulator = tl.dot(
             probabilities.to(values.dtype),
@@ -617,6 +695,12 @@ def qsa_sparse_paged_attention(
     the expand kernel; never a token index). The kernel reads it as the
     tile-loop bound. use_prefill_config only steers the top of the config table; see
     _select_config.
+
+    This function is an UNCHECKED INTERNAL PRIMITIVE with respect to hardware
+    support: the sm_86 validation gate is enforced once, at attention
+    construction, and a direct caller can pass an FP8 cache on any device. The
+    integer decode is arch-independent, so it will not fault, but it has only
+    been validated on sm_86.
     """
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -636,15 +720,25 @@ def qsa_sparse_paged_attention(
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
     assert q.dtype == torch.bfloat16
     assert k_cache.dtype == v_cache.dtype
-    is_fp8 = k_cache.dtype == torch.float8_e4m3fn
+    # Single dispatch decision: the wrapper and the warmup both read the mode
+    # from this helper, so the kernel's KV_DTYPE and the host-side scale
+    # folding always agree.
+    kv_mode = _qsa_kv_mode(k_cache.dtype, k_cache.device)
+    if kv_mode == 2 and k_cache.dtype == torch.float8_e4m3fn:
+        # Present E4M3 storage as bytes on the software-decode path: a tl.load
+        # from an fp8-typed pointer materializes fp8e4nv in the IR, which only
+        # compiles on SM89+. The backend hands us the e4m3 view, so re-view it.
+        k_cache = k_cache.view(torch.uint8)
+        v_cache = v_cache.view(torch.uint8)
+    is_fp8 = kv_mode != 0
     if is_fp8:
         assert k_scale is not None and v_scale is not None
         # Host pre-multiply: fold the K dequant scale into the attention scale
-        # and pass V's dequant scale as the kernel's output scale.
+        # and pass V's dequant scale as the kernel's output scale. Holds for
+        # every non-zero KV_DTYPE mode; the kernel never touches a scale.
         softmax_scale = (head_dim**-0.5) * float(k_scale)
         output_scale = float(v_scale)
     else:
-        assert k_cache.dtype == torch.bfloat16
         softmax_scale = head_dim**-0.5
         output_scale = 1.0
     assert logical_indices.dtype == block_table.dtype == torch.int32
@@ -729,9 +823,9 @@ def qsa_sparse_paged_attention(
         NUM_QUERY_HEADS=q.shape[1],
         NUM_SPLITS=num_splits,
         NUM_TILES=num_tiles,
+        KV_DTYPE=kv_mode,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
-        IS_FP8=is_fp8,
         num_warps=partial_warps,
         num_stages=2,
     )
@@ -768,9 +862,20 @@ def warmup_qsa_sparse_paged_attention(
     """Compile every production-reachable split-K/merge specialization."""
     head_dim = kv_cache.shape[-1] // 2
     key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
-    # An fp8 cache is allocated as uint8 and viewed as e4m3 at attention time.
-    is_fp8 = kv_cache.dtype == torch.uint8
-    cache_dtype = torch.float8_e4m3fn if is_fp8 else key_cache.dtype
+    # Single dispatch decision: same helper as the wrapper. A warmup that
+    # hardcodes IS_FP8 / mode 3 compiles fp8e4nv on SM<89 at engine boot.
+    kv_mode = _qsa_kv_mode(kv_cache.dtype, kv_cache.device)
+    is_fp8 = kv_mode != 0
+    # TritonWarmupTensor dtype matches what the kernel sees in production.
+    # Mode 0: bf16. Mode 1: e5m2. Mode 2: e4m3 as raw uint8 bytes (the
+    # software decode path). Mode 3: float8_e4m3fn (production's .view()
+    # target, then the kernel's native cast).
+    if kv_mode in (0, 1):
+        warm_cache_dtype = key_cache.dtype
+    elif kv_mode == 2:
+        warm_cache_dtype = torch.uint8
+    else:
+        warm_cache_dtype = torch.float8_e4m3fn
     num_kv_heads = key_cache.shape[2]
     group_size = num_query_heads // num_kv_heads
     block_m = triton.next_power_of_2(group_size)
@@ -793,12 +898,12 @@ def warmup_qsa_sparse_paged_attention(
         torch.bfloat16, shape=(num_rows, num_query_heads, head_dim)
     )
     k_cache_ptr = TritonWarmupTensor(
-        cache_dtype,
+        warm_cache_dtype,
         shape=tuple(key_cache.shape),
         strides=tuple(key_cache.stride()),
     )
     v_cache_ptr = TritonWarmupTensor(
-        cache_dtype,
+        warm_cache_dtype,
         shape=tuple(value_cache.shape),
         strides=tuple(value_cache.stride()),
     )
@@ -872,9 +977,9 @@ def warmup_qsa_sparse_paged_attention(
             NUM_QUERY_HEADS=num_query_heads,
             NUM_SPLITS=num_splits,
             NUM_TILES=num_tiles,
+            KV_DTYPE=kv_mode,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
-            IS_FP8=is_fp8,
             num_warps=warps,
             num_stages=2,
             grid=(num_rows, num_kv_heads, num_splits),
