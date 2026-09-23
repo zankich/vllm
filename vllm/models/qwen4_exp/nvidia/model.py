@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen4Exp model."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -10,6 +11,7 @@ from torch import nn
 
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
@@ -79,7 +81,33 @@ from ..config import Qwen4ExpConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ple_layer import Qwen4ExpPLELayer
-from .qsa import Qwen4ExpQSAAttention
+from .qsa import Qwen4ExpQSAAttention, load_qsa_static_kv_scales
+
+logger = init_logger(__name__)
+
+_QSA_KV_SCALES_ENV = "VLLM_QSA_KV_SCALES"
+
+
+def _maybe_load_qsa_static_kv_scales(model: nn.Module) -> None:
+    """Apply a static QSA K/V scale sidecar when VLLM_QSA_KV_SCALES names one.
+
+    Called after checkpoint weights load and before profiling, warmup or
+    cudagraph capture. Unset env var is a no-op; set but unusable raises: a
+    calibration that was requested and silently not applied is worse than
+    one never requested.
+    """
+    path = os.environ.get(_QSA_KV_SCALES_ENV, "").strip()
+    if not path:
+        return
+    applied = load_qsa_static_kv_scales(model, path, strict=True)
+    shown = ", ".join(sorted(applied)[:4])
+    logger.info(
+        "Qwen4Exp QSA: applied static K/V scales from %s to %d layer(s): %s%s",
+        path,
+        len(applied),
+        shown,
+        " ..." if len(applied) > 4 else "",
+    )
 
 
 def without_modelopt_fp4(
@@ -626,6 +654,7 @@ class Qwen4ExpModel(nn.Module):
             weights,
             mapper=mapper,
         )
+        _maybe_load_qsa_static_kv_scales(self)
         return loaded
 
 

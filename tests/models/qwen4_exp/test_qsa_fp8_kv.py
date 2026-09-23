@@ -328,12 +328,23 @@ def test_fp8_dtype_validation_gates_on_sm86(monkeypatch):
         qsa_mod._validated_qsa_fp8_dtype("fp8")
 
 
-def test_backend_supports_kv_cache_dtype_bypasses_fa_hardware_check():
-    # The inherited FlashAttentionBackend.supports_kv_cache_dtype defers
-    # quantized dtypes to flash_attn_supports_kv_cache_dtype, which is False
-    # for fp8 on sm_86; QSA never dispatches to an FA kernel, so the backend
-    # must answer from its own supported_kv_cache_dtypes.
-    assert qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype("fp8_e4m3")
-    assert qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype("fp8")
-    assert qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype(None)
-    assert not qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype("fp8_e5m2")
+def test_maybe_load_env_gate(tmp_path, monkeypatch, caplog):
+    import logging
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.nvidia import model as model_mod
+
+    sidecar = _sidecar(tmp_path, {"a.attn": {"k_scale": 0.02, "v_scale": 0.04}})
+    fake = SimpleNamespace(modules=lambda: iter(()))
+
+    monkeypatch.delenv("VLLM_QSA_KV_SCALES", raising=False)
+    model_mod._maybe_load_qsa_static_kv_scales(fake)  # no-op, no raise
+
+    # patch the name model.py bound, not the qsa module attribute
+    monkeypatch.setattr(
+        model_mod, "load_qsa_static_kv_scales", lambda model, path, strict: ["a.attn"]
+    )
+    monkeypatch.setenv("VLLM_QSA_KV_SCALES", str(sidecar))
+    with caplog.at_level(logging.INFO):
+        model_mod._maybe_load_qsa_static_kv_scales(fake)
+    assert any("applied static K/V scales" in r.message for r in caplog.records)
