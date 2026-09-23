@@ -361,3 +361,25 @@ def test_sidecar_scales_reach_the_backend_reader(tmp_path):
     assert layer._v_scale.item() == pytest.approx(0.5)
     assert layer._k_scale_float == pytest.approx(0.25)
     assert layer._v_scale_float == pytest.approx(0.5)
+
+
+def test_maybe_load_env_gate(tmp_path, monkeypatch, caplog):
+    import logging
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.nvidia import model as model_mod
+
+    sidecar = _sidecar(tmp_path, {"a.attn": {"k_scale": 0.02, "v_scale": 0.04}})
+    fake = SimpleNamespace(modules=lambda: iter(()))
+
+    monkeypatch.delenv("VLLM_QSA_KV_SCALES", raising=False)
+    model_mod._maybe_load_qsa_static_kv_scales(fake)  # no-op, no raise
+
+    # patch the name model.py bound, not the qsa module attribute
+    monkeypatch.setattr(
+        model_mod, "load_qsa_static_kv_scales", lambda model, path, strict: ["a.attn"]
+    )
+    monkeypatch.setenv("VLLM_QSA_KV_SCALES", str(sidecar))
+    with caplog.at_level(logging.INFO):
+        model_mod._maybe_load_qsa_static_kv_scales(fake)
+    assert any("applied static K/V scales" in r.message for r in caplog.records)
