@@ -3,6 +3,7 @@
 """E4M3 KV reader for sm_86: decode exactness and kernel equivalence."""
 
 import json
+import time
 import math
 from pathlib import Path
 
@@ -290,7 +291,6 @@ def test_loader_rejects_bad_values_and_non_fp8_layers(tmp_path):
 
 
 def test_fp8_dtype_validation_gates_on_sm86(monkeypatch):
-
     class _Cap:
         def to_int(self):
             return 86
@@ -328,6 +328,17 @@ def test_fp8_dtype_validation_gates_on_sm86(monkeypatch):
         qsa_mod._validated_qsa_fp8_dtype("fp8")
 
 
+def test_backend_supports_kv_cache_dtype_bypasses_fa_hardware_check():
+    # The inherited FlashAttentionBackend.supports_kv_cache_dtype defers
+    # quantized dtypes to flash_attn_supports_kv_cache_dtype, which is False
+    # for fp8 on sm_86; QSA never dispatches to an FA kernel, so the backend
+    # must answer from its own supported_kv_cache_dtypes.
+    assert qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype("fp8_e4m3")
+    assert qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype("fp8")
+    assert qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype(None)
+    assert not qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype("fp8_e5m2")
+
+
 def test_maybe_load_env_gate(tmp_path, monkeypatch, caplog):
     import logging
     from types import SimpleNamespace
@@ -350,7 +361,7 @@ def test_maybe_load_env_gate(tmp_path, monkeypatch, caplog):
     assert any("applied static K/V scales" in r.message for r in caplog.records)
 
 
-# --- calibration collector -------------------------------------------------------
+# --- calibration collector and clip counter ------------------------------------
 
 
 def test_collector_running_max_and_dump(tmp_path, monkeypatch):
@@ -397,6 +408,62 @@ def test_collector_caches_rank_across_distributed_teardown(tmp_path, monkeypatch
     # still the rank name, no pid-named duplicate
     assert (tmp_path / "qsa_absmax_rank3.json").is_file()
     assert len(list(tmp_path.glob("qsa_absmax_rank*.json"))) == 1
+
+
+def test_clip_env_fail_closed(monkeypatch):
+    import importlib
+
+    monkeypatch.delenv("VLLM_QSA_KV_CLIP_COUNT", raising=False)
+    monkeypatch.delenv("VLLM_QSA_KV_CLIP_READER", raising=False)
+    monkeypatch.setenv("VLLM_QSA_KV_CLIP_READER", "not-a-number")
+    with pytest.raises(ValueError, match="an interval in seconds"):
+        importlib.reload(qsa_mod)
+    monkeypatch.setenv("VLLM_QSA_KV_CLIP_READER", "0")
+    with pytest.raises(ValueError, match="finite positive"):
+        importlib.reload(qsa_mod)
+    monkeypatch.delenv("VLLM_QSA_KV_CLIP_COUNT", raising=False)
+    monkeypatch.delenv("VLLM_QSA_KV_CLIP_READER", raising=False)
+    importlib.reload(qsa_mod)  # restore
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_clip_drain_reads_counters_armed_under_inference_mode(monkeypatch):
+    """Production arms inside a forward running under torch.inference_mode.
+    The drain runs later on the engine thread at shutdown; it must read
+    those counters without inference-mode or concurrency hazards."""
+    monkeypatch.setattr(qsa_mod, "_qsa_clip_counters", {})
+    monkeypatch.setattr(qsa_mod, "_qsa_clip_on", True)
+    monkeypatch.setattr(qsa_mod, "_qsa_clip_reader_started", True)  # no thread
+
+    layer = _fake_qsa_layer("l0")
+    # scale 0.001 -> ceiling 448*0.001 = 0.448: every 5.0 element clips
+    layer._k_scale = torch.full((1,), 0.001, device="cuda")
+    layer._v_scale = torch.full((1,), 0.001, device="cuda")
+    key = torch.full((1, 2, 8), 5.0, device="cuda", dtype=torch.bfloat16)
+    value = torch.full((1, 2, 8), 5.0, device="cuda", dtype=torch.bfloat16)
+    with torch.inference_mode():
+        qsa_mod._qsa_clip_count(layer, key, value)
+    totals = qsa_mod._qsa_clip_drain()
+    assert totals == {"l0": (16, 16)}  # all 16 elements above the ceiling
+
+
+def test_clip_count_env_enables_drain_reader_env_separate(monkeypatch):
+    import importlib
+
+    monkeypatch.setenv("VLLM_QSA_KV_CLIP_COUNT", "1")
+    monkeypatch.delenv("VLLM_QSA_KV_CLIP_READER", raising=False)
+    importlib.reload(qsa_mod)
+    assert qsa_mod._qsa_clip_counting_enabled()
+    assert qsa_mod._qsa_clip_interval == 0.0  # no live reader
+
+    monkeypatch.setenv("VLLM_QSA_KV_CLIP_READER", "5")
+    importlib.reload(qsa_mod)
+    assert qsa_mod._qsa_clip_interval == 5.0
+
+    monkeypatch.delenv("VLLM_QSA_KV_CLIP_COUNT")
+    monkeypatch.delenv("VLLM_QSA_KV_CLIP_READER")
+    importlib.reload(qsa_mod)  # restore
+    assert not qsa_mod._qsa_clip_counting_enabled()
 
 
 # --- calibration merge script ----------------------------------------------------
