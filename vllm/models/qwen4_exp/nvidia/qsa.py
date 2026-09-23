@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+import json
+import math
+from collections.abc import Mapping
+from pathlib import Path
 from typing import ClassVar, cast
 
 import torch
@@ -14,6 +18,7 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
@@ -53,6 +58,14 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
+
+logger = init_logger(__name__)
+
+_QSA_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
+
+
+def _is_qsa_fp8_cache_dtype(cache_dtype: str) -> bool:
+    return cache_dtype in _QSA_FP8_CACHE_DTYPES
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -526,9 +539,109 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         return output
 
 
+def load_qsa_static_kv_scales(
+    layers: nn.Module | Mapping[str, nn.Module],
+    sidecar_path: str | Path,
+    *,
+    strict: bool = True,
+) -> list[str]:
+    """Load static scalar QSA K/V scales into already-loaded model layers.
+
+    Call this on every model worker after checkpoint weight loading finishes
+    and before any profiling, warmup, or cudagraph capture. ``layers`` may be
+    the loaded root module or ``compilation_config.static_forward_context``.
+
+    The JSON schema is::
+
+        {"model.layers.3.self_attn.attn": {"k_scale": 0.25, "v_scale": 2.0}}
+
+    ``strict=False`` permits a deliberate subset; omitted layers keep the
+    vLLM default scale of 1.0. Unknown names and non-scalar values are always
+    errors.
+    """
+    path = Path(sidecar_path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path} must contain a JSON object keyed by layer name")
+
+    if isinstance(layers, nn.Module):
+        qsa_layers = {
+            layer.layer_name: layer
+            for layer in layers.modules()
+            if isinstance(layer, Qwen4ExpQSAAttention)
+        }
+    else:
+        qsa_layers = {
+            name: layer
+            for name, layer in layers.items()
+            if isinstance(name, str) and isinstance(layer, Qwen4ExpQSAAttention)
+        }
+
+    if not qsa_layers:
+        raise ValueError("No Qwen4Exp QSA attention layers were supplied")
+    non_fp8_layers = sorted(
+        name
+        for name, layer in qsa_layers.items()
+        if not _is_qsa_fp8_cache_dtype(layer.kv_cache_dtype)
+    )
+    if non_fp8_layers:
+        raise ValueError(
+            "Static QSA KV scales may only be injected into E4M3 layers; "
+            f"non-FP8 layers: {non_fp8_layers}"
+        )
+
+    unknown = sorted(name for name in raw if name not in qsa_layers)
+    if unknown:
+        raise ValueError(f"Unknown QSA layer names in {path}: {unknown}")
+    missing = sorted(name for name in qsa_layers if name not in raw)
+    if strict and missing:
+        raise ValueError(f"Missing QSA layer scales in {path}: {missing}")
+
+    validated: dict[str, tuple[float, float]] = {}
+    for layer_name, entry in raw.items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"{layer_name} scales must be a JSON object")
+        if set(entry) != {"k_scale", "v_scale"}:
+            raise ValueError(f"{layer_name} must contain exactly k_scale and v_scale")
+
+        values: list[float] = []
+        for field in ("k_scale", "v_scale"):
+            value = entry[field]
+            if type(value) not in (int, float):
+                raise ValueError(f"{layer_name}.{field} must be a scalar JSON number")
+            scale = float(value)
+            if not math.isfinite(scale) or scale <= 0.0:
+                raise ValueError(f"{layer_name}.{field} must be finite and positive")
+            values.append(scale)
+
+        layer = qsa_layers[layer_name]
+        for field in ("_k_scale", "_v_scale"):
+            tensor = getattr(layer, field, None)
+            if not isinstance(tensor, torch.Tensor) or tensor.numel() != 1:
+                raise ValueError(
+                    f"{layer_name}.{field} must be an existing scalar tensor"
+                )
+        validated[layer_name] = (values[0], values[1])
+
+    with torch.no_grad():
+        for layer_name, (k_scale, v_scale) in validated.items():
+            layer = qsa_layers[layer_name]
+            layer._k_scale.fill_(k_scale)
+            layer._v_scale.fill_(v_scale)
+            # Host-float mirrors read by the backend's call into the kernel.
+            # The CUDA writer quantizes with the tensor; the sparse kernel
+            # folds the float into softmax_scale and output_scale, so both
+            # forms must agree.
+            layer._k_scale_float = float(k_scale)
+            layer._v_scale_float = float(v_scale)
+
+    return sorted(validated)
+
+
 __all__ = [
     "QSAIndexer",
     "Qwen4ExpQSAAttention",
     "Qwen4ExpQSAFlashAttentionBackend",
     "Qwen4ExpQSAFlashAttentionImpl",
+    "load_qsa_static_kv_scales",
 ]
