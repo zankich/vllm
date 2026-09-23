@@ -4,6 +4,11 @@
 
 from __future__ import annotations
 
+import json
+import math
+import os
+from collections.abc import Mapping
+from pathlib import Path
 from typing import ClassVar, cast
 
 import torch
@@ -14,6 +19,7 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
@@ -54,6 +60,39 @@ from . import model
 from .indexer_qsa import QSAIndexer
 
 
+logger = init_logger(__name__)
+
+_QSA_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
+_QSA_SUPPORTED_CACHE_DTYPES = ("auto", "bfloat16", *_QSA_FP8_CACHE_DTYPES)
+
+
+def _is_qsa_fp8_cache_dtype(cache_dtype: str) -> bool:
+    return cache_dtype in _QSA_FP8_CACHE_DTYPES
+
+
+def _validated_qsa_fp8_dtype(cache_dtype: str) -> torch.dtype | None:
+    """Return the platform E4M3 dtype after enforcing the validated HW gate."""
+
+    if not _is_qsa_fp8_cache_dtype(cache_dtype):
+        return None
+    if not current_platform.is_cuda():
+        raise ValueError(
+            "Qwen4Exp QSA E4M3 KV cache is supported only on CUDA; "
+            "ROCm and other platforms have not been validated"
+        )
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.to_int() != 86:
+        cap_str = (
+            capability.as_version_str() if capability is not None else "unknown"
+        )
+        raise ValueError(
+            "Qwen4Exp QSA E4M3 KV cache is validated only on SM86, but "
+            f"{current_platform.get_device_name()} has compute capability "
+            f"{cap_str}. Re-run with --kv-cache-dtype bfloat16."
+        )
+    return current_platform.fp8_dtype()
+
+
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
@@ -64,11 +103,23 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
     """FullAttentionSpec backend used by the merged QSA owner."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+    ]
 
     @staticmethod
     def get_name() -> str:
         return "QWEN4_EXP_QSA_TRITON"
+
+    @classmethod
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
+        # QSA never dispatches to a FlashAttention kernel; the base class
+        # defers quantized dtypes to flash_attn_supports_kv_cache_dtype,
+        # which is False for fp8 on sm_86. Answer from our own list.
+        return kv_cache_dtype is None or kv_cache_dtype in cls.supported_kv_cache_dtypes
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
@@ -99,15 +150,34 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     supports_pcp: bool = False
 
     def __init__(self, *args, **kwargs) -> None:
+        # FlashAttentionImpl.__init__ rejects any quantized KV dtype that FA
+        # itself cannot read, and sm_86 has no FP8 FA kernel. Present "auto"
+        # to the base class, then restore the real dtype. QSA never
+        # dispatches to an FA kernel, and the only other kv_cache_dtype use
+        # in that constructor is an SM90/FA4 dequant path that cannot
+        # trigger here.
+        requested_kv_cache_dtype = None
+        if "kv_cache_dtype" in kwargs:
+            requested_kv_cache_dtype = kwargs["kv_cache_dtype"]
+            kwargs = {**kwargs, "kv_cache_dtype": "auto"}
+        elif len(args) > 6:
+            requested_kv_cache_dtype = args[6]
+            args = (*args[:6], "auto", *args[7:])
         super().__init__(*args, **kwargs)
+        if requested_kv_cache_dtype is not None:
+            self.kv_cache_dtype = requested_kv_cache_dtype
         if not is_flash_attn_varlen_func_available():
             raise NotImplementedError("Qwen4Exp QSA requires FlashAttention")
         if self.dcp_world_size != 1:
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
-        if self.kv_cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
+        if self.kv_cache_dtype not in _QSA_SUPPORTED_CACHE_DTYPES:
+            raise NotImplementedError(
+                "Qwen4Exp QSA supports BF16 or static per-tensor E4M3 main "
+                f"KV caches, not {self.kv_cache_dtype!r}"
+            )
+        self.qsa_fp8_dtype = _validated_qsa_fp8_dtype(self.kv_cache_dtype)
         self.supports_quant_query_input = False
 
     def forward_qsa(
@@ -143,10 +213,41 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-        if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA requires BF16 Q/K/V")
+        if query.dtype != torch.bfloat16:
+            raise NotImplementedError("Qwen4Exp QSA requires a BF16 query")
+        if key_cache.dtype != value_cache.dtype:
+            raise TypeError("Qwen4Exp QSA K and V cache dtypes must match")
+        if _is_qsa_fp8_cache_dtype(self.kv_cache_dtype):
+            if self.qsa_fp8_dtype is None:
+                raise RuntimeError("QSA FP8 dtype was not initialized")
+            if key_cache.dtype not in (torch.uint8, self.qsa_fp8_dtype):
+                raise NotImplementedError(
+                    "Qwen4Exp QSA E4M3 cache storage must use raw uint8 or "
+                    f"the platform FP8 dtype, not {key_cache.dtype}"
+                )
+        elif key_cache.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                "Qwen4Exp QSA BF16 mode requires a BF16 main KV cache"
+            )
 
         from .ops.qsa import qsa_sparse_paged_attention
+
+        # Announce the effective scales once per layer: a deployment that
+        # forgets the sidecar runs at the default 1.0, which is legitimate
+        # but must never be silent.
+        if _is_qsa_fp8_cache_dtype(self.kv_cache_dtype) and not getattr(
+            self, "_qsa_scales_logged", False
+        ):
+            self._qsa_scales_logged = True
+            logger.info(
+                "Qwen4Exp QSA E4M3 KV active on %s: k_scale=%.6g v_scale=%.6g%s",
+                getattr(layer, "layer_name", "<unnamed>"),
+                float(layer._k_scale),
+                float(layer._v_scale),
+                ""
+                if float(layer._k_scale) != 1.0 or float(layer._v_scale) != 1.0
+                else "  (DEFAULT 1.0 -- no static calibration loaded)",
+            )
 
         qsa_sparse_paged_attention(
             query[:num_tokens],
@@ -157,6 +258,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             token_to_req,
             use_prefill_config,
             output[:num_tokens],
+            k_scale=layer._k_scale,
+            v_scale=layer._v_scale,
         )
         return output
 
@@ -183,10 +286,20 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
         if model_config.dtype != torch.bfloat16:
             raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
-        if cache_config.cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
-        if getattr(quant_config, "kv_cache_scheme", None) is not None:
-            raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
+        if cache_config.cache_dtype not in _QSA_SUPPORTED_CACHE_DTYPES:
+            raise NotImplementedError(
+                "Qwen4Exp QSA supports BF16 or static per-tensor E4M3 main "
+                f"KV caches, not {cache_config.cache_dtype!r}"
+            )
+        qsa_fp8_dtype = _validated_qsa_fp8_dtype(cache_config.cache_dtype)
+        kv_cache_scheme = getattr(quant_config, "kv_cache_scheme", None)
+        if kv_cache_scheme is not None:
+            raise NotImplementedError(
+                "Qwen4Exp QSA does not implement kv_cache_scheme variants. "
+                "Dynamic, per-head and per-token KV scales are unsupported; "
+                "use static scalar per-layer K/V scales from "
+                "load_qsa_static_kv_scales()."
+            )
         parallel_config = vllm_config.parallel_config
         if (
             parallel_config.prefill_context_parallel_size > 1
@@ -283,8 +396,21 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_torch_dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA requires BF16 cache storage")
+        if _is_qsa_fp8_cache_dtype(self.kv_cache_dtype):
+            if qsa_fp8_dtype is None:
+                raise RuntimeError("QSA FP8 dtype was not initialized")
+            if self.kv_cache_torch_dtype not in (torch.uint8, qsa_fp8_dtype):
+                raise NotImplementedError(
+                    "Qwen4Exp QSA E4M3 cache storage resolved to unsupported "
+                    f"dtype {self.kv_cache_torch_dtype}"
+                )
+        elif self.kv_cache_torch_dtype != torch.bfloat16:
+            raise NotImplementedError(
+                "Qwen4Exp QSA BF16 mode requires BF16 cache storage"
+            )
+        # The checkpoint carries no KV scale scheme: these registered scalar
+        # buffers stay 1.0 until load_qsa_static_kv_scales() replaces them
+        # after weight load.
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
@@ -427,9 +553,109 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         return output
 
 
+def load_qsa_static_kv_scales(
+    layers: nn.Module | Mapping[str, nn.Module],
+    sidecar_path: str | Path,
+    *,
+    strict: bool = True,
+) -> list[str]:
+    """Load static scalar QSA K/V scales into already-loaded model layers.
+
+    Call this on every model worker after checkpoint weight loading finishes
+    and before any profiling, warmup, or cudagraph capture. ``layers`` may be
+    the loaded root module or ``compilation_config.static_forward_context``.
+
+    The JSON schema is::
+
+        {
+          "model.layers.3.self_attn.attn": {
+            "k_scale": 0.25,
+            "v_scale": 2.0
+          }
+        }
+
+    ``strict=False`` permits a deliberate subset; omitted layers keep the
+    vLLM default scale of 1.0. Unknown names and non-scalar values are always
+    errors.
+    """
+
+    path = Path(sidecar_path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path} must contain a JSON object keyed by layer name")
+
+    if isinstance(layers, nn.Module):
+        qsa_layers = {
+            layer.layer_name: layer
+            for layer in layers.modules()
+            if isinstance(layer, Qwen4ExpQSAAttention)
+        }
+    else:
+        qsa_layers = {
+            name: layer
+            for name, layer in layers.items()
+            if isinstance(name, str) and isinstance(layer, Qwen4ExpQSAAttention)
+        }
+
+    if not qsa_layers:
+        raise ValueError("No Qwen4Exp QSA attention layers were supplied")
+    non_fp8_layers = sorted(
+        name
+        for name, layer in qsa_layers.items()
+        if not _is_qsa_fp8_cache_dtype(layer.kv_cache_dtype)
+    )
+    if non_fp8_layers:
+        raise ValueError(
+            "Static QSA KV scales may only be injected into E4M3 layers; "
+            f"non-FP8 layers: {non_fp8_layers}"
+        )
+
+    unknown = sorted(name for name in raw if name not in qsa_layers)
+    if unknown:
+        raise ValueError(f"Unknown QSA layer names in {path}: {unknown}")
+    missing = sorted(name for name in qsa_layers if name not in raw)
+    if strict and missing:
+        raise ValueError(f"Missing QSA layer scales in {path}: {missing}")
+
+    validated: dict[str, tuple[float, float]] = {}
+    for layer_name, entry in raw.items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"{layer_name} scales must be a JSON object")
+        if set(entry) != {"k_scale", "v_scale"}:
+            raise ValueError(f"{layer_name} must contain exactly k_scale and v_scale")
+
+        values: list[float] = []
+        for field in ("k_scale", "v_scale"):
+            value = entry[field]
+            if type(value) not in (int, float):
+                raise ValueError(f"{layer_name}.{field} must be a scalar JSON number")
+            scale = float(value)
+            if not math.isfinite(scale) or scale <= 0.0:
+                raise ValueError(f"{layer_name}.{field} must be finite and positive")
+            values.append(scale)
+
+        layer = qsa_layers[layer_name]
+        for field in ("_k_scale", "_v_scale"):
+            tensor = getattr(layer, field, None)
+            if not isinstance(tensor, torch.Tensor) or tensor.numel() != 1:
+                raise ValueError(
+                    f"{layer_name}.{field} must be an existing scalar tensor"
+                )
+        validated[layer_name] = (values[0], values[1])
+
+    with torch.no_grad():
+        for layer_name, (k_scale, v_scale) in validated.items():
+            layer = qsa_layers[layer_name]
+            layer._k_scale.fill_(k_scale)
+            layer._v_scale.fill_(v_scale)
+
+    return sorted(validated)
+
+
 __all__ = [
     "QSAIndexer",
     "Qwen4ExpQSAAttention",
     "Qwen4ExpQSAFlashAttentionBackend",
     "Qwen4ExpQSAFlashAttentionImpl",
+    "load_qsa_static_kv_scales",
 ]
