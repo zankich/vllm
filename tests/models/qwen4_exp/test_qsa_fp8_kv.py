@@ -348,3 +348,52 @@ def test_maybe_load_env_gate(tmp_path, monkeypatch, caplog):
     with caplog.at_level(logging.INFO):
         model_mod._maybe_load_qsa_static_kv_scales(fake)
     assert any("applied static K/V scales" in r.message for r in caplog.records)
+
+
+# --- calibration collector -------------------------------------------------------
+
+
+def test_collector_running_max_and_dump(tmp_path, monkeypatch):
+    monkeypatch.setattr(qsa_mod, "_qsa_collect_dir", str(tmp_path))
+    monkeypatch.setattr(qsa_mod, "_qsa_collect_state", {})
+    monkeypatch.setattr(qsa_mod, "_qsa_collect_calls", 0)
+    qsa_mod._qsa_collect_absmax("l0", torch.tensor([1.0, -3.0]), torch.tensor([0.5]))
+    qsa_mod._qsa_collect_absmax("l0", torch.tensor([2.0, -1.0]), torch.tensor([4.0]))
+    qsa_mod._qsa_collect_absmax("l1", torch.tensor([0.1]), torch.tensor([0.2]))
+    st = qsa_mod._qsa_collect_state
+    assert st["l0"][0].item() == 3.0 and st["l0"][1].item() == 4.0
+    assert st["l1"][0].item() == pytest.approx(0.1) and st["l1"][1].item() == pytest.approx(0.2)
+    qsa_mod._qsa_collect_dump()
+    # outside a TP group the rank falls back to the pid: any rank file proves
+    # the dump contract
+    dumped = next(iter(tmp_path.glob("qsa_absmax_rank*.json")))
+    data = json.loads(dumped.read_text())
+    assert data["l0"] == {"k_absmax": 3.0, "v_absmax": 4.0}
+
+
+def test_collector_caches_rank_across_distributed_teardown(tmp_path, monkeypatch):
+    """Atexit dumps must keep the TP rank name even after the distributed
+    group is gone: resolve once, cache, never fall back to pid mid-run."""
+    import vllm.distributed as dist_mod
+
+    monkeypatch.setattr(qsa_mod, "_qsa_collect_dir", str(tmp_path))
+    monkeypatch.setattr(qsa_mod, "_qsa_collect_state", {})
+    monkeypatch.setattr(qsa_mod, "_qsa_collect_calls", 0)
+    monkeypatch.setattr(qsa_mod, "_qsa_collect_rank", None)
+    monkeypatch.setattr(
+        dist_mod, "get_tensor_model_parallel_rank", lambda: 3
+    )
+    qsa_mod._qsa_collect_absmax("l0", torch.tensor([1.0]), torch.tensor([1.0]))
+    qsa_mod._qsa_collect_dump()
+    assert (tmp_path / "qsa_absmax_rank3.json").is_file()
+
+    def _boom():
+        raise RuntimeError("distributed already destroyed")
+
+    monkeypatch.setattr(
+        dist_mod, "get_tensor_model_parallel_rank", _boom
+    )
+    qsa_mod._qsa_collect_dump()
+    # still the rank name, no pid-named duplicate
+    assert (tmp_path / "qsa_absmax_rank3.json").is_file()
+    assert len(list(tmp_path.glob("qsa_absmax_rank*.json"))) == 1
