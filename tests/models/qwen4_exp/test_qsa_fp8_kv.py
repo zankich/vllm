@@ -397,3 +397,60 @@ def test_collector_caches_rank_across_distributed_teardown(tmp_path, monkeypatch
     # still the rank name, no pid-named duplicate
     assert (tmp_path / "qsa_absmax_rank3.json").is_file()
     assert len(list(tmp_path.glob("qsa_absmax_rank*.json"))) == 1
+
+
+# --- calibration merge script ----------------------------------------------------
+
+
+def test_calib_merge_math_and_fail_closed(tmp_path):
+    import subprocess
+    import sys
+
+    for rank in range(2):
+        (tmp_path / f"qsa_absmax_rank{rank}.json").write_text(
+            json.dumps(
+                {
+                    "l0.attn": {"k_absmax": 3.0 + rank, "v_absmax": 1.0},
+                    "l1.attn": {"k_absmax": 0.5, "v_absmax": 8.0},
+                }
+            )
+        )
+    out = tmp_path / "merged.json"
+    r = subprocess.run(
+        [
+            sys.executable,
+            "calib/qsa_calib_merge.py",
+            str(tmp_path),
+            str(out),
+            "--ranks",
+            "2",
+            "--layers",
+            "2",
+            "--margin",
+            "1.10",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).parents[3]),
+    )
+    assert r.returncode == 0, r.stderr
+    data = json.loads(out.read_text())
+    # scale = absmax * margin / 448
+    assert math.isclose(data["l0.attn"]["k_scale"], 4.0 * 1.10 / 448.0)
+    assert math.isclose(data["l1.attn"]["v_scale"], 8.0 * 1.10 / 448.0)
+
+    (tmp_path / "qsa_absmax_rank1.json").unlink()
+    r = subprocess.run(
+        [
+            sys.executable,
+            "calib/qsa_calib_merge.py",
+            str(tmp_path),
+            str(out),
+            "--ranks",
+            "2",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).parents[3]),
+    )
+    assert r.returncode != 0
