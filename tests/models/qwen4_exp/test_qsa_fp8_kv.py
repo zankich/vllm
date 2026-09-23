@@ -1,0 +1,191 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""E4M3 KV reader for sm_86: decode exactness and kernel equivalence."""
+
+import json
+import math
+from pathlib import Path
+
+import pytest
+import torch
+import triton
+import triton.language as tl
+
+from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
+from vllm.platforms import current_platform
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_decode_e4m3_bit_exact_on_all_finite_codepoints():
+    """The shift-mul decode must equal torch's fp8->bf16 on all 254 finite
+    codepoints; 0x7F/0xFF are NaN in e4m3fn and out of contract."""
+
+    @triton.jit
+    def _decode_probe(src_ptr, dst_ptr, n, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        b = tl.load(src_ptr + offs, mask=m, other=0)
+        tl.store(dst_ptr + offs, qsa_ops._decode_e4m3_to_bf16(b), mask=m)
+
+    codepoints = torch.tensor(
+        [b for b in range(256) if b not in (0x7F, 0xFF)], dtype=torch.uint8
+    ).to("cuda")
+    out = torch.empty(codepoints.shape[0], dtype=torch.bfloat16, device="cuda")
+    n = codepoints.shape[0]
+    _decode_probe[(triton.cdiv(n, 128),)](codepoints, out, n, BLOCK=128)
+    reference = codepoints.view(torch.float8_e4m3fn).to(torch.bfloat16)
+    assert torch.equal(out, reference)
+
+
+def _make_paged_case(selection_width=6, device="cuda", seed=0):
+    """Synthetic paged QSA case with in-range fp8 quantizable values."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    num_rows, num_q_heads, num_kv_heads, head_dim = 8, 4, 2, 64
+    page_size = 4
+    num_pages = max(16, selection_width + 1)
+    k_scale = torch.tensor(0.02, dtype=torch.float32, device=device)
+    v_scale = torch.tensor(0.03, dtype=torch.float32, device=device)
+
+    q = (torch.randn(num_rows, num_q_heads, head_dim, generator=g) * 0.5).to(
+        torch.bfloat16
+    ).to(device)
+    # |k| max ~ 3*sigma = 6 << 448 * 0.02 = 8.96: no saturation, cast is exact
+    k = (
+        torch.randn(num_pages * page_size, num_kv_heads, head_dim, generator=g)
+        * 2.0
+    ).to(torch.bfloat16).to(device)
+    v = (
+        torch.randn(num_pages * page_size, num_kv_heads, head_dim, generator=g)
+        * 2.0
+    ).to(torch.bfloat16).to(device)
+    indices = torch.zeros(
+        num_rows, selection_width + 1, dtype=torch.int32, device=device
+    )
+    for r in range(num_rows):
+        count = int(torch.randint(2, selection_width + 1, (1,), generator=g))
+        idx = torch.randperm(num_pages * page_size, generator=g)[:count]
+        indices[r, :count] = idx.to(torch.int32)
+        indices[r, selection_width] = count
+    block_table = (
+        torch.arange(num_pages, dtype=torch.int32, device=device)
+        .unsqueeze(0)
+        .repeat(2, 1)
+    )
+    token_to_req = torch.zeros(num_rows, dtype=torch.int32, device=device)
+
+    def _page(rows):
+        return rows.view(num_pages, page_size, num_kv_heads, head_dim)
+
+    return q, k, v, _page, indices, block_table, token_to_req, k_scale, v_scale
+
+
+def _fp8_outputs(case):
+    q, k, v, page, indices, block_table, token_to_req, k_scale, v_scale = case
+    kq = (k.float() / k_scale.cpu()).to(torch.float8_e4m3fn)
+    vq = (v.float() / v_scale.cpu()).to(torch.float8_e4m3fn)
+    k_deq = (kq.to(torch.bfloat16).float() * k_scale.cpu()).to(torch.bfloat16).to(
+        q.device
+    )
+    v_deq = (vq.to(torch.bfloat16).float() * v_scale.cpu()).to(torch.bfloat16).to(
+        q.device
+    )
+    # bf16 reference: the same rows the fp8 path will decode to
+    ref = qsa_ops.qsa_sparse_paged_attention(
+        q, page(k_deq), page(v_deq), indices, block_table, token_to_req, False
+    )
+    fp8 = qsa_ops.qsa_sparse_paged_attention(
+        q,
+        page(kq).to(q.device),
+        page(vq).to(q.device),
+        indices,
+        block_table,
+        token_to_req,
+        False,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    fp8_bytes = qsa_ops.qsa_sparse_paged_attention(
+        q,
+        page(kq).to(q.device).view(torch.uint8),
+        page(vq).to(q.device).view(torch.uint8),
+        indices,
+        block_table,
+        token_to_req,
+        False,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    return ref, fp8, fp8_bytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fp8_kv_direct_path_matches_bf16_over_dequantized_rows():
+    # 6-wide selection: single-split direct-store profile. The bf16 reference
+    # cache is itself a bf16-rounded product (decoded * scale), one extra
+    # rounding the fp8 path avoids by folding the scale in fp32 — so the
+    # comparison bound is magnitude-scaled, not elementwise-exact.
+    ref, fp8, fp8_bytes = _fp8_outputs(_make_paged_case(selection_width=6))
+    diff = (fp8.float() - ref.float()).abs()
+    assert diff.max().item() <= 0.01 * ref.float().abs().max().item()
+    torch.testing.assert_close(fp8.float(), ref.float(), rtol=1.5e-2, atol=5e-2)
+    assert torch.equal(fp8, fp8_bytes)  # uint8 view == fp8 dtype view
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fp8_kv_splitk_path_matches_bf16_over_dequantized_rows():
+    # 100-wide selection: num_tiles=4, splits=4 -> partials + merge kernel,
+    # exercising the v_scale fold through the linear LSE merge
+    ref, fp8, fp8_bytes = _fp8_outputs(_make_paged_case(selection_width=100))
+    diff = (fp8.float() - ref.float()).abs()
+    assert diff.max().item() <= 0.01 * ref.float().abs().max().item()
+    torch.testing.assert_close(fp8.float(), ref.float(), rtol=1.5e-2, atol=5e-2)
+    assert torch.equal(fp8, fp8_bytes)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fp8_kv_rejects_bad_scales_and_mixed_dtypes():
+    (
+        q,
+        k,
+        v,
+        page,
+        indices,
+        block_table,
+        token_to_req,
+        k_scale,
+        v_scale,
+    ) = _make_paged_case()
+    kq = (k.float() / k_scale.cpu()).to(torch.float8_e4m3fn)
+    vq = (v.float() / v_scale.cpu()).to(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="scalar float32"):
+        qsa_ops.qsa_sparse_paged_attention(
+            q,
+            page(kq).to(q.device),
+            page(vq).to(q.device),
+            indices,
+            block_table,
+            token_to_req,
+            False,
+            k_scale=k_scale.double(),
+            v_scale=v_scale,
+        )
+    with pytest.raises(ValueError, match="matching K/V dtypes"):
+        qsa_ops.qsa_sparse_paged_attention(
+            q,
+            page(kq).to(q.device),
+            page(v).to(q.device),
+            indices,
+            block_table,
+            token_to_req,
+            False,
+        )
+    with pytest.raises(ValueError, match="BF16 queries"):
+        qsa_ops.qsa_sparse_paged_attention(
+            q.float(),
+            page(kq).to(q.device),
+            page(vq).to(q.device),
+            indices,
+            block_table,
+            token_to_req,
+            False,
+        )
