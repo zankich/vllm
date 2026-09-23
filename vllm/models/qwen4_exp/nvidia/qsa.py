@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import os
@@ -91,6 +92,62 @@ def _validated_qsa_fp8_dtype(cache_dtype: str) -> torch.dtype | None:
             f"{cap_str}. Re-run with --kv-cache-dtype bfloat16."
         )
     return current_platform.fp8_dtype()
+
+
+# --- FP8 K/V scale calibration collector ---------------------------------------
+# Active ONLY when VLLM_QSA_KV_COLLECT names a writable directory. Records a
+# GPU-side running absmax of the pre-quantization BF16 K/V per layer and
+# dumps per-rank JSON for an offline max-merge into the VLLM_QSA_KV_SCALES
+# sidecar. Must run with --enforce-eager: the collector mutates
+# module-external state per step, which cudagraph capture would freeze.
+_QSA_KV_COLLECT_ENV = "VLLM_QSA_KV_COLLECT"
+_qsa_collect_dir = os.environ.get(_QSA_KV_COLLECT_ENV, "").strip()
+_qsa_collect_state: dict[str, list[torch.Tensor]] = {}
+_qsa_collect_calls = 0
+_qsa_collect_rank: int | None = None
+
+
+def _qsa_collect_dump() -> None:
+    global _qsa_collect_rank
+    if not _qsa_collect_state:
+        return
+    # Resolve the TP rank once and cache it: the atexit flush can run after
+    # distributed teardown, where re-resolving would fall back to the pid and
+    # write a differently-named duplicate next to the rank file.
+    if _qsa_collect_rank is None:
+        try:
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            _qsa_collect_rank = get_tensor_model_parallel_rank()
+        except Exception:
+            _qsa_collect_rank = os.getpid()
+    out = {
+        name: {"k_absmax": float(st[0].item()), "v_absmax": float(st[1].item())}
+        for name, st in _qsa_collect_state.items()
+    }
+    path = Path(_qsa_collect_dir) / f"qsa_absmax_rank{_qsa_collect_rank}.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(out, indent=1), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _qsa_collect_absmax(
+    layer_name: str, key: torch.Tensor, value: torch.Tensor
+) -> None:
+    global _qsa_collect_calls
+    k_abs = key.detach().abs().amax().float()
+    v_abs = value.detach().abs().amax().float()
+    st = _qsa_collect_state.get(layer_name)
+    if st is None:
+        if not _qsa_collect_state:
+            atexit.register(_qsa_collect_dump)
+        _qsa_collect_state[layer_name] = [k_abs, v_abs]
+    else:
+        torch.maximum(st[0], k_abs, out=st[0])
+        torch.maximum(st[1], v_abs, out=st[1])
+    _qsa_collect_calls += 1
+    if _qsa_collect_calls % 2000 == 0:
+        _qsa_collect_dump()
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -535,6 +592,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         query = q.view(num_tokens, self.num_heads, self.head_dim)
         key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
         value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
+        if _qsa_collect_dir:
+            _qsa_collect_absmax(self.layer_name, key, value)
         attn_output = torch.empty_like(query)
         # Keep the index projection outside the eager break.
         projected_qk, _ = self.indexer.index_qk_proj(hidden_states)
