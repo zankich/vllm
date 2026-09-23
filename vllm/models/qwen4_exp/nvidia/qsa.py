@@ -8,6 +8,8 @@ import atexit
 import json
 import math
 import os
+import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import ClassVar, cast
@@ -148,6 +150,153 @@ def _qsa_collect_absmax(
     _qsa_collect_calls += 1
     if _qsa_collect_calls % 2000 == 0:
         _qsa_collect_dump()
+
+
+# --- FP8 K/V runtime clipping counter ------------------------------------------
+# Under-coverage guard for the calibrated sidecar: counts K/V elements that
+# would saturate E4M3 after scaling (|x| > 448 * scale). The increments are
+# pure tensor ops inside the forward — captured into the graph or eager,
+# both safe by construction. Reading is the hazardous half: CUDA forbids a
+# whole class of calls from another thread while a cudagraph capture is
+# active, and the reader cannot detect capture (the API reports the calling
+# thread), so a live reader cannot be made safe alongside graphs (halt95's
+# rc3-rc7 arc concluded the same, 0073 "default off, operator ruling").
+# Reading therefore happens in two safe places only:
+#   - VLLM_QSA_KV_CLIP_COUNT=1: counters on; per-layer totals drained and
+#     logged ONCE at engine shutdown, on the engine thread with capture gone.
+#   - VLLM_QSA_KV_CLIP_READER=<seconds>: additionally run the live reader
+#     thread — diagnostic only, for --enforce-eager boots without graphs.
+_QSA_CLIP_ENV = "VLLM_QSA_KV_CLIP_COUNT"
+_QSA_CLIP_READER_ENV = "VLLM_QSA_KV_CLIP_READER"
+
+
+def _parse_clip_env(name: str) -> float:
+    raw = os.environ.get(name, "").strip()
+    try:
+        value = float(raw) if raw else 0.0
+    except ValueError as exc:
+        # fail closed: a set-but-broken gate must not be silent
+        raise ValueError(
+            f"{name} must be an interval in seconds, got {raw!r}"
+        ) from exc
+    if raw and not (math.isfinite(value) and value > 0.0):
+        raise ValueError(
+            f"{name} must be a finite positive number of seconds, got {raw!r}"
+        )
+    return value
+
+
+_qsa_clip_on = bool(os.environ.get(_QSA_CLIP_ENV, "").strip())
+_qsa_clip_interval = _parse_clip_env(_QSA_CLIP_READER_ENV)
+_qsa_clip_counters: dict[str, torch.Tensor] = {}
+_qsa_clip_reader_started = False
+_qsa_clip_drain_registered = False
+_qsa_clip_lock = threading.Lock()
+
+
+def _qsa_clip_counting_enabled() -> bool:
+    return _qsa_clip_on
+
+
+def _qsa_clip_drain() -> dict[str, tuple[int, int]]:
+    """Final totals, once, on the way down: capture is destroyed and this
+    runs on the engine's own thread, so a synchronous read is safe here and
+    nowhere else. Runs via atexit, so logging may already be torn down —
+    the totals are still returned for any caller that can consume them."""
+    totals: dict[str, tuple[int, int]] = {}
+    try:
+        for name, ctr in sorted(_qsa_clip_counters.items()):
+            totals[name] = (int(ctr[0].item()), int(ctr[1].item()))
+        clipped = {n: t for n, t in totals.items() if t[0] or t[1]}
+        if clipped:
+            logger.warning(
+                "QSA KV CLIPPING final totals: %s",
+                "; ".join(f"{n}: k={t[0]} v={t[1]}" for n, t in clipped.items()),
+            )
+        else:
+            logger.info(
+                "QSA clip counters final: zero clips on %d layer(s)",
+                len(totals),
+            )
+    except Exception:
+        pass  # interpreter teardown: streams and handlers may be gone
+    return totals
+
+
+def _qsa_clip_reader() -> None:
+    last: dict[str, tuple[int, int]] = {}
+    passes = 0
+    while True:
+        time.sleep(_qsa_clip_interval)
+        passes += 1
+        try:
+            totals_k = totals_v = 0
+            for name, ctr in list(_qsa_clip_counters.items()):
+                k_total = int(ctr[0].item())
+                v_total = int(ctr[1].item())
+                totals_k += k_total
+                totals_v += v_total
+                prev_k, prev_v = last.get(name, (0, 0))
+                if k_total > prev_k or v_total > prev_v:
+                    logger.warning(
+                        "QSA KV CLIPPING on %s: k +%d (total %d), v +%d (total %d)"
+                        " -- inputs exceeded the calibration absmax; the scales"
+                        " sidecar may need re-calibration",
+                        name,
+                        k_total - prev_k,
+                        k_total,
+                        v_total - prev_v,
+                        v_total,
+                    )
+                last[name] = (k_total, v_total)
+            if passes % 10 == 1:
+                logger.info(
+                    "QSA clip counters alive: %d layer(s), totals k=%d v=%d",
+                    len(_qsa_clip_counters),
+                    totals_k,
+                    totals_v,
+                )
+        except Exception:
+            logger.exception("QSA clip reader pass failed; thread continues")
+
+
+def _qsa_clip_count(
+    layer: "Qwen4ExpQSAAttention", key: torch.Tensor, value: torch.Tensor
+) -> None:
+    global _qsa_clip_reader_started, _qsa_clip_drain_registered
+    if not _qsa_clip_on:
+        return
+    ctr = _qsa_clip_counters.get(layer.layer_name)
+    if ctr is None:
+        # First forward is eager (profiling/warmup precede capture), so the
+        # allocation never happens inside cudagraph capture.
+        ctr = torch.zeros(2, dtype=torch.int64, device=key.device)
+        _qsa_clip_counters[layer.layer_name] = ctr
+        with _qsa_clip_lock:
+            if not _qsa_clip_drain_registered:
+                _qsa_clip_drain_registered = True
+                atexit.register(_qsa_clip_drain)
+            if _qsa_clip_interval and not _qsa_clip_reader_started:
+                _qsa_clip_reader_started = True
+                threading.Thread(
+                    target=_qsa_clip_reader,
+                    name="qsa-clip-reader",
+                    daemon=True,
+                ).start()
+                logger.warning(
+                    "QSA clip live reader armed (%.0fs): diagnostic only, "
+                    "safe under --enforce-eager; with cudagraphs a tick "
+                    "during capture can kill the engine",
+                    _qsa_clip_interval,
+                )
+    # Thresholds are 1-D so the comparison promotes to float32; a 0-dim
+    # float32 tensor promotes like a Python scalar and the threshold would be
+    # rounded to the BF16 grid of K/V, undercounting values just above the
+    # calibrated ceiling.
+    k_ceiling = (448.0 * layer._k_scale).to(torch.float32).view(1)
+    v_ceiling = (448.0 * layer._v_scale).to(torch.float32).view(1)
+    ctr[0] += (key.detach().abs() > k_ceiling).sum()
+    ctr[1] += (value.detach().abs() > v_ceiling).sum()
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -594,6 +743,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
         if _qsa_collect_dir:
             _qsa_collect_absmax(self.layer_name, key, value)
+        if _qsa_clip_on:
+            _qsa_clip_count(self, key, value)
         attn_output = torch.empty_like(query)
         # Keep the index projection outside the eager break.
         projected_qk, _ = self.indexer.index_qk_proj(hidden_states)
