@@ -23,6 +23,10 @@ import hashlib
 import os
 import struct
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 XATTR_NAME = "user.vllm_kv_integrity"
 
 _MAGIC = b"KVMI"
@@ -105,9 +109,15 @@ def read_record(path: str) -> tuple[bytes, bytes] | None:
     return key, checksum
 
 
-def remove_block(path: str) -> None:
-    """Best-effort removal of a rejected payload (its record dies with it)."""
+def remove_block(path: str, reason: str) -> None:
+    """Best-effort removal of a rejected payload (its record dies with it).
+
+    Successful removals log ``integrity-<reason> removed <path>`` so recurring
+    mismatches in the engine logs distinguish a file removed once and gone
+    from one removed and re-created wrong.
+    """
     try:
         os.remove(path)
     except OSError:
-        pass
+        return
+    logger.warning("integrity-%s removed %s", reason, path)
