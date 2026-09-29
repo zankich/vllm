@@ -483,6 +483,7 @@ class OpenAIServingChat(GenerateBaseServing):
         num_prompt_tokens = 0
         num_cached_tokens = None
         num_cache_creation_tokens = None
+        prompt_tokens_details: PromptTokenUsageInfo | None = None
         tools_streamed = [False] * num_choices
 
         if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):
@@ -531,6 +532,14 @@ class OpenAIServingChat(GenerateBaseServing):
                 if first_iteration:
                     num_cached_tokens = res.num_cached_tokens
                     num_cache_creation_tokens = res.num_cache_creation_tokens
+                    # Cache details are constant for the request; compute
+                    # once so every continuous usage chunk carries them.
+                    prompt_tokens_details = _make_prompt_tokens_details(
+                        self.enable_prompt_tokens_details,
+                        num_cached_tokens,
+                        num_cache_creation_tokens,
+                        mm_token_counts,
+                    )
                     # Send first response for each request.n (index) with
                     # the role
                     role = self.get_chat_request_role(request)
@@ -578,6 +587,10 @@ class OpenAIServingChat(GenerateBaseServing):
                                     else None
                                 ),
                             )
+                            if prompt_tokens_details is not None:
+                                chunk.usage.prompt_tokens_details = (
+                                    prompt_tokens_details
+                                )
 
                         data = chunk.model_dump_json(exclude_unset=True)
                         yield f"data: {data}\n\n"
@@ -619,6 +632,10 @@ class OpenAIServingChat(GenerateBaseServing):
                                             else None
                                         ),
                                     )
+                                    if prompt_tokens_details is not None:
+                                        chunk.usage.prompt_tokens_details = (
+                                            prompt_tokens_details
+                                        )
 
                                 data = chunk.model_dump_json(exclude_unset=True)
                                 yield f"data: {data}\n\n"
@@ -823,6 +840,8 @@ class OpenAIServingChat(GenerateBaseServing):
                                 else None
                             ),
                         )
+                        if prompt_tokens_details is not None:
+                            chunk.usage.prompt_tokens_details = prompt_tokens_details
 
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
@@ -848,12 +867,11 @@ class OpenAIServingChat(GenerateBaseServing):
                     if self._include_reasoning_tokens_details
                     else None,
                 )
-                final_usage.prompt_tokens_details = _make_prompt_tokens_details(
-                    self.enable_prompt_tokens_details,
-                    num_cached_tokens,
-                    num_cache_creation_tokens,
-                    mm_token_counts,
-                )
+                # Final usage reuses the same details the first chunk
+                # already stamped onto every continuous usage emission,
+                # so the values are equal by construction.
+                if prompt_tokens_details is not None:
+                    final_usage.prompt_tokens_details = prompt_tokens_details
 
                 # In streaming, metrics ride on this final usage chunk, which is
                 # only emitted when usage reporting is enabled (i.e.

@@ -14,6 +14,7 @@ from typing import Any, get_args
 
 import jinja2
 from fastapi import Request
+from pydantic import ValidationError
 
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.protocol import (
@@ -99,6 +100,32 @@ def _build_anthropic_usage(
 
 def wrap_data_with_event(data: str, event: str):
     return f"event: {event}\ndata: {data}\n\n"
+
+
+# Map engine-emitted error ``code`` values to the Anthropic-shaped
+# ``error.type`` we forward to clients. A missing or unrecognized code maps
+# to ``api_error`` (the catch-all for server-side failures).
+_ENGINE_ERROR_CODE_TO_ANTHROPIC_TYPE: dict[int | None, str] = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    422: "invalid_request_error",
+    429: "rate_limit_error",
+    503: "overloaded_error",
+    529: "overloaded_error",
+}
+
+
+def _anthropic_error_type_for_engine_code(code: object) -> str:
+    """Pick the Anthropic ``error.type`` for a numeric engine error code.
+
+    Non-int codes and unknown ints collapse to ``api_error``.
+    """
+    if isinstance(code, bool) or not isinstance(code, int):
+        return "api_error"
+    return _ENGINE_ERROR_CODE_TO_ANTHROPIC_TYPE.get(code, "api_error")
 
 
 class AnthropicServingMessages(OpenAIServingChat):
@@ -923,9 +950,41 @@ class AnthropicServingMessages(OpenAIServingChat):
                         )
                         yield wrap_data_with_event(data, "message_stop")
                     else:
-                        origin_chunk = ChatCompletionStreamResponse.model_validate_json(
-                            data_str
-                        )
+                        try:
+                            origin_chunk = (
+                                ChatCompletionStreamResponse.model_validate_json(
+                                    data_str
+                                )
+                            )
+                        except ValidationError:
+                            # EngineCore may emit an
+                            # ``{"error": ...}`` payload that is not a
+                            # valid chunk. Surface the original message
+                            # instead of leaking ``ValidationError``;
+                            # anything else falls through to the outer
+                            # handler.
+                            payload = json.loads(data_str)
+                            if not (isinstance(payload, dict) and "error" in payload):
+                                raise
+                            error_obj = payload["error"]
+                            if isinstance(error_obj, dict):
+                                message = str(error_obj.get("message", "Engine error"))
+                                code = error_obj.get("code")
+                            else:
+                                message = str(error_obj)
+                                code = None
+                            for event in stop_and_flush():
+                                yield event
+                            error_response = AnthropicStreamEvent(
+                                type="error",
+                                error=AnthropicError(
+                                    type=_anthropic_error_type_for_engine_code(code),
+                                    message=message,
+                                ),
+                            )
+                            data = error_response.model_dump_json(exclude_unset=True)
+                            yield wrap_data_with_event(data, "error")
+                            return
 
                         if first_item:
                             chunk = AnthropicStreamEvent(
