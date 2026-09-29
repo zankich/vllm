@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from collections import OrderedDict
 from collections.abc import Collection, Iterable
 
@@ -293,10 +294,13 @@ class CPUOffloadingManager(OffloadingManager):
                 continue
             assert chunk is not None, f"Chunk {key!r} not found in cache"
             assert chunk.is_ready, f"Chunk {key!r} is not ready for reading"
-            if pins is not None and key in self._lookup_pinned:
-                # Already pinned (and counted non-evictable) by the
-                # confirming lookup; the load's ref_cnt takes over.
-                if key in pins:
+            if key in self._lookup_pinned:
+                # Already pinned (and counted non-evictable) by a
+                # confirming lookup — this request's or another's; whoever
+                # loads takes the pin over. A second request's lookup
+                # confirms an already-pinned key without growing its own
+                # pin list, so the take-over must not require one.
+                if pins is not None and key in pins:
                     pins.remove(key)
                 self._lookup_pinned.discard(key)
             elif chunk.ref_cnt == 0:
