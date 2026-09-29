@@ -159,6 +159,10 @@ class FileSystemTierManager(SecondaryTierManager):
         # the GIL that read cannot observe the finished job without the prior
         # write, so no extra lock is needed (get_finished is itself lock-free).
         self._load_progress: dict[JobId, int] = {}
+        # Per load job: the keys whose payload files the job rejected and
+        # removed (definite corruption classes only). Same worker-to-scheduler
+        # handoff as _load_progress; consumed to emit removed events.
+        self._load_removed: dict[JobId, list[OffloadKey]] = {}
         # Fork-local integrity: payload path -> (st_dev, st_ino) at store time.
         # A mismatch at load means the tier's storage was replaced under a
         # live engine; the whole map is ground truth for nothing at that point.
@@ -230,6 +234,20 @@ class FileSystemTierManager(SecondaryTierManager):
         offsets = [int(cid) * self._block_size for cid in job_metadata.chunk_ids]
 
         def store_task() -> None:
+            # Mint integrity records only for files this job creates. The
+            # payload write skips files that already exist (both the C and
+            # Python paths), and a record re-minted over a pre-existing file
+            # binds bytes that may never have reached it: under FP8 KV a
+            # recompute of the same prefix quantizes differently, so the
+            # re-minted record described foreign bytes and every later load
+            # failed the checksum deterministically (observed 2026-09-28).
+            # A pre-existing file with a missing or foreign record is the
+            # load path's to reject and remove; the next store rewrites
+            # clean. Residual race: two same-key stores interleaving between
+            # the existence snapshot and the rename can still cross-mint
+            # (microsecond window); the escalation if it shows up is a
+            # wrote-mask from the C store plus per-path serialization.
+            fresh = [not os.path.exists(p) for p in paths]
             batch_store_block(
                 paths,
                 self._primary_kv_view,
@@ -237,17 +255,12 @@ class FileSystemTierManager(SecondaryTierManager):
                 self._block_size,
                 self._use_o_direct,
             )
-            # Fork-local integrity: record each block's key binding so a later
-            # load can refuse wrong-for-key or tampered bytes instead of
-            # restoring them silently. Writing from the current buffer is safe
-            # even when batch_store_block skipped an existing payload: if the
-            # on-disk bytes differ, the next load fails the checksum, removes
-            # the block, and the following store rewrites it.
             view_b = self._primary_kv_view.cast("B")
-            for path, key, offset in zip(paths, keys, offsets):
-                integrity.write_record(
-                    path, key, view_b[offset : offset + self._block_size]
-                )
+            for path, key, offset, is_fresh in zip(paths, keys, offsets, fresh):
+                if is_fresh:
+                    integrity.write_record(
+                        path, key, view_b[offset : offset + self._block_size]
+                    )
                 try:
                     st = os.stat(path)
                 except OSError:
@@ -267,6 +280,9 @@ class FileSystemTierManager(SecondaryTierManager):
         offsets = [int(cid) * self._block_size for cid in job_metadata.chunk_ids]
 
         def load_task() -> None:
+            # Keys whose payload files this job rejects and removes; handed
+            # to get_finished_jobs for the removed event.
+            removed: list[OffloadKey] = []
             try:
                 # Fork-local integrity pre-checks, before any block is read.
                 # A missing or foreign record, or a payload whose storage
@@ -276,7 +292,8 @@ class FileSystemTierManager(SecondaryTierManager):
                 for path, key in zip(paths, keys):
                     record = integrity.read_record(path)
                     if record is None or record[0] != bytes(key):
-                        integrity.remove_block(path)
+                        integrity.remove_block(path, "record")
+                        removed.append(key)
                         raise OSError(f"integrity record missing or foreign for {path}")
                     try:
                         st = os.stat(path)
@@ -288,7 +305,8 @@ class FileSystemTierManager(SecondaryTierManager):
                         # was replaced underneath it; everything the tier
                         # believes is now suspect.
                         self._storage_ids.clear()
-                        integrity.remove_block(path)
+                        integrity.remove_block(path, "storage-id")
+                        removed.append(key)
                         raise OSError(f"storage identity changed for {path}")
                 batch_load_block(
                     paths,
@@ -299,7 +317,7 @@ class FileSystemTierManager(SecondaryTierManager):
                 )
                 # Post-check: the bytes just read must match the record.
                 view_b = self._primary_kv_view.cast("B")
-                for path, key, offset in zip(paths, keys, offsets):
+                for i, (path, key, offset) in enumerate(zip(paths, keys, offsets)):
                     record = integrity.read_record(path)
                     if record is None or not (
                         record[0] == bytes(key)
@@ -308,8 +326,13 @@ class FileSystemTierManager(SecondaryTierManager):
                             key, view_b[offset : offset + self._block_size]
                         )
                     ):
-                        integrity.remove_block(path)
-                        raise OSError(f"integrity checksum mismatch for {path}")
+                        integrity.remove_block(path, "mismatch")
+                        removed.append(key)
+                        exc = OSError(f"integrity checksum mismatch for {path}")
+                        # Blocks before the failing one passed verification
+                        # and are kept, per the partial-keep contract.
+                        exc.num_succeeded = i  # type: ignore[attr-defined]
+                        raise exc
             except OSError as exc:
                 # Runs on the pool worker thread. Record how many blocks loaded
                 # before the failure so get_finished_jobs can keep them; this
@@ -317,6 +340,8 @@ class FileSystemTierManager(SecondaryTierManager):
                 # under the GIL once the finished queue hands back this job.
                 num_succeeded = getattr(exc, "num_succeeded", 0)
                 self._load_progress[job_id] = num_succeeded
+                if removed:
+                    self._load_removed[job_id] = removed
                 # Surfaces errno (e.g. EMFILE "Too many open files") for both
                 # the C and Python load paths.
                 logger.debug(
@@ -349,6 +374,7 @@ class FileSystemTierManager(SecondaryTierManager):
                     )
             load_keys = self._load_job_keys.pop(job_id, None)
             num_succeeded = self._load_progress.pop(job_id, 0)
+            removed_keys = self._load_removed.pop(job_id, None)
             if load_keys is not None and not success:
                 # A batched load stops at the first bad block and reports how
                 # many loaded before it. Those earlier blocks are kept in the
@@ -357,6 +383,17 @@ class FileSystemTierManager(SecondaryTierManager):
                 successful = load_keys[:num_succeeded]
                 failed = load_keys[num_succeeded:]
                 self._lookup_manager.mark_miss(failed)
+                if removed_keys and self.events is not None:
+                    # The pruner's feed learns the key died in this tier.
+                    # Corruption removals are never expected evictions.
+                    self.events.append(
+                        OffloadingEvent(
+                            keys=removed_keys,
+                            medium=self.medium,
+                            removed=True,
+                            locality=self.locality,
+                        )
+                    )
                 results.append(
                     JobResult(
                         job_id=job_id,

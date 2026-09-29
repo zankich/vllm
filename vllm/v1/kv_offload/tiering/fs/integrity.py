@@ -18,11 +18,14 @@ Linux user.* xattrs only; the tier probes support at construction and fails
 loud rather than silently running as a 100% miss.
 """
 
-import contextlib
 import errno
 import hashlib
 import os
 import struct
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 XATTR_NAME = "user.vllm_kv_integrity"
 
@@ -106,7 +109,15 @@ def read_record(path: str) -> tuple[bytes, bytes] | None:
     return key, checksum
 
 
-def remove_block(path: str) -> None:
-    """Best-effort removal of a rejected payload (its record dies with it)."""
-    with contextlib.suppress(OSError):
+def remove_block(path: str, reason: str) -> None:
+    """Best-effort removal of a rejected payload (its record dies with it).
+
+    Successful removals log ``integrity-<reason> removed <path>`` so recurring
+    mismatches in the engine logs distinguish a file removed once and gone
+    from one removed and re-created wrong.
+    """
+    try:
         os.remove(path)
+    except OSError:
+        return
+    logger.warning("integrity-%s removed %s", reason, path)
