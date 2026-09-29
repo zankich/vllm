@@ -844,6 +844,356 @@ async def test_streaming_reasoning_usage_counts_across_deltas():
     }
 
 
+@pytest.mark.asyncio
+async def test_streaming_continuous_usage_chunks_carry_prompt_tokens_details():
+    """Every continuous usage chunk must carry the same
+    ``prompt_tokens_details`` as the final chunk so downstream layers
+    (notably the Anthropic converter's ``message_start`` event) see a
+    consistent split, not just the terminal one.
+    """
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    serving.enable_prompt_tokens_details = True
+
+    first = RequestOutput(
+        request_id="test-id",
+        prompt="Test prompt",
+        prompt_token_ids=list(range(100)),
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text="hi",
+                token_ids=[100, 101],
+                cumulative_logprob=0.0,
+                logprobs=None,
+                finish_reason=None,
+            )
+        ],
+        finished=False,
+        num_cached_tokens=80,
+        num_cache_creation_tokens=10,
+    )
+    final = RequestOutput(
+        request_id="test-id",
+        prompt="Test prompt",
+        prompt_token_ids=list(range(100)),
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text="",
+                token_ids=[],
+                cumulative_logprob=0.0,
+                logprobs=None,
+                finish_reason="stop",
+            )
+        ],
+        finished=True,
+        num_cached_tokens=80,
+        num_cache_creation_tokens=10,
+    )
+
+    chunks: list[dict[str, Any]] = []
+    async for line in serving.chat_completion_stream_generator(
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Test prompt"}],
+            max_tokens=10,
+            stream=True,
+            stream_options={
+                "include_usage": True,
+                "continuous_usage_stats": True,
+            },
+        ),
+        _stream_request_outputs(first, final),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    ):
+        payload = line.removeprefix("data: ").strip()
+        if payload and payload != "[DONE]":
+            chunks.append(json.loads(payload))
+
+    usage_chunks = [chunk for chunk in chunks if chunk.get("usage")]
+    assert len(usage_chunks) >= 2  # at least first and final
+
+    expected_cached = 80
+    expected_created = 10
+    for chunk in usage_chunks:
+        details = chunk["usage"].get("prompt_tokens_details")
+        assert details is not None, (
+            "continuous usage chunks must carry prompt_tokens_details "
+            "from the first chunk"
+        )
+        assert details["cached_tokens"] == expected_cached
+        assert details["created_cache_tokens"] == expected_created
+
+
+@pytest.mark.asyncio
+async def test_streaming_continuous_usage_omits_prompt_tokens_details_when_flag_off():
+    """When ``enable_prompt_tokens_details`` is off, continuous usage
+    chunks must omit the ``prompt_tokens_details`` key entirely so the
+    wire output is byte-identical to the pre-fix code. Only the final
+    usage chunk (which sets the field explicitly) is allowed to carry
+    it, and only when details are non-None.
+    """
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    serving.enable_prompt_tokens_details = False
+
+    first = RequestOutput(
+        request_id="test-id",
+        prompt="Test prompt",
+        prompt_token_ids=list(range(50)),
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text="hi",
+                token_ids=[100, 101],
+                cumulative_logprob=0.0,
+                logprobs=None,
+                finish_reason=None,
+            )
+        ],
+        finished=False,
+    )
+    final = RequestOutput(
+        request_id="test-id",
+        prompt="Test prompt",
+        prompt_token_ids=list(range(50)),
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text="",
+                token_ids=[],
+                cumulative_logprob=0.0,
+                logprobs=None,
+                finish_reason="stop",
+            )
+        ],
+        finished=True,
+    )
+
+    raw_chunks: list[str] = []
+    async for line in serving.chat_completion_stream_generator(
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Test prompt"}],
+            max_tokens=10,
+            stream=True,
+            stream_options={
+                "include_usage": True,
+                "continuous_usage_stats": True,
+            },
+        ),
+        _stream_request_outputs(first, final),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    ):
+        raw_chunks.append(line)
+
+    # Continuous usage chunks (the ones before the final empty-choices
+    # usage chunk) must not serialize prompt_tokens_details at all.
+    final_usage_seen = False
+    for raw in raw_chunks:
+        payload = raw.removeprefix("data: ").strip()
+        if not payload or payload == "[DONE]":
+            continue
+        chunk = json.loads(payload)
+        if not chunk.get("usage"):
+            continue
+        if chunk.get("choices"):
+            # Intermediate continuous-usage chunk: the key must be absent.
+            assert "prompt_tokens_details" not in chunk["usage"], (
+                f"continuous usage chunk leaked prompt_tokens_details "
+                f"with flag off: {chunk['usage']}"
+            )
+        else:
+            final_usage_seen = True
+    assert final_usage_seen, "expected a final empty-choices usage chunk"
+
+
+@pytest.mark.asyncio
+async def test_streaming_continuous_usage_details_repeat_for_n_greater_than_one():
+    """Regression guard: with ``n=2`` and continuous usage stats, every
+    continuous usage chunk emitted for both choices must carry
+    ``prompt_tokens_details`` populated identically to the final chunk.
+
+    Pre-fix the role chunks (one per choice) emitted no
+    ``prompt_tokens_details`` at all because the field was only attached
+    to the terminal empty-choices chunk.
+    """
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    serving.enable_prompt_tokens_details = True
+
+    first = RequestOutput(
+        request_id="test-id",
+        prompt="Test prompt",
+        prompt_token_ids=list(range(100)),
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text="hi",
+                token_ids=[100, 101],
+                cumulative_logprob=0.0,
+                logprobs=None,
+                finish_reason=None,
+            )
+        ],
+        finished=False,
+        num_cached_tokens=80,
+        num_cache_creation_tokens=10,
+    )
+    final = RequestOutput(
+        request_id="test-id",
+        prompt="Test prompt",
+        prompt_token_ids=list(range(100)),
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text="",
+                token_ids=[],
+                cumulative_logprob=0.0,
+                logprobs=None,
+                finish_reason="stop",
+            )
+        ],
+        finished=True,
+        num_cached_tokens=80,
+        num_cache_creation_tokens=10,
+    )
+
+    chunks: list[dict[str, Any]] = []
+    async for line in serving.chat_completion_stream_generator(
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Test prompt"}],
+            max_tokens=10,
+            stream=True,
+            n=2,
+            stream_options={
+                "include_usage": True,
+                "continuous_usage_stats": True,
+            },
+        ),
+        _stream_request_outputs(first, final),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    ):
+        payload = line.removeprefix("data: ").strip()
+        if payload and payload != "[DONE]":
+            chunks.append(json.loads(payload))
+
+    usage_chunks = [chunk for chunk in chunks if chunk.get("usage")]
+    assert len(usage_chunks) >= 3  # one role chunk per choice + final
+
+    expected_cached = 80
+    expected_created = 10
+    for chunk in usage_chunks:
+        details = chunk["usage"].get("prompt_tokens_details")
+        assert details is not None, (
+            "every continuous usage chunk (across all n choices) must "
+            "carry prompt_tokens_details"
+        )
+        assert details["cached_tokens"] == expected_cached
+        assert details["created_cache_tokens"] == expected_created
+
+
+@pytest.mark.asyncio
+async def test_streaming_continuous_usage_details_ride_multimodal_token_counts():
+    """Regression guard: when ``mm_token_counts`` is passed to the
+    generator, the multimodal-token leg of ``prompt_tokens_details`` on
+    the first continuous usage chunk must equal the final chunk's.
+
+    Pre-fix the first chunk emitted no ``prompt_tokens_details`` at all,
+    so the multimodal count was lost on the first chunk and only
+    surfaced on the terminal empty-choices chunk.
+    """
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    serving.enable_prompt_tokens_details = True
+
+    first = RequestOutput(
+        request_id="test-id",
+        prompt="Test prompt",
+        prompt_token_ids=list(range(50)),
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text="hi",
+                token_ids=[100, 101],
+                cumulative_logprob=0.0,
+                logprobs=None,
+                finish_reason=None,
+            )
+        ],
+        finished=False,
+    )
+    final = RequestOutput(
+        request_id="test-id",
+        prompt="Test prompt",
+        prompt_token_ids=list(range(50)),
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text="",
+                token_ids=[],
+                cumulative_logprob=0.0,
+                logprobs=None,
+                finish_reason="stop",
+            )
+        ],
+        finished=True,
+    )
+
+    mm_token_counts = {"image": 600, "video": 1200}
+    chunks: list[dict[str, Any]] = []
+    async for line in serving.chat_completion_stream_generator(
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Test prompt"}],
+            max_tokens=10,
+            stream=True,
+            stream_options={
+                "include_usage": True,
+                "continuous_usage_stats": True,
+            },
+        ),
+        _stream_request_outputs(first, final),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+        mm_token_counts=mm_token_counts,
+    ):
+        payload = line.removeprefix("data: ").strip()
+        if payload and payload != "[DONE]":
+            chunks.append(json.loads(payload))
+
+    usage_chunks = [chunk for chunk in chunks if chunk.get("usage")]
+    assert len(usage_chunks) >= 2  # first role chunk + final
+
+    final_mm = usage_chunks[-1]["usage"]["prompt_tokens_details"]["multimodal_tokens"]
+    first_mm = usage_chunks[0]["usage"]["prompt_tokens_details"]["multimodal_tokens"]
+    assert first_mm == final_mm == mm_token_counts, (
+        f"first continuous chunk multimodal_tokens={first_mm} must match "
+        f"final chunk multimodal_tokens={final_mm}"
+    )
+
+
 @dataclass
 class MockEngine:
     model_config: MockModelConfig = field(default_factory=MockModelConfig)
