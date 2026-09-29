@@ -1848,3 +1848,63 @@ def test_lookup_confirmed_hit_pinned_until_prepare_load():
         # Store refusal is the legal pressure outcome; the keys never
         # landed, so nothing is resident for them.
         assert manager.lookup(to_key(2), churn_ctx) is not LookupResult.HIT
+
+
+def test_prepare_load_takes_over_foreign_lookup_pin():
+    """Regression (2026-09-29): request A's
+    lookup pinned a key; request B's lookup confirmed the same key HIT
+    without pinning it (the pin branch requires ``key not in
+    _lookup_pinned``), so B never grew a ``_load_pins`` list. B's
+    prepare_load then keyed its take-over branch on ``pins is not None``
+    and fell into ``mark_non_evictable`` on an already-non-evictable key:
+    ``KeyError`` in the LRU policy, a dead EngineCore. The contract:
+    whoever loads a pinned key takes the pin over, regardless of which
+    request created it."""
+    manager = make_cpu_manager(num_chunks=2, cache_policy="lru")
+    ctx_a = make_req_context("a")
+    ctx_b = make_req_context("b")
+
+    out = manager.prepare_store(to_keys([1]), ctx_a)
+    assert out is not None
+    manager.complete_store(to_keys([1]), ctx_a)
+
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+    assert manager.lookup(to_key(1), ctx_b) is LookupResult.HIT
+    # B confirmed a foreign pin and must not have grown its own list.
+    assert getattr(ctx_b, "_load_pins", None) is None
+    assert to_key(1) in manager._lookup_pinned
+
+    spec = manager.prepare_load(to_keys([1]), ctx_b)
+    assert spec is not None
+    assert to_key(1) not in manager._lookup_pinned
+    block = manager._policy.get(to_key(1))
+    assert block.ref_cnt == 1
+
+
+def test_pin_owner_finish_after_takeover():
+    """After request B's load took over A's lookup pin, A finishing must
+    release nothing: its stale pin entry targets a key no longer in
+    ``_lookup_pinned``. The load's ref_cnt protection and the evictable
+    accounting must survive A's finish untouched, and complete_load must
+    return the key to the evictable pool exactly once."""
+    manager = make_cpu_manager(num_chunks=2, cache_policy="lru")
+    ctx_a = make_req_context("a")
+    ctx_b = make_req_context("b")
+
+    out = manager.prepare_store(to_keys([1]), ctx_a)
+    assert out is not None
+    manager.complete_store(to_keys([1]), ctx_a)
+
+    manager.lookup(to_key(1), ctx_a)
+    manager.lookup(to_key(1), ctx_b)
+    assert manager.prepare_load(to_keys([1]), ctx_b) is not None
+    assert manager._num_evictable_cache_chunks == 0
+
+    manager.on_request_finished(ctx_a)
+    assert manager._lookup_pinned == set()
+    assert manager._policy.get(to_key(1)).ref_cnt == 1
+    assert manager._num_evictable_cache_chunks == 0
+
+    manager.complete_load(to_keys([1]), ctx_b)
+    assert manager._policy.get(to_key(1)).ref_cnt == 0
+    assert manager._num_evictable_cache_chunks == 1
