@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Calibration traffic for the QSA K/V absmax collector.
 
 Adapted from halt95/qwen38-flash-next-3090s calib/qsa_calib_traffic.py.
@@ -10,6 +13,7 @@ calibrate without the image arm (Pillow).
 
     python calib/qsa_calib_traffic.py [port=8140] [model=qwen3.8-flash-next]
 """
+
 import base64
 import io
 import json
@@ -21,15 +25,48 @@ import urllib.request
 try:
     import PIL  # noqa: F401
 except ImportError:
-    sys.exit("Pillow is required (run this under the vLLM venv's python); refusing to calibrate without the image arm")
+    sys.exit(
+        "Pillow is required (run this under the vLLM venv's python); "
+        "refusing to calibrate without the image arm"
+    )
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "8140"
 MODEL = sys.argv[2] if len(sys.argv) > 2 else "qwen3.8-flash-next"
 BASE = f"http://127.0.0.1:{PORT}/v1"
 
-WORDS = ("harbour dawn quiet boats rest still granite ledger crimson orbit velvet "
-         "thunder archive lantern mosaic quarry sable meridian copper glacier fable "
-         "sextant bramble hollow zenith cinder plume rivet tundra ember lattice").split()
+WORDS = [
+    "harbour",
+    "dawn",
+    "quiet",
+    "boats",
+    "rest",
+    "still",
+    "granite",
+    "ledger",
+    "crimson",
+    "orbit",
+    "velvet",
+    "thunder",
+    "archive",
+    "lantern",
+    "mosaic",
+    "quarry",
+    "sable",
+    "meridian",
+    "copper",
+    "glacier",
+    "fable",
+    "sextant",
+    "bramble",
+    "hollow",
+    "zenith",
+    "cinder",
+    "plume",
+    "rivet",
+    "tundra",
+    "ember",
+    "lattice",
+]
 rng = random.Random(1949)
 
 
@@ -38,20 +75,33 @@ def text(n_words):
 
 
 def completion(prompt, max_tokens=64, ignore_eos=False):
-    body = {"model": MODEL, "prompt": prompt, "max_tokens": max_tokens,
-            "temperature": 0.8, "ignore_eos": ignore_eos}
-    req = urllib.request.Request(f"{BASE}/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+    body = {
+        "model": MODEL,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0.8,
+        "ignore_eos": ignore_eos,
+    }
+    req = urllib.request.Request(
+        f"{BASE}/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
     t0 = time.perf_counter()
     d = json.load(urllib.request.urlopen(req, timeout=3600))
-    print(f"  text: {d['usage']['prompt_tokens']} prompt tok, "
-          f"{d['usage']['completion_tokens']} gen, {time.perf_counter()-t0:.1f}s",
-          flush=True)
+    print(
+        f"  text: {d['usage']['prompt_tokens']} prompt tok, "
+        f"{d['usage']['completion_tokens']} gen, {time.perf_counter() - t0:.1f}s",
+        flush=True,
+    )
     return d["usage"]["prompt_tokens"]
 
 
 def image_chat(n_words):
-    from PIL import Image  # required: a run without the image arm is not a valid calibration
+    from PIL import (
+        Image,  # required: a run without the image arm is not a valid calibration
+    )
+
     img = Image.new("RGB", (896, 896))
     px = img.load()
     r = random.Random(7)
@@ -64,17 +114,35 @@ def image_chat(n_words):
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-    body = {"model": MODEL, "max_tokens": 64, "temperature": 0.8, "messages": [
-        {"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": uri}},
-            {"type": "text", "text": "Describe the image. Context: " + text(n_words)},
-        ]}]}
-    req = urllib.request.Request(f"{BASE}/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+    body = {
+        "model": MODEL,
+        "max_tokens": 64,
+        "temperature": 0.8,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": uri}},
+                    {
+                        "type": "text",
+                        "text": "Describe the image. Context: " + text(n_words),
+                    },
+                ],
+            }
+        ],
+    }
+    req = urllib.request.Request(
+        f"{BASE}/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
     t0 = time.perf_counter()
     d = json.load(urllib.request.urlopen(req, timeout=3600))
-    print(f"  image: {d['usage']['prompt_tokens']} prompt tok, "
-          f"{time.perf_counter()-t0:.1f}s", flush=True)
+    print(
+        f"  image: {d['usage']['prompt_tokens']} prompt tok, "
+        f"{time.perf_counter() - t0:.1f}s",
+        flush=True,
+    )
 
 
 # Measured on halt95's server for the same tokenizer: the word list tokenizes
@@ -98,7 +166,10 @@ for label, toks in (("128k", 128000), ("200k", 200000), ("255k", 255000)):
     print(f"[{label}]", flush=True)
     deepest = max(deepest, completion(text(words_for(toks))))
 if deepest < 250000:
-    sys.exit(f"deepest arm reached only {deepest} prompt tokens (< 250000): the tokens/word ratio is off for this tokenizer; fix RATIO")
+    sys.exit(
+        f"deepest arm reached only {deepest} prompt tokens (< 250000): "
+        "the tokens/word ratio is off for this tokenizer; fix RATIO"
+    )
 # Flush: the collector persists its running maxima every 2,000 layer calls, not on
 # a timer, so the deepest request's maxima may still be unpersisted when traffic
 # ends. A dump boundary is at most 2,000 / 12 layers = 167 model forwards away;

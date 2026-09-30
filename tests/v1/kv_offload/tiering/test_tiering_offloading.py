@@ -1458,3 +1458,29 @@ def test_parse_tier_filter_skips_bad_entries():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_tiering_manager_wires_cascade_cross_check():
+    """Contract pin: a secondary tier declaring the cascade cross-check
+    slot gets it wired to the primary's verify_stored_slot whenever the
+    primary exposes it."""
+    mock_region = _mock_mmap_region(4)
+    primary_tier = CPUPrimaryTierOffloadingManager(
+        num_chunks=4, mmap_region=mock_region
+    )
+    stub_tier = MetricsSecondaryTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=mock_region.create_kv_memoryview(),
+        tier_type="test_wiring",
+    )
+    stub_tier._store_cross_check = None
+
+    TieringOffloadingManager(primary_tier=primary_tier, secondary_tiers=[stub_tier])
+
+    expected = getattr(primary_tier, "verify_stored_slot", None)
+    if expected is None:
+        assert stub_tier._store_cross_check is None
+    else:
+        # Bound methods are fresh objects per access; compare by identity
+        # of the underlying function.
+        assert stub_tier._store_cross_check.__func__ is expected.__func__

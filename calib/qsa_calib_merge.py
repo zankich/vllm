@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Max-merge per-rank QSA absmax dumps into the VLLM_QSA_KV_SCALES sidecar.
 
 Adapted from halt95/qwen38-flash-next-3090s calib/qsa_calib_merge.py for the
@@ -8,7 +11,8 @@ every rank file (--ranks), exactly the expected number of QSA layers in each
 maxima, a margin in [1.0, 2.0], and positive finite output scales.
 scale = absmax / 448.0 (E4M3 max normal), per the collector design.
 
-    python calib/qsa_calib_merge.py <dump-dir> <out.json> [--ranks 4] [--layers 12] [--margin 1.10]
+    python calib/qsa_calib_merge.py <dump-dir> <out.json>
+    [--ranks 4] [--layers 12] [--margin 1.10]
 
 How the dumps are made: see calib/calib_launch.sh (serve with VLLM_QSA_KV_COLLECT
 and --enforce-eager, no speculative config) and calib/qsa_calib_traffic.py (the
@@ -28,6 +32,7 @@ ends with a flush phase of short completions that pushes past the next dump
 boundary. Use a fresh, empty dump directory per run and check the rank files'
 mtimes are later than your last deep request before merging.
 """
+
 import argparse
 import json
 import math
@@ -43,8 +48,12 @@ def main() -> None:
     )
     ap.add_argument("dump_dir", type=Path)
     ap.add_argument("out", type=Path)
-    ap.add_argument("--ranks", type=int, default=4, help="TP size; one dump per rank is required")
-    ap.add_argument("--layers", type=int, default=12, help="QSA layers the target model has")
+    ap.add_argument(
+        "--ranks", type=int, default=4, help="TP size; one dump per rank is required"
+    )
+    ap.add_argument(
+        "--layers", type=int, default=12, help="QSA layers the target model has"
+    )
     ap.add_argument(
         "--margin",
         type=float,
@@ -56,7 +65,9 @@ def main() -> None:
     )
     a = ap.parse_args()
     if a.ranks < 1 or a.layers < 1:
-        sys.exit(f"FAIL: --ranks and --layers must be positive, got {a.ranks} / {a.layers}")
+        sys.exit(
+            f"FAIL: --ranks and --layers must be positive, got {a.ranks} / {a.layers}"
+        )
     if not (math.isfinite(a.margin) and 1.0 <= a.margin <= 2.0):
         sys.exit(f"FAIL: --margin must be a finite value in [1.0, 2.0], got {a.margin}")
 
@@ -64,7 +75,8 @@ def main() -> None:
     missing = [str(f) for f in files if not f.is_file()]
     if missing:
         sys.exit(
-            "FAIL: missing rank files (a missing rank under-estimates the global absmax):\n  "
+            "FAIL: missing rank files (a missing rank under-estimates the "
+            "global absmax):\n  "
             + "\n  ".join(missing)
         )
 
@@ -80,7 +92,8 @@ def main() -> None:
             k, v = float(st["k_absmax"]), float(st["v_absmax"])
             if not (math.isfinite(k) and math.isfinite(v) and k > 0 and v > 0):
                 sys.exit(
-                    f"FAIL: non-finite or non-positive absmax on {name} in {f.name}: k={k} v={v}"
+                    f"FAIL: non-finite or non-positive absmax on {name} "
+                    f"in {f.name}: k={k} v={v}"
                 )
             m = merged.setdefault(name, {"k_absmax": 0.0, "v_absmax": 0.0})
             m["k_absmax"] = max(m["k_absmax"], k)
@@ -104,7 +117,9 @@ def main() -> None:
     }
     for name, sc in sidecar.items():
         if not all(math.isfinite(x) and x > 0 for x in sc.values()):
-            sys.exit(f"FAIL: non-finite or non-positive scale computed for {name}: {sc}")
+            sys.exit(
+                f"FAIL: non-finite or non-positive scale computed for {name}: {sc}"
+            )
     with open(a.out, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(json.dumps(sidecar, indent=1, allow_nan=False))
     print(f"wrote {a.out} ({len(sidecar)} layers)")

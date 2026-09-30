@@ -206,6 +206,12 @@ class FileSystemTierManager(SecondaryTierManager):
                 tier_type,
             )
 
+        # Cascade cross-check: optional callable (key, payload) -> bool |
+        # None from the primary tier's recorded checksums. False refuses
+        # the fs write. Set by the tiering manager when the primary tier
+        # exposes verify_stored_slot.
+        self._store_cross_check = None
+
         self._pool = DualQueueThreadPool(
             n_read_threads,
             n_write_threads,
@@ -248,15 +254,49 @@ class FileSystemTierManager(SecondaryTierManager):
             # (microsecond window); the escalation if it shows up is a
             # wrote-mask from the C store plus per-path serialization.
             fresh = [not os.path.exists(p) for p in paths]
+            sel_paths, sel_keys, sel_offsets, sel_fresh = paths, keys, offsets, fresh
+            if self._store_cross_check is not None:
+                # Store-side self-verification: the bytes being persisted
+                # must still match the primary tier's recorded checksum
+                # for the key. Load-side integrity binds the key to the
+                # bytes AS STORED, so a mislabel at write time would
+                # verify clean forever; this check refuses it at the mint.
+                view_c = self._primary_kv_view.cast("B")
+                keep = []
+                for i, is_fresh in enumerate(fresh):
+                    if not is_fresh:
+                        keep.append(True)
+                    elif (
+                        self._store_cross_check(
+                            keys[i],
+                            view_c[offsets[i] : offsets[i] + self._block_size],
+                        )
+                        is False
+                    ):
+                        logger.warning(
+                            "cascade cross-check rejected %s: bytes diverged "
+                            "from the primary tier's recorded checksum",
+                            paths[i],
+                        )
+                        keep.append(False)
+                    else:
+                        keep.append(True)
+                sel = [i for i, kp in enumerate(keep) if kp]
+                sel_paths = [paths[i] for i in sel]
+                sel_keys = [keys[i] for i in sel]
+                sel_offsets = [offsets[i] for i in sel]
+                sel_fresh = [fresh[i] for i in sel]
             batch_store_block(
-                paths,
+                sel_paths,
                 self._primary_kv_view,
-                offsets,
+                sel_offsets,
                 self._block_size,
                 self._use_o_direct,
             )
             view_b = self._primary_kv_view.cast("B")
-            for path, key, offset, is_fresh in zip(paths, keys, offsets, fresh):
+            for path, key, offset, is_fresh in zip(
+                sel_paths, sel_keys, sel_offsets, sel_fresh
+            ):
                 if is_fresh:
                     integrity.write_record(
                         path, key, view_b[offset : offset + self._block_size]
@@ -328,11 +368,11 @@ class FileSystemTierManager(SecondaryTierManager):
                     ):
                         integrity.remove_block(path, "mismatch")
                         removed.append(key)
-                        exc = OSError(f"integrity checksum mismatch for {path}")
+                        err = OSError(f"integrity checksum mismatch for {path}")
                         # Blocks before the failing one passed verification
                         # and are kept, per the partial-keep contract.
-                        exc.num_succeeded = i  # type: ignore[attr-defined]
-                        raise exc
+                        err.num_succeeded = i  # type: ignore[attr-defined]
+                        raise err
             except OSError as exc:
                 # Runs on the pool worker thread. Record how many blocks loaded
                 # before the failure so get_finished_jobs can keep them; this
