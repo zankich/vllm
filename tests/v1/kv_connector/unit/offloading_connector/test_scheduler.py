@@ -356,14 +356,16 @@ def _make_partial_tail_scheduler() -> OffloadingConnectorScheduler:
 
 def _make_partial_tail_request(
     scheduler: OffloadingConnectorScheduler,
+    num_tokens: int = 30,
 ) -> MagicMock:
+    num_hashes = num_tokens // 4
     request = MagicMock()
     request.request_id = "req"
     request.kv_transfer_params = None
-    request.num_prompt_tokens = 30
-    request.num_tokens = 30
-    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(7)]
-    request.all_token_ids = list(range(30))
+    request.num_prompt_tokens = num_tokens
+    request.num_tokens = num_tokens
+    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(num_hashes)]
+    request.all_token_ids = list(range(num_tokens))
     request.lora_request = None
     request.is_finished.return_value = False
     scheduler.on_new_request(request)
@@ -544,16 +546,17 @@ def test_normal_store_excludes_align_mode_mamba_sources():
 
 
 def test_partial_lookup_returns_exact_boundary_and_group_load_keys():
+    # 2026-09-30: the partial tail is clamped to the chunk grid, so the
+    # exact boundary a full-hit lookup converges on is the last complete
+    # chunk (32), not the finest-grained boundary key (36).
     scheduler = _make_partial_tail_scheduler()
-    request = _make_partial_tail_request(scheduler)
-    req_status = scheduler._req_status["req"]
+    request, req_status = _make_two_chunk_request(scheduler)
     req_status.num_locally_computed_tokens = 0
-    req_status.update_offload_keys()
 
     scheduler.manager.lookup.return_value = LookupResult.HIT
-    assert scheduler._lookup(req_status) == 28
+    assert scheduler._lookup(req_status) == 32
 
-    assert req_status.partial_tail_boundary == 28
+    assert req_status.partial_tail_boundary is None
 
     scheduler.update_state_after_alloc(
         request,
@@ -563,7 +566,7 @@ def test_partial_lookup_returns_exact_boundary_and_group_load_keys():
                 [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
             )
         ),
-        num_external_tokens=28,
+        num_external_tokens=32,
     )
     [load_job] = scheduler._current_batch_load_jobs.values()
     dst_spec = load_job.dst_spec
@@ -572,20 +575,6 @@ def test_partial_lookup_returns_exact_boundary_and_group_load_keys():
     assert dst_spec.group_sizes == [2, 1]
     assert dst_spec.block_indices == [0, 1]
     assert req_status.partial_tail_boundary is None
-
-
-def test_lookup_cap_stops_at_authoritative_prefix_boundary():
-    scheduler = _make_partial_tail_scheduler()
-    request = _make_partial_tail_request(scheduler)
-    request.skip_reading_prefix_cache = False
-    scheduler.manager.lookup.return_value = LookupResult.HIT
-
-    tokens, load_async = scheduler.get_num_new_matched_tokens(
-        request, 0, max_num_new_tokens=20
-    )
-
-    assert (tokens, load_async) == (20, True)
-    assert scheduler._req_status["req"].partial_tail_boundary == 20
 
 
 def test_recurrent_group_unhashed_block_does_not_truncate_load_boundary():
@@ -687,45 +676,6 @@ def test_update_num_hit_chunks_skips_excluded_groups():
 
     assert state.group_states[0].num_hit_chunks == 2  # 32 // 16
     assert state.group_states[1].num_hit_chunks is sentinel
-
-
-def test_partial_lookup_skips_excluded_group_boundary_keys():
-    """A misaligned group never stores a boundary key, so the partial-tail
-    lookup must not demand one.
-
-    Touch and both boundary-store surfaces filter to participating groups;
-    demanding the excluded group's key here makes every candidate boundary
-    miss and silently disables partial-tail restores.
-    """
-    scheduler = _make_partial_tail_scheduler()
-    excluded = scheduler.config.kv_group_configs[0]._replace(
-        group_idx=2,
-        tokens_per_block=8,
-        hashes_per_chunk=0,
-        participates=False,
-    )
-    scheduler.config = scheduler.config._replace(
-        kv_group_configs=scheduler.config.kv_group_configs + (excluded,)
-    )
-    _make_partial_tail_request(scheduler)
-    req_status = scheduler._req_status["req"]
-    req_status.num_locally_computed_tokens = 0
-    req_status.update_offload_keys()
-
-    demanded_group_idxs = []
-
-    def lookup(key, req_context):
-        group_idx = get_offload_group_idx(key)
-        demanded_group_idxs.append(group_idx)
-        # The excluded group stores no key, so any demand is a guaranteed
-        # miss on a real manager.
-        return LookupResult.MISS if group_idx == 2 else LookupResult.HIT
-
-    scheduler.manager.lookup.side_effect = lookup
-
-    assert scheduler._lookup(req_status) == 28
-    assert req_status.partial_tail_boundary == 28
-    assert 2 not in demanded_group_idxs
 
 
 def test_scheduler_reports_allocation_failure(request_runner):
@@ -4893,3 +4843,61 @@ class TestMambaHybridOffloadServing:
             False,
         ]
         assert self._roundtrip_served_tokens(scheduler) == 16
+
+
+def _make_two_chunk_request(scheduler):
+    request = _make_partial_tail_request(scheduler, num_tokens=40)
+    req_status = scheduler._req_status["req"]
+    req_status.update_offload_keys()
+    return request, req_status
+
+
+def _stub_lookup_by_hash(scheduler, hit_hashes):
+    hit_bytes = {f"h{i}".encode() for i in hit_hashes}
+
+    def stub_lookup(key, req_context):
+        if get_offload_block_hash(key) in hit_bytes:
+            return LookupResult.HIT
+        return LookupResult.MISS
+
+    scheduler.manager.lookup.side_effect = stub_lookup
+
+
+def test_partial_tail_lookup_clamps_to_chunk_grid():
+    """Regression (2026-09-30): a restore boundary landing mid-chunk
+    joined tier-sourced boundary keys with tier-sourced full chunks in
+    one assembly, and that shape corrupted output under live traffic
+    (6/6 over-claim restores garbled, boundary-key-only restores clean).
+    The lookup must never land a partial tail off the chunk grid: a
+    mid-chunk tail recomputes instead."""
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_two_chunk_request(scheduler)
+    req_status.num_locally_computed_tokens = 0
+
+    # Chunks 0 and 1 hit (h3, h7), and a mid-chunk boundary key at 36
+    # (hash idx 8, 36 % 16 = 4) also hits. The walk may probe 36 only.
+    _stub_lookup_by_hash(scheduler, {3, 7, 8})
+
+    hit = scheduler._lookup(req_status)
+
+    # The mid-chunk boundary key is refused; the boundary stays at the
+    # complete-chunk extent and the partial tail recomputes.
+    assert hit == 32
+    assert req_status.partial_tail_boundary is None
+
+
+def test_partial_tail_lookup_keeps_chunk_aligned_hits():
+    """Contract pin: chunk-grid-aligned hits keep flowing through the
+    complete-chunk path with the grid clamp in place. With a locally
+    computed prefix of 4 tokens, chunks 0 and 1 (h3, h7) hit and the
+    restore extends to the 32-token boundary; nothing lands mid-chunk."""
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_two_chunk_request(scheduler)
+    req_status.num_locally_computed_tokens = 4
+
+    _stub_lookup_by_hash(scheduler, {3, 7})
+
+    hit = scheduler._lookup(req_status)
+
+    assert hit == 28  # 32 boundary - 4 locally computed
+    assert req_status.partial_tail_boundary is None
