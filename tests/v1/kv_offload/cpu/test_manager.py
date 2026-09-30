@@ -1307,3 +1307,26 @@ def test_pin_owner_finish_after_takeover():
     manager.complete_load(to_keys([1]), ctx_b)
     assert manager._policy.get(to_key(1)).ref_cnt == 0
     assert manager._num_evictable_cache_blocks == 1
+
+
+def test_verify_stored_slot_cross_check():
+    """The cascade cross-check source: whether given bytes match the
+    checksum recorded at this key's CPU-store completion. True/False for
+    a recorded key, None when slot checksums are off or unrecorded."""
+    view, write_slot, _ = _make_integrity_buffer()
+    manager = make_cpu_manager(num_blocks=2, kv_memoryview=view)
+    _store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
+
+    key = to_key(1)
+    block_id = manager._policy.get(key).block_id
+    size = len(view) // 2
+    stored = bytes(view[block_id * size : (block_id + 1) * size])
+    tampered = bytearray(stored)
+    tampered[0] ^= 0xFF
+
+    assert manager.verify_stored_slot(key, stored) is True
+    assert manager.verify_stored_slot(key, bytes(tampered)) is False
+    assert manager.verify_stored_slot(to_key(9), stored) is None
+
+    no_view_manager = make_cpu_manager(num_blocks=2)
+    assert no_view_manager.verify_stored_slot(key, stored) is None

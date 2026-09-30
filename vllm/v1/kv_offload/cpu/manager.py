@@ -101,6 +101,22 @@ class CPUOffloadingManager(OffloadingManager):
         slot = self._kv_bytes[block_id * size : (block_id + 1) * size]
         return block_checksum(key, slot)
 
+    def verify_stored_slot(
+        self, key: OffloadKey, payload: bytes | memoryview
+    ) -> bool | None:
+        """Whether *payload* matches the checksum recorded at this key's
+        CPU-store completion. The cascade cross-check source for
+        secondary tiers: None when slot checksums are off or the key has
+        no record, so callers treat it as "cannot judge"."""
+        if self._integrity is None:
+            return None
+        from vllm.v1.kv_offload.tiering.fs.integrity import block_checksum
+
+        recorded = self._integrity.get(key)
+        if recorded is None:
+            return None
+        return block_checksum(key, payload) == recorded
+
     def _reject_corrupt_block(self, key: OffloadKey, block: BlockStatus) -> None:
         """Evict a block whose bytes no longer match its recorded checksum."""
         logger.warning(
