@@ -154,9 +154,7 @@ def restore_accounting_summary(
             violations,
         )
     if boundary > num_prompt_tokens:
-        violations.append(
-            f"boundary exceeds prompt: {boundary} > {num_prompt_tokens}"
-        )
+        violations.append(f"boundary exceeds prompt: {boundary} > {num_prompt_tokens}")
     if (
         has_full_group
         and full_group_capacity > 0
@@ -377,9 +375,7 @@ class SchedulerOffloadConfig(NamedTuple):
         kv_group_configs = tuple(kv_group_configs_list)
         # Uniformity and tail support are properties of the groups that
         # actually offload; excluded groups sit at their own block size.
-        participating = [
-            config for config in kv_group_configs if config.participates
-        ]
+        participating = [config for config in kv_group_configs if config.participates]
         group_block_sizes = {config.tokens_per_block for config in participating}
         has_partial_recurrent_group = any(
             config.requires_cow_source
@@ -621,7 +617,9 @@ class OffloadingConnectorScheduler:
         )
         # Store-accounting needs the GPU hash-block size (block_hashes are
         # per GPU block); any group's spec carries it.
-        self._gpu_block_size = kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+        self._gpu_block_size = kv_cache_config.kv_cache_groups[
+            0
+        ].kv_cache_spec.block_size
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats = OffloadingConnectorStats()
 
@@ -1026,46 +1024,16 @@ class OffloadingConnectorScheduler:
         if complete_hit is None or not self.config.supports_partial_tail:
             return complete_hit
 
-        local_tokens = req_status.num_locally_computed_tokens
-        complete_boundary = local_tokens + complete_hit
-        tokens_per_hash = self.config.tokens_per_hash
-        block_end = complete_boundary + self._partial_tail_block_size
-        max_boundary = round_down(
-            min(req_status.req.num_prompt_tokens - 1, block_end - 1), tokens_per_hash
-        )
-        if max_boundary <= complete_boundary:
-            return complete_hit
-
-        pending = False
-        for boundary in range(max_boundary, complete_boundary, -tokens_per_hash):
-            boundary_pending = False
-            boundary_missed = False
-            boundary_keys = []
-            for group_config in self.config.kv_group_configs:
-                key = self._make_boundary_key(
-                    req_status.req, group_config.group_idx, boundary
-                )
-                boundary_keys.append(key)
-                result = self.manager.lookup(key, req_status.req_context)
-                if result is LookupResult.MISS:
-                    boundary_missed = True
-                    break
-                if result in (LookupResult.HIT_PENDING, LookupResult.RETRY):
-                    boundary_pending = True
-
-            pending |= boundary_pending
-            if not boundary_missed and not boundary_pending:
-                for group_config, key in zip(
-                    self.config.kv_group_configs, boundary_keys
-                ):
-                    self._events_tracker.record_partial_lookup(
-                        req_status.req, group_config, boundary, key
-                    )
-                req_status.partial_tail_boundary = boundary
-                return boundary - local_tokens
-
-        if pending and complete_hit == 0:
-            return None
+        # The partial-tail walk is disabled: it can only land a
+        # mid-chunk boundary, and a mid-chunk boundary key joins
+        # tier-sourced full chunks with a tier-sourced partial tail in
+        # one assembly — the shape that corrupted output under live
+        # traffic (every over-claim restore garbled; boundary-key-only
+        # restores stayed clean). Chunk-aligned candidates are
+        # unreachable by construction: the walk window is
+        # _partial_tail_block_size wide and the next aligned boundary is
+        # a full block past complete_boundary, outside it. The partial
+        # tail past the last full chunk recomputes instead.
         return complete_hit
 
     def on_new_request(self, request: Request) -> None:
