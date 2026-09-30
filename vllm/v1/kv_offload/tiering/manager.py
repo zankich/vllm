@@ -208,6 +208,15 @@ class TieringOffloadingManager(OffloadingManager):
         self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
 
+        # Cascade cross-check: tiers that declare the slot (fs) verify
+        # their persisted bytes against the primary's recorded checksums
+        # when the primary exposes them.
+        verify = getattr(self.primary_tier, "verify_stored_slot", None)
+        if verify is not None:
+            for tier in self.secondary_tiers:
+                if hasattr(tier, "_store_cross_check"):
+                    tier._store_cross_check = verify
+
         self._job_id_counter: int = 0
         # Job tracking: maps job_id to metadata for all in-flight transfers.
         # TransferJob.is_promotion distinguishes direction:
