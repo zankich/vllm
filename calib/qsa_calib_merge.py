@@ -12,7 +12,7 @@ maxima, a margin in [1.0, 2.0], and positive finite output scales.
 scale = absmax / 448.0 (E4M3 max normal), per the collector design.
 
     python calib/qsa_calib_merge.py <dump-dir> <out.json>
-        [--ranks 4] [--layers 12] [--margin 1.10]
+    [--ranks 4] [--layers 12] [--margin 1.10]
 
 How the dumps are made: see calib/calib_launch.sh (serve with VLLM_QSA_KV_COLLECT
 and --enforce-eager, no speculative config) and calib/qsa_calib_traffic.py (the
@@ -75,8 +75,8 @@ def main() -> None:
     missing = [str(f) for f in files if not f.is_file()]
     if missing:
         sys.exit(
-            "FAIL: missing rank files (a missing rank under-estimates "
-            "the global absmax):\n  " + "\n  ".join(missing)
+            "FAIL: missing rank files (a missing rank under-estimates the "
+            "global absmax):\n  " + "\n  ".join(missing)
         )
 
     merged: dict[str, dict[str, float]] = {}

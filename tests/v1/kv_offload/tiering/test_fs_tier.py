@@ -1471,3 +1471,65 @@ def test_mismatch_removal_spares_sibling_group_files(fs_tier):
 
     assert not os.path.exists(path0)
     assert os.path.exists(sibling), "sibling group files must be untouched"
+
+
+def test_store_refuses_block_on_cross_check_mismatch(fs_tier, caplog):
+    """The cascade cross-check: the fs tier must refuse to persist bytes
+    that no longer match the CPU tier's recorded checksum for the key.
+    The bytes drifted between the CPU store and the fs write — the
+    store-side mislabel class that load-side integrity verifies as clean
+    forever. A refusal costs a miss and recompute; a silent write costs
+    permanent poison."""
+    import logging
+
+    tier, tensor = fs_tier
+    tier._store_cross_check = lambda key, payload: False
+    tier.submit_store(make_job(1, [key(0)], [0]))
+    with caplog.at_level(logging.WARNING):
+        results = drain(tier)
+    assert all(r.success for r in results)
+    path = tier.file_mapper.get_file_name(key(0))
+
+    assert not os.path.exists(path), "mismatched bytes must not persist"
+    assert any(
+        "cascade cross-check rejected" in r.message and path in r.message
+        for r in caplog.records
+    ), f"expected a rejection line in {caplog.records!r}"
+    del tensor
+
+
+def test_store_proceeds_when_cross_check_matches(fs_tier):
+    """Contract pin: a passing cross-check (True) does not impede the
+    store."""
+    tier, _ = fs_tier
+    tier._store_cross_check = lambda key, payload: True
+    tier.submit_store(make_job(1, [key(0)], [0]))
+    assert all(r.success for r in drain(tier))
+    assert os.path.exists(tier.file_mapper.get_file_name(key(0)))
+
+
+def test_store_cross_check_none_is_inert(fs_tier):
+    """No CPU record (None) means the check cannot judge: proceed, the
+    load-side integrity still guards what lands."""
+    tier, _ = fs_tier
+    tier._store_cross_check = lambda key, payload: None
+    tier.submit_store(make_job(1, [key(0)], [0]))
+    assert all(r.success for r in drain(tier))
+    assert os.path.exists(tier.file_mapper.get_file_name(key(0)))
+
+
+def test_store_cross_check_partitions_mixed_batch(fs_tier, caplog):
+    """One job, two keys, verdicts split True/False: the passing key
+    persists, the failing key is refused, and the job still succeeds."""
+    import logging
+
+    tier, _ = fs_tier
+    tier._store_cross_check = lambda k, payload: k != key(1)
+    tier.submit_store(make_job(1, [key(0), key(1)], [0, 1]))
+    with caplog.at_level(logging.WARNING):
+        results = drain(tier)
+
+    assert all(r.success for r in results)
+    assert os.path.exists(tier.file_mapper.get_file_name(key(0)))
+    assert not os.path.exists(tier.file_mapper.get_file_name(key(1)))
+    assert any("cascade cross-check rejected" in r.message for r in caplog.records)
