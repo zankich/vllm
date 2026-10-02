@@ -3,7 +3,6 @@
 """E4M3 KV reader for sm_86: decode exactness and kernel equivalence."""
 
 import json
-import time
 import math
 from pathlib import Path
 
@@ -17,7 +16,6 @@ import triton.language as tl
 import vllm.models.qwen4_exp.nvidia.model  # noqa: F401
 from vllm.models.qwen4_exp.nvidia import qsa as qsa_mod
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
-from vllm.platforms import current_platform
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -51,18 +49,22 @@ def _make_paged_case(selection_width=6, device="cuda", seed=0):
     k_scale = torch.tensor(0.02, dtype=torch.float32, device=device)
     v_scale = torch.tensor(0.03, dtype=torch.float32, device=device)
 
-    q = (torch.randn(num_rows, num_q_heads, head_dim, generator=g) * 0.5).to(
-        torch.bfloat16
-    ).to(device)
+    q = (
+        (torch.randn(num_rows, num_q_heads, head_dim, generator=g) * 0.5)
+        .to(torch.bfloat16)
+        .to(device)
+    )
     # |k| max ~ 3*sigma = 6 << 448 * 0.02 = 8.96: no saturation, cast is exact
     k = (
-        torch.randn(num_pages * page_size, num_kv_heads, head_dim, generator=g)
-        * 2.0
-    ).to(torch.bfloat16).to(device)
+        (torch.randn(num_pages * page_size, num_kv_heads, head_dim, generator=g) * 2.0)
+        .to(torch.bfloat16)
+        .to(device)
+    )
     v = (
-        torch.randn(num_pages * page_size, num_kv_heads, head_dim, generator=g)
-        * 2.0
-    ).to(torch.bfloat16).to(device)
+        (torch.randn(num_pages * page_size, num_kv_heads, head_dim, generator=g) * 2.0)
+        .to(torch.bfloat16)
+        .to(device)
+    )
     indices = torch.zeros(
         num_rows, selection_width + 1, dtype=torch.int32, device=device
     )
@@ -84,19 +86,33 @@ def _make_paged_case(selection_width=6, device="cuda", seed=0):
     return q, k, v, _page, indices, block_table, token_to_req, k_scale, v_scale
 
 
+def _ungated(q):
+    # The sparse primitive applies sigmoid(output_gate) to its output on this
+    # branch. sigmoid(20) is exactly 1.0 in fp32, so a +20 gate leaves the
+    # ungated attention values these comparisons are written against.
+    return torch.full_like(q, 20.0)
+
+
 def _fp8_outputs(case):
     q, k, v, page, indices, block_table, token_to_req, k_scale, v_scale = case
     kq = (k.float() / k_scale.cpu()).to(torch.float8_e4m3fn)
     vq = (v.float() / v_scale.cpu()).to(torch.float8_e4m3fn)
-    k_deq = (kq.to(torch.bfloat16).float() * k_scale.cpu()).to(torch.bfloat16).to(
-        q.device
+    k_deq = (
+        (kq.to(torch.bfloat16).float() * k_scale.cpu()).to(torch.bfloat16).to(q.device)
     )
-    v_deq = (vq.to(torch.bfloat16).float() * v_scale.cpu()).to(torch.bfloat16).to(
-        q.device
+    v_deq = (
+        (vq.to(torch.bfloat16).float() * v_scale.cpu()).to(torch.bfloat16).to(q.device)
     )
     # bf16 reference: the same rows the fp8 path will decode to
     ref = qsa_ops.qsa_sparse_paged_attention(
-        q, page(k_deq), page(v_deq), indices, block_table, token_to_req, False
+        q,
+        page(k_deq),
+        page(v_deq),
+        indices,
+        block_table,
+        token_to_req,
+        False,
+        output_gate=_ungated(q),
     )
     fp8 = qsa_ops.qsa_sparse_paged_attention(
         q,
@@ -106,6 +122,7 @@ def _fp8_outputs(case):
         block_table,
         token_to_req,
         False,
+        output_gate=_ungated(q),
         k_scale=k_scale,
         v_scale=v_scale,
     )
@@ -117,6 +134,7 @@ def _fp8_outputs(case):
         block_table,
         token_to_req,
         False,
+        output_gate=_ungated(q),
         k_scale=k_scale,
         v_scale=v_scale,
     )
@@ -171,6 +189,7 @@ def test_fp8_kv_rejects_bad_scales_and_mixed_dtypes():
             block_table,
             token_to_req,
             False,
+            output_gate=_ungated(q),
             k_scale=k_scale.double(),
             v_scale=v_scale,
         )
@@ -183,6 +202,7 @@ def test_fp8_kv_rejects_bad_scales_and_mixed_dtypes():
             block_table,
             token_to_req,
             False,
+            output_gate=_ungated(q),
         )
     with pytest.raises(ValueError, match="BF16 queries"):
         qsa_ops.qsa_sparse_paged_attention(
@@ -193,6 +213,7 @@ def test_fp8_kv_rejects_bad_scales_and_mixed_dtypes():
             block_table,
             token_to_req,
             False,
+            output_gate=_ungated(q),
         )
 
 
@@ -200,7 +221,6 @@ def test_fp8_kv_rejects_bad_scales_and_mixed_dtypes():
 
 
 def _fake_qsa_layer(name, kv_cache_dtype="fp8_e4m3"):
-
     layer = qsa_mod.Qwen4ExpQSAAttention.__new__(qsa_mod.Qwen4ExpQSAAttention)
     layer.layer_name = name
     layer.kv_cache_dtype = kv_cache_dtype
@@ -216,7 +236,6 @@ def _sidecar(tmp_path, entries):
 
 
 def test_loader_strict_applies_scales(tmp_path):
-
     layers = {
         "model.layers.3.self_attn.attn": _fake_qsa_layer(
             "model.layers.3.self_attn.attn"
@@ -247,7 +266,6 @@ def test_loader_strict_applies_scales(tmp_path):
 
 
 def test_loader_strict_rejects_partial_and_unknown(tmp_path):
-
     layers = {"a.attn": _fake_qsa_layer("a.attn"), "b.attn": _fake_qsa_layer("b.attn")}
     with pytest.raises(ValueError, match="Unknown QSA layer names"):
         qsa_mod.load_qsa_static_kv_scales(
@@ -271,7 +289,6 @@ def test_loader_strict_rejects_partial_and_unknown(tmp_path):
 
 
 def test_loader_rejects_bad_values_and_non_fp8_layers(tmp_path):
-
     layers = {"a.attn": _fake_qsa_layer("a.attn")}
     with pytest.raises(ValueError, match="finite and positive"):
         qsa_mod.load_qsa_static_kv_scales(
@@ -336,7 +353,9 @@ def test_backend_supports_kv_cache_dtype_bypasses_fa_hardware_check():
     assert qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype("fp8_e4m3")
     assert qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype("fp8")
     assert qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype(None)
-    assert not qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype("fp8_e5m2")
+    assert not qsa_mod.Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype(
+        "fp8_e5m2"
+    )
 
 
 def test_maybe_load_env_gate(tmp_path, monkeypatch, caplog):
@@ -373,7 +392,9 @@ def test_collector_running_max_and_dump(tmp_path, monkeypatch):
     qsa_mod._qsa_collect_absmax("l1", torch.tensor([0.1]), torch.tensor([0.2]))
     st = qsa_mod._qsa_collect_state
     assert st["l0"][0].item() == 3.0 and st["l0"][1].item() == 4.0
-    assert st["l1"][0].item() == pytest.approx(0.1) and st["l1"][1].item() == pytest.approx(0.2)
+    assert st["l1"][0].item() == pytest.approx(0.1) and st["l1"][
+        1
+    ].item() == pytest.approx(0.2)
     qsa_mod._qsa_collect_dump()
     # outside a TP group the rank falls back to the pid: any rank file proves
     # the dump contract
@@ -391,9 +412,7 @@ def test_collector_caches_rank_across_distributed_teardown(tmp_path, monkeypatch
     monkeypatch.setattr(qsa_mod, "_qsa_collect_state", {})
     monkeypatch.setattr(qsa_mod, "_qsa_collect_calls", 0)
     monkeypatch.setattr(qsa_mod, "_qsa_collect_rank", None)
-    monkeypatch.setattr(
-        dist_mod, "get_tensor_model_parallel_rank", lambda: 3
-    )
+    monkeypatch.setattr(dist_mod, "get_tensor_model_parallel_rank", lambda: 3)
     qsa_mod._qsa_collect_absmax("l0", torch.tensor([1.0]), torch.tensor([1.0]))
     qsa_mod._qsa_collect_dump()
     assert (tmp_path / "qsa_absmax_rank3.json").is_file()
@@ -401,9 +420,7 @@ def test_collector_caches_rank_across_distributed_teardown(tmp_path, monkeypatch
     def _boom():
         raise RuntimeError("distributed already destroyed")
 
-    monkeypatch.setattr(
-        dist_mod, "get_tensor_model_parallel_rank", _boom
-    )
+    monkeypatch.setattr(dist_mod, "get_tensor_model_parallel_rank", _boom)
     qsa_mod._qsa_collect_dump()
     # still the rank name, no pid-named duplicate
     assert (tmp_path / "qsa_absmax_rank3.json").is_file()
