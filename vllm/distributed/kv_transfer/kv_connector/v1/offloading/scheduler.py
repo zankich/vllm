@@ -639,8 +639,9 @@ class OffloadingConnectorScheduler:
         sliding_window_groups.sort(key=_sliding_window_sort_key, reverse=True)
 
         # used by _lookup
+        self._full_attention_groups: tuple[int, ...] = tuple(full_attention_groups)
         self._sliding_window_groups: tuple[int, ...] = tuple(sliding_window_groups)
-        self._lookup_groups = tuple(full_attention_groups) + self._sliding_window_groups
+        self._lookup_groups = self._full_attention_groups + self._sliding_window_groups
         self._mamba_align_size: int | None = resolve_mamba_align_size(
             spec, kv_cache_config
         )
@@ -1019,10 +1020,79 @@ class OffloadingConnectorScheduler:
         if complete_hit is None or not self.config.supports_partial_tail:
             return complete_hit
 
+        # A recurrent "align" group keeps one state per producer request, at
+        # that prompt's tail, so it rarely has a state at a full-attention
+        # chunk boundary; requiring every group to hit at the chunk grid
+        # hides every partial tail beyond the first recurrent block and no
+        # cross-restart restore can assemble on a hybrid model. Anchor the
+        # boundary search on the full-attention complete chunks alone and
+        # check the remaining groups only at the candidate boundary, where
+        # their state actually lives. Eagle groups opt out: their
+        # volatile-tail widening lives in _lookup_complete_chunks and the
+        # per-group probe here would under-query them.
+        full_attention_hit: int | None = complete_hit
+        if self._full_attention_groups and not any(
+            self.config.kv_group_configs[idx].is_eagle_group
+            for idx in self._full_attention_groups
+        ):
+            full_attention_hit = None
+            for idx in self._full_attention_groups:
+                group_config = self.config.kv_group_configs[idx]
+                group_state = req_status.group_states[idx]
+                tokens_per_chunk = group_config.tokens_per_chunk
+                local_tokens = req_status.num_locally_computed_tokens
+                hit_ceiling = req_status.req.num_tokens
+                if max_num_new_tokens is not None:
+                    hit_ceiling = min(hit_ceiling, local_tokens + max_num_new_tokens)
+                if req_status.max_load_tokens is not None:
+                    # Mirrors _lookup_complete_chunks: under a load cap only
+                    # whole chunks inside the cap count.
+                    hit_ceiling = min(
+                        hit_ceiling, local_tokens + req_status.max_load_tokens
+                    )
+                    chunk_ceiling = hit_ceiling // tokens_per_chunk
+                else:
+                    chunk_ceiling = cdiv(hit_ceiling, tokens_per_chunk)
+                num_chunks = min(chunk_ceiling, len(group_state.offload_keys))
+                start_chunk_idx = local_tokens // tokens_per_chunk
+                probe: int | None
+                if num_chunks <= start_chunk_idx:
+                    probe = 0
+                else:
+                    probe = self._maximal_prefix_lookup(
+                        group_state.offload_keys[start_chunk_idx:num_chunks],
+                        req_status.req_context,
+                        req_status.req,
+                        group_config,
+                        start_chunk_idx,
+                    )
+                if probe is None:
+                    full_attention_hit = None
+                    break
+                if self._chunks_being_loaded and any(
+                    key in self._chunks_being_loaded
+                    for key in group_state.offload_keys[
+                        start_chunk_idx : start_chunk_idx + probe
+                    ]
+                ):
+                    # Mirrors the in-flight defer in _lookup_complete_chunks:
+                    # a chunk the anchor would use is being loaded.
+                    full_attention_hit = None
+                    break
+                group_hit = (start_chunk_idx + probe) * tokens_per_chunk - local_tokens
+                full_attention_hit = (
+                    group_hit
+                    if full_attention_hit is None
+                    else min(full_attention_hit, group_hit)
+                )
+        if full_attention_hit is None:
+            return None if complete_hit == 0 else complete_hit
+        anchor_hit = max(complete_hit, full_attention_hit)
+
         local_tokens = req_status.num_locally_computed_tokens
-        complete_boundary = local_tokens + complete_hit
+        anchor_boundary = local_tokens + anchor_hit
         tokens_per_hash = self.config.tokens_per_hash
-        block_end = complete_boundary + self._partial_tail_block_size
+        block_end = anchor_boundary + self._partial_tail_block_size
         max_boundary = min(req_status.req.num_prompt_tokens - 1, block_end - 1)
         if max_num_new_tokens is not None:
             max_boundary = min(max_boundary, local_tokens + max_num_new_tokens)
@@ -1032,11 +1102,11 @@ class OffloadingConnectorScheduler:
                 local_tokens + req_status.max_load_tokens,
             )
         max_boundary = round_down(max_boundary, tokens_per_hash)
-        if max_boundary <= complete_boundary:
+        if max_boundary <= anchor_boundary:
             return complete_hit
 
         pending = False
-        for boundary in range(max_boundary, complete_boundary, -tokens_per_hash):
+        for boundary in range(max_boundary, anchor_boundary, -tokens_per_hash):
             boundary_pending = False
             boundary_missed = False
             boundary_keys = []
