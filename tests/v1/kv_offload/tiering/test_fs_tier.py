@@ -1534,3 +1534,36 @@ def test_store_cross_check_partitions_mixed_batch(fs_tier, caplog):
     assert os.path.exists(tier.file_mapper.get_file_name(key(0)))
     assert not os.path.exists(tier.file_mapper.get_file_name(key(1)))
     assert any("cascade cross-check rejected" in r.message for r in caplog.records)
+
+
+def test_lookup_hits_across_manager_restart(tmp_path):
+    """Cross-restart restore contract: a block stored by one manager
+    instance must be found by a fresh instance over the same root_dir."""
+    tensor = _page_aligned_rand_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    mock_view = memoryview(tensor.numpy())
+
+    tier1 = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=mock_view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=4,
+        n_write_threads=4,
+    )
+    tier1.submit_store(make_job(1, [key(1)], [1]))
+    assert all(r.success for r in drain(tier1))
+    assert lookup_and_wait(tier1, [key(1)]) == [LookupResult.HIT]
+    tier1.shutdown()
+
+    tier2 = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=mock_view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=4,
+        n_write_threads=4,
+    )
+    assert lookup_and_wait(tier2, [key(1)]) == [LookupResult.HIT], (
+        "fresh manager over a populated root_dir must find stored blocks"
+    )
+    tier2.shutdown()
