@@ -62,7 +62,6 @@ from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
 
-
 logger = init_logger(__name__)
 
 _QSA_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
@@ -85,9 +84,7 @@ def _validated_qsa_fp8_dtype(cache_dtype: str) -> torch.dtype | None:
         )
     capability = current_platform.get_device_capability()
     if capability is None or capability.to_int() != 86:
-        cap_str = (
-            capability.as_version_str() if capability is not None else "unknown"
-        )
+        cap_str = capability.as_version_str() if capability is not None else "unknown"
         raise ValueError(
             "Qwen4Exp QSA E4M3 KV cache is validated only on SM86, but "
             f"{current_platform.get_device_name()} has compute capability "
@@ -176,9 +173,7 @@ def _parse_clip_env(name: str) -> float:
         value = float(raw) if raw else 0.0
     except ValueError as exc:
         # fail closed: a set-but-broken gate must not be silent
-        raise ValueError(
-            f"{name} must be an interval in seconds, got {raw!r}"
-        ) from exc
+        raise ValueError(f"{name} must be an interval in seconds, got {raw!r}") from exc
     if raw and not (math.isfinite(value) and value > 0.0):
         raise ValueError(
             f"{name} must be a finite positive number of seconds, got {raw!r}"
@@ -261,7 +256,7 @@ def _qsa_clip_reader() -> None:
 
 
 def _qsa_clip_count(
-    layer: "Qwen4ExpQSAAttention", key: torch.Tensor, value: torch.Tensor
+    layer: Qwen4ExpQSAAttention, key: torch.Tensor, value: torch.Tensor
 ) -> None:
     global _qsa_clip_reader_started, _qsa_clip_drain_registered
     if not _qsa_clip_on:
@@ -781,12 +776,7 @@ def load_qsa_static_kv_scales(
 
     The JSON schema is::
 
-        {
-          "model.layers.3.self_attn.attn": {
-            "k_scale": 0.25,
-            "v_scale": 2.0
-          }
-        }
+        {"model.layers.3.self_attn.attn": {"k_scale": 0.25, "v_scale": 2.0}}
 
     ``strict=False`` permits a deliberate subset; omitted layers keep the
     vLLM default scale of 1.0. Unknown names and non-scalar values are always
