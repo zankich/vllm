@@ -367,6 +367,7 @@ def _make_partial_tail_request(
     request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(num_hashes)]
     request.all_token_ids = list(range(num_tokens))
     request.lora_request = None
+    request.skip_reading_prefix_cache = False
     request.is_finished.return_value = False
     scheduler.on_new_request(request)
     return request
@@ -543,38 +544,6 @@ def test_normal_store_excludes_align_mode_mamba_sources():
     assert isinstance(src_spec, GPULoadStoreSpec)
     assert src_spec.block_ids.tolist() == [11]
     assert src_spec.group_sizes == [1, 0]
-
-
-def test_partial_lookup_returns_exact_boundary_and_group_load_keys():
-    # 2026-09-30: the partial tail is clamped to the chunk grid, so the
-    # exact boundary a full-hit lookup converges on is the last complete
-    # chunk (32), not the finest-grained boundary key (36).
-    scheduler = _make_partial_tail_scheduler()
-    request, req_status = _make_two_chunk_request(scheduler)
-    req_status.num_locally_computed_tokens = 0
-
-    scheduler.manager.lookup.return_value = LookupResult.HIT
-    assert scheduler._lookup(req_status) == 32
-
-    assert req_status.partial_tail_boundary is None
-
-    scheduler.update_state_after_alloc(
-        request,
-        KVCacheBlocks(
-            (
-                [KVCacheBlock(31), KVCacheBlock(32)],
-                [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
-            )
-        ),
-        num_external_tokens=32,
-    )
-    [load_job] = scheduler._current_batch_load_jobs.values()
-    dst_spec = load_job.dst_spec
-    assert isinstance(dst_spec, GPULoadStoreSpec)
-    assert dst_spec.block_ids.tolist() == [31, 32, 41]
-    assert dst_spec.group_sizes == [2, 1]
-    assert dst_spec.block_indices == [0, 1]
-    assert req_status.partial_tail_boundary is None
 
 
 def test_recurrent_group_unhashed_block_does_not_truncate_load_boundary():
@@ -4863,29 +4832,6 @@ def _stub_lookup_by_hash(scheduler, hit_hashes):
     scheduler.manager.lookup.side_effect = stub_lookup
 
 
-def test_partial_tail_lookup_clamps_to_chunk_grid():
-    """Regression (2026-09-30): a restore boundary landing mid-chunk
-    joined tier-sourced boundary keys with tier-sourced full chunks in
-    one assembly, and that shape corrupted output under live traffic
-    (6/6 over-claim restores garbled, boundary-key-only restores clean).
-    The lookup must never land a partial tail off the chunk grid: a
-    mid-chunk tail recomputes instead."""
-    scheduler = _make_partial_tail_scheduler()
-    request, req_status = _make_two_chunk_request(scheduler)
-    req_status.num_locally_computed_tokens = 0
-
-    # Chunks 0 and 1 hit (h3, h7), and a mid-chunk boundary key at 36
-    # (hash idx 8, 36 % 16 = 4) also hits. The walk may probe 36 only.
-    _stub_lookup_by_hash(scheduler, {3, 7, 8})
-
-    hit = scheduler._lookup(req_status)
-
-    # The mid-chunk boundary key is refused; the boundary stays at the
-    # complete-chunk extent and the partial tail recomputes.
-    assert hit == 32
-    assert req_status.partial_tail_boundary is None
-
-
 def test_partial_tail_lookup_keeps_chunk_aligned_hits():
     """Contract pin: chunk-grid-aligned hits keep flowing through the
     complete-chunk path with the grid clamp in place. With a locally
@@ -4901,3 +4847,253 @@ def test_partial_tail_lookup_keeps_chunk_aligned_hits():
 
     assert hit == 28  # 32 boundary - 4 locally computed
     assert req_status.partial_tail_boundary is None
+
+
+def test_sliding_window_group_accumulates_prefix_store_across_window_slide():
+    """RCA 2026-10-03: a sliding-window (linear-attention) group's GPU blocks
+    are the current window, cleared and re-extended every step, so its
+    block-id list is window-SIZED at position-LATEST. The store must map
+    those blocks to the newest chunk indices and accumulate a full-prefix
+    store as the window slides. If it instead treats the list as
+    prefix-indexed allocation, chunks past the first window are never
+    stored, the sliding lookup dies on the missing run, and no cross-restart
+    restore can ever fire on hybrid models (upstream #53569 class)."""
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler, num_tokens=140)
+    req_status = scheduler._req_status["req"]
+    stored: set = set()
+    scheduler.manager.lookup.side_effect = lambda key, ctx: (
+        LookupResult.HIT if key in stored else LookupResult.MISS
+    )
+    scheduler.manager.prepare_store.side_effect = lambda keys, ctx: (
+        generate_store_output(list(keys))
+    )
+
+    def complete_all_jobs():
+        job_ids = list(scheduler._jobs.keys())
+        for jid in job_ids:
+            stored.update(scheduler._jobs[jid].keys)
+        if job_ids:
+            scheduler.update_connector_output(
+                KVConnectorOutput(
+                    kv_connector_worker_meta=OffloadingWorkerMetadata(
+                        completed_jobs={jid: 1 for jid in job_ids}
+                    )
+                )
+            )
+
+    # Running phase: 8 prefill steps of one chunk each. The FA group's
+    # blocks accumulate; the sliding group's list is RECYCLED to the
+    # current window (one block) every step, per the engine's update.
+    for step in range(1, 10):
+        req_status.group_states[0].block_ids.append(100 + step)
+        req_status.group_states[1].block_ids[:] = [200 + step]
+        req_status.update_offload_keys()
+        out = SimpleNamespace(
+            num_scheduled_tokens={"req": 16},
+            finished_req_ids=set(),
+            kv_connector_block_state=KVConnectorBlockState(
+                req_ids=set(),
+                resolve_block_ids={}.__getitem__,
+                boundary_state_offloads={},
+            ),
+        )
+        request.num_computed_tokens = 16 * step
+        request.num_tokens = 140
+        scheduler._build_store_jobs(out)
+        complete_all_jobs()
+
+    request.is_finished.return_value = True
+    out = SimpleNamespace(num_scheduled_tokens={}, finished_req_ids={"req"})
+    scheduler._build_store_jobs(out)
+    # The recurrent group's store flows through the boundary hand-off: the
+    # engine reports the retained state at the prompt tail. Boundary 136 is
+    # the highest hash-aligned boundary the anchored walk can accept
+    # (max 139 rounded down to the hash unit of 4).
+    boundary_out = SimpleNamespace(
+        kv_connector_block_state=KVConnectorBlockState(
+            req_ids=set(),
+            resolve_block_ids={}.__getitem__,
+            boundary_state_offloads={"req": [(1, 300, 136)]},
+        )
+    )
+    scheduler._build_partial_tail_store_jobs(boundary_out)
+    complete_all_jobs()
+
+    # The FA group's complete-chunk prefix and both groups' tail-boundary
+    # keys must be on the tier.
+    fa_keys = req_status.group_states[0].offload_keys
+    assert len(fa_keys) == 8
+    assert all(k in stored for k in fa_keys), (
+        f"FA prefix incomplete: {sum(k in stored for k in fa_keys)}/8"
+    )
+    for group_idx in (0, 1):
+        key = scheduler._make_boundary_key(request, group_idx, 136)
+        assert key in stored, f"group {group_idx} boundary key missing"
+
+    # A second identical request must serve from the tier: the FA anchor
+    # spans the complete chunks and the boundary walk lands the tail.
+    request2 = _make_partial_tail_request(scheduler, num_tokens=140)
+    rs2 = scheduler._req_status["req"]
+    rs2.num_locally_computed_tokens = 0
+    rs2.update_offload_keys()
+    served = scheduler._lookup(rs2)
+    assert served == 136, f"cross-restart lookup served {served}"
+
+
+def _resident_lookup(hits: dict[int, set[bytes]]):
+    """Lookup side effect: HIT iff the key's hash is resident for its group."""
+
+    def lookup(key, req_context):
+        resident = hits.get(get_offload_group_idx(key), set())
+        return (
+            LookupResult.HIT
+            if get_offload_block_hash(key) in resident
+            else LookupResult.MISS
+        )
+
+    return lookup
+
+
+def _make_anchored_partial_tail_request(scheduler, hits, num_tokens=30):
+    """16-token chunks, hash 4: FA chunk [0,16) is h3, [16,32) is h7; a
+    30-token prompt's tail at 28 is h6. `hits` holds what each group has
+    resident; a recurrent group typically has its state only at the producer's
+    tail, never at a chunk boundary.
+    """
+    request = _make_partial_tail_request(scheduler, num_tokens=num_tokens)
+    req_status = scheduler._req_status["req"]
+    req_status.update_offload_keys()
+    scheduler.manager.lookup.side_effect = _resident_lookup(hits)
+    return request, req_status
+
+
+def test_partial_lookup_anchors_on_full_attention_prefix():
+    # No recurrent state at the chunk boundary 16, the common case: the search
+    # must still find the tail at 28 from the full-attention prefix alone.
+    scheduler = _make_partial_tail_scheduler()
+    _, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h6"}, 1: {b"h6"}}
+    )
+    assert scheduler._lookup(req_status) == 28
+    assert req_status.partial_tail_boundary == 28
+
+
+def test_partial_lookup_anchor_loads_only_verified_chunks():
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h6"}, 1: {b"h6"}}
+    )
+    assert scheduler._lookup(req_status) == 28
+    scheduler.update_state_after_alloc(
+        request,
+        KVCacheBlocks(
+            (
+                [KVCacheBlock(31), KVCacheBlock(32)],
+                [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
+            )
+        ),
+        num_external_tokens=28,
+    )
+    [load_job] = scheduler._current_batch_load_jobs.values()
+    assert [
+        (get_offload_group_idx(key), get_offload_block_hash(key))
+        for key in load_job.src_spec.offload_keys
+    ] == [(0, b"h3"), (0, b"h6"), (1, b"h6")]
+    assert isinstance(load_job.dst_spec, GPULoadStoreSpec)
+    assert load_job.dst_spec.block_ids.tolist() == [31, 32, 41]
+    assert load_job.dst_spec.group_sizes == [2, 1]
+    assert load_job.dst_spec.block_indices == [0, 1]
+
+
+def test_partial_lookup_returns_zero_without_stored_tail():
+    scheduler = _make_partial_tail_scheduler()
+    _, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3"}, 1: set()}
+    )
+    assert scheduler._lookup(req_status) == 0
+    assert req_status.partial_tail_boundary is None
+
+
+def test_partial_lookup_requires_resident_full_attention_prefix():
+    # Tail keys resident but the chunk [0,16) was evicted: reporting the tail
+    # would make the load request a missing chunk.
+    scheduler = _make_partial_tail_scheduler()
+    _, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h6"}, 1: {b"h6"}}
+    )
+    assert scheduler._lookup(req_status) == 0
+    assert req_status.partial_tail_boundary is None
+
+
+def test_partial_lookup_prefers_tail_over_aligned_recurrent_state():
+    scheduler = _make_partial_tail_scheduler()
+    _, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h6"}, 1: {b"h3", b"h6"}}
+    )
+    assert scheduler._lookup(req_status) == 28
+
+
+def test_partial_lookup_defers_while_anchor_chunk_is_loading():
+    scheduler = _make_partial_tail_scheduler()
+    _, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h6"}, 1: {b"h6"}}
+    )
+    scheduler._chunks_being_loaded.add(req_status.group_states[0].offload_keys[0])
+    assert scheduler._lookup(req_status) is None
+    assert req_status.partial_tail_boundary is None
+
+
+def test_partial_lookup_defers_while_anchor_chunk_is_pending():
+    # The chunk the tail depends on is still being written: wait for it rather
+    # than report 0 and forfeit the tail.
+    scheduler = _make_partial_tail_scheduler()
+    _, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h6"}, 1: {b"h6"}}
+    )
+    resident = scheduler.manager.lookup.side_effect
+
+    def lookup(key, req_context):
+        if get_offload_group_idx(key) == 0 and get_offload_block_hash(key) == b"h3":
+            return LookupResult.HIT_PENDING
+        return resident(key, req_context)
+
+    scheduler.manager.lookup.side_effect = lookup
+    assert scheduler._lookup(req_status) is None
+    assert req_status.partial_tail_boundary is None
+
+
+def test_partial_lookup_anchor_spans_multiple_complete_chunks():
+    # 46-token prompt: chunks [0,16) and [16,32) resident, tail at 44, no
+    # recurrent state at 16 or 32. The bug as seen in production: the tail
+    # lies beyond the first chunk and the complete-chunk anchor is 0.
+    scheduler = _make_partial_tail_scheduler()
+    _, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h7", b"h10"}, 1: {b"h10"}}, num_tokens=46
+    )
+    assert scheduler._lookup(req_status) == 44
+    assert req_status.partial_tail_boundary == 44
+
+
+def test_partial_lookup_anchor_honours_max_num_new_tokens():
+    scheduler = _make_partial_tail_scheduler()
+    request, _ = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h4", b"h6"}, 1: {b"h4", b"h6"}}
+    )
+    # tails at 20 and 28 are both resident; the cap admits only 20
+    assert scheduler.get_num_new_matched_tokens(request, 0, max_num_new_tokens=20) == (
+        20,
+        True,
+    )
+    assert scheduler._req_status["req"].partial_tail_boundary == 20
+
+
+def test_partial_lookup_anchor_after_gpu_prefix_hit():
+    # The first chunk is already on the GPU; the anchor starts there and the
+    # tail is found without any recurrent state at the chunk boundary.
+    scheduler = _make_partial_tail_scheduler()
+    request, _ = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h6"}, 1: {b"h6"}}
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 16) == (12, True)
+    assert scheduler._req_status["req"].partial_tail_boundary == 28
