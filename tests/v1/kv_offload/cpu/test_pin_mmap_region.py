@@ -10,6 +10,7 @@ the registration path on the same region file must not overlap their
 cudaHostRegister sections (the observed 3090 Ti TP2 failure mode).
 """
 
+import contextlib
 import fcntl
 import os
 import time
@@ -157,3 +158,75 @@ def test_registration_serializes_two_ranks_on_shared_region(tmp_path):
                 child.terminate()
                 child.join(timeout=10)
         mgr.shutdown()
+
+
+def test_region_registration_lock_keeps_shared_liveness_mark(monkeypatch, tmp_path):
+    """The registration context must re-acquire LOCK_SH on exit.
+
+    Every participant holds a LOCK_SH on the region fd for the engine's
+    lifetime, and `_reclaim_orphaned_regions` probes that lock to tell a
+    live region from an orphan. The barrier flow unlinks the path on
+    barrier release, but the tiering flow does not, so the boot-time
+    LOCK_SH is the only thing protecting the full-size on-disk region
+    from a concurrent engine's reclaim sweep.
+
+    The registration context upgrades to LOCK_EX for the cudaHostRegister
+    critical section. If it leaves the fd unlocked on exit, a reclaim
+    sweep that wins the race between the last worker's release and the
+    scheduler's LOCK_SH can unlink the path while workers still hold
+    mappings. The fix re-acquires LOCK_SH on exit, mirroring
+    `_hold_shared_lock` in shared_offload_region.
+    """
+    cudart = MagicMock()
+    cudart.cudaHostRegister.return_value = 0
+    cudart.cudaHostUnregister.return_value = 0
+    monkeypatch.setattr(gpu_worker, "CudaRTLibrary", lambda: cudart)
+    monkeypatch.setattr(gpu_worker.current_platform, "is_cuda_alike", lambda: True)
+
+    region_path = tmp_path / "region"
+    region_path.write_bytes(b"\0" * 4096)
+    # Two independent fds to the same file: region.fd for registration,
+    # observer_fd to probe the lock state from the side.
+    region_fd = os.open(region_path, os.O_RDWR)
+    observer_fd = os.open(region_path, os.O_RDWR)
+    try:
+        # Mimic the boot-time LOCK_SH that _hold_shared_lock establishes
+        # when the region is opened. fcntl.flock on the region fd must
+        # hold for the engine's lifetime.
+        fcntl.flock(region_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+
+        region = _make_region(fd=region_fd)
+        gpu_worker.pin_mmap_region(region)
+        assert region.is_pinned
+
+        # After registration the region fd must still hold its shared
+        # liveness mark: an observer trying to take LOCK_EX on a
+        # separate open file description of the same file must fail.
+        try:
+            fcntl.flock(observer_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            pass  # expected: the shared liveness mark blocks the exclusive
+        else:
+            # The exclusive probe succeeded, which means the region fd
+            # was left unlocked after registration exited. Release the
+            # observer's lock and the region's (no-op) lock before
+            # letting the finally block close both fds and reporting
+            # the failure.
+            fcntl.flock(observer_fd, fcntl.LOCK_UN)
+            fcntl.flock(region_fd, fcntl.LOCK_UN)
+            pytest.fail(
+                "region fd was left unlocked after _region_registration_lock "
+                "exited; a concurrent reclaim sweep could unlink the path"
+            )
+
+        # The shared liveness mark is intact: the region fd holds a
+        # shared lock and the observer's exclusive probe above raised.
+        # Release both before the finally block closes the fds.
+        fcntl.flock(region_fd, fcntl.LOCK_UN)
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(observer_fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            fcntl.flock(region_fd, fcntl.LOCK_UN)
+        os.close(observer_fd)
+        os.close(region_fd)

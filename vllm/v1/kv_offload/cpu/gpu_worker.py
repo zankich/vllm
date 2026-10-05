@@ -211,11 +211,15 @@ def _region_registration_lock(region: SharedOffloadRegion):
     could itself be orphaned by a crash.
 
     The LOCK_EX conversion replaces the fd's boot-time LOCK_SH liveness
-    mark, and LOCK_UN releases the lock without restoring it: the fd ends
-    this context unlocked. Safe because registration runs after the
-    creator's post-barrier unlink of the region path, so the orphan
-    reclaimer has no path to probe; both locks matter only inside the
-    boot window.
+    mark for the duration of the critical section, then the fd re-acquires
+    the shared mark on release. The exclusive lock serializes registration
+    across ranks, and the re-acquired shared mark is what tells the orphan
+    reclaimer the region is still live. The barrier flow unlinks the path
+    on barrier release, but the tiering flow never unlinks it, so the
+    shared mark held by every participant for the engine's lifetime is the
+    only thing keeping a concurrent engine's reclaim sweep from unlinking
+    a full-size on-disk region between the last worker's release and the
+    scheduler's own LOCK_SH in its later SharedOffloadRegion construction.
     """
     if region.fd is None:
         yield
@@ -224,7 +228,14 @@ def _region_registration_lock(region: SharedOffloadRegion):
     try:
         yield
     finally:
+        # Mirror _hold_shared_lock in shared_offload_region: release the
+        # exclusive lock and re-acquire the boot-time shared liveness mark
+        # before any other code path can see an unlocked fd. The
+        # non-blocking re-acquire cannot fail while the fd holds no other
+        # lock, so an OSError here means the kernel state is broken and
+        # we let it propagate.
         fcntl.flock(region.fd, fcntl.LOCK_UN)
+        fcntl.flock(region.fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
 
 
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
