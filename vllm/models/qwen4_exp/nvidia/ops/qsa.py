@@ -697,10 +697,9 @@ def qsa_sparse_paged_attention(
     _select_config.
 
     This function is an UNCHECKED INTERNAL PRIMITIVE with respect to hardware
-    support: the sm_86 validation gate is enforced once, at attention
-    construction, and a direct caller can pass an FP8 cache on any device. The
-    integer decode is arch-independent, so it will not fault, but it has only
-    been validated on sm_86.
+    support: a direct caller can pass an FP8 cache on any device. The
+    integer decode is arch-independent, so it will not fault, but it has
+    only been validated on sm_86.
     """
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
