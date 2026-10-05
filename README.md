@@ -1,4 +1,96 @@
 <!-- markdownlint-disable MD001 MD041 -->
+<!-- fork-preamble-start -->
+# zankich/vllm — fork of vllm-project/vllm
+
+Fork of vLLM carrying model-specific enablement and
+fixes (Qwen3.8-27B, Qwen3.8-Flash-Next, Gemma-4) plus cross-model
+patches for KV-offload correctness, FlashInfer on SM8x, and the
+Anthropic `/v1/messages` endpoint. Upstream vLLM is excellent;
+this fork exists to carry fixes that had not shipped in a release at
+deploy time. See what this fork changes with:
+
+```bash
+git log v0.31.0..HEAD --oneline        # everything on top of the tag
+git log v0.31.0..HEAD --stat          # full delta of the upstream tag
+```
+
+## Branches
+
+- `v0.31.0z` (default) — current, on the v0.31.0 tag; carries the cross-model integrity, anchor, and all-reduce patches plus the Qwen3.8 27B and Flash-Next enablement from v0.30.0z retargeted onto v0.31.0. Serving validation is pending until Adrian reports it
+
+## Cross-model patches
+
+Apply to every model this fork serves.
+
+| commit | what it does | origin |
+| --- | --- | --- |
+| `Fix intermittent offload-region pinning failure` | concurrent `cudaHostRegister` of the shared region across TP ranks is flock-serialized, upstream's chunked registration from [#51081](https://github.com/vllm-project/vllm/pull/51081) drains and rolls back a failed chunk, and the region then stays pageable with a warning | fork-local, no upstream fix at port time |
+| `Reclaim orphaned offload regions` | a SIGKILL'd engine leaks `/dev/shm/vllm_offload_*.mmap`, wedging the next boot on shared `/dev/shm`; sweep at construction reclaims regions whose exclusive flock can be taken (port of upstream [#54124](https://github.com/vllm-project/vllm/pull/54124), closed unmerged) | [upstream PR #54124](https://github.com/vllm-project/vllm/pull/54124), adapted |
+| `Surface per-request spec-decode metrics on the Anthropic messages API` | `--per-request-spec-decode-metrics` stats reach `/v1/chat/completions` upstream but were dropped by the `/v1/messages` converter; both the response and the final `message_delta` stream event now carry the same `metrics.speculative_decoding` field | fork-local |
+| `anthropic streaming: split usage on every chunk, map engine error codes` | `message_start` carried `input_tokens` = the whole prompt because the OpenAI generator attached `prompt_tokens_details` only to the final usage chunk even though the cache counts are read at first_iteration, while `message_delta` carried the split — at `prompt == cached + created` a field-wise client merge kept the whole prompt next to cache fields that also sum to it, so Claude Code counted 2x the prompt and compacted at half the true context (72 of 938 streams in the evidence window). The generator now stamps the details on every continuous usage chunk, only when non-None so flag-off wire output stays byte-identical; both events agree by construction and nothing is buffered. Engine error chunks in the internal stream failed `ChatCompletionStreamResponse` validation and leaked the pydantic dump with the message truncated; the converter now closes any open block and emits an Anthropic error event with the code mapped to a type (503/529 → `overloaded_error`, 422 → `invalid_request_error`, else the standard map) and the message verbatim, while every other failure still lands in the outer handler | fork-local |
+| `Bind fs-tier blocks to their keys, detect replaced storage` | the tier's files were content-addressed by path only: full-length wrong-for-key bytes restored silently (a real incident class — index/path confusion, replaced storage, pruner-damaged trees). Each store records a key-bound checksum in a `user.vllm_kv_integrity` xattr on the payload (sidecars in an earlier revision — same record bytes, xattr carrier halves the inodes and leaves nothing for the pruner to orphan); loads verify before and after the read, transient errors (ELOOP/EACCES/EIO) fail without deletion, and a payload whose storage identity changed under a live engine rejects the whole job to a cold recompute. Never partial trust. Construction probes xattr support and fails loud rather than silently missing | fork-local, Linux-only |
+| `fs tier: cascade cross-check at store time` | store-side self-verification closing the blind spot the load-side integrity could never see: it binds a key to the bytes AS STORED, so a mislabel at write time (foreign KV persisted under a correct key) verifies clean forever. The fs store now compares the bytes it persists against the primary tier's recorded slot checksum for the same key and refuses the write on divergence — a refusal costs a miss and recompute, a silent write costs permanent poison. `verify_stored_slot` on the CPU tier is the source; the tiering manager wires it into any tier declaring the slot | fork-local |
+| `offloading: anchor the partial-tail lookup on the full-attention prefix` | a recurrent align group keeps one state per producer request at that prompt's tail, so requiring every group to hit at the complete-chunk grid hid every partial tail beyond the first recurrent block and no cross-restart restore could ever assemble on hybrid models — measured live: zero restore bytes across four eval shapes while stores flowed and the full-attention group hit alone. The lookup now anchors the search on the full-attention complete chunks and checks the recurrent groups only at the candidate boundary, where their state actually lives, and honors the per-request `max_load_tokens` cap from upstream [#55885](https://github.com/vllm-project/vllm/pull/55885). Live gate on the 27B hybrid: 211 MB restored across a cold restart, temp-0 output byte-identical between the cold prefill and the tier-restored prefill | fork-local minimal anchor; matches the open upstream bug [vllm-project/vllm#53569](https://github.com/vllm-project/vllm/issues/53569), approach after [vllm-project/vllm#58618](https://github.com/vllm-project/vllm/pull/58618) |
+| `fs tier: stop re-minting integrity records over skipped payloads` | the batch store skips writing payloads whose files already exist, but the record mint ran unconditionally from the live view — a cascaded re-store of a key whose recompute quantized differently (FP8 KV) bound the record to bytes that never reached the file, and every later load failed the checksum deterministically, was removed, and the next cascade re-poisoned the fresh file (recurring mismatch bursts on the same block digests). The store now mints only for files absent before the batch write; removals log `integrity-<reason> removed <path>`; definite-corruption removals emit `OffloadingEvent(removed=True)` so the pruner feed learns the key died; a post-check mismatch carries `num_succeeded` so the verified prefix keeps its verdict | fork-local |
+| `CPU shm tier: in-memory slot checksums` | post-store slot clobber, aliasing, and torn writers had no detection anywhere in the cascade. `complete_store` records `sha256(key, slot bytes)`; lookup re-verifies once per key per request and a mismatch answers MISS (nothing downstream can crash or misalign), evicts the corrupt block, and emits a removal event. In-memory carrier — the CPU tier has no cross-restart reuse, regions die with their engine | fork-local |
+| `OffloadingConnector: per-request restore-accounting line` | one INFO line per restore with external hits carrying the assembly arithmetic (`prompt`/`local`/`ext`/`boundary`/`keys`/`chunk`) plus ERROR violations on boundary-exceeds-prompt and keys-cannot-cover — the correlation instrument for restore-shape debugging | fork-local |
+| `CPU tier: pin lookup-confirmed hits until load or finish` | store completions and their LRU evictions run on transfer threads asynchronously from the scheduler thread, so an unpinned lookup-confirmed hit could vanish between the connector's confirming lookup and prepare_load — a fatal `Block ... not found in cache` under restore-heavy load, and the mechanism behind repeated corrupt-output incidents (verified end to end under adversarial load before landing). A confirmed HIT now pins (ref_cnt-like, insertion-ordered per request); prepare_load's ref count takes the pin over, never-loaded pins release at request finish, and the corrupt-block reject path accounts for pins. Pressure against pinned keys surfaces as store refusal, never as key disappearance. Latent in stock. The take-over keys on the tier-wide pin set, not the loading request's own pin list — a second request whose lookup confirmed an already-pinned key (shared prefix, concurrent requests) never grew a pin list and previously died at `mark_non_evictable` with a KeyError | fork-local |
+| `custom all-reduce: P2P-aware fully-connected probe, expert-parallel group` | two coordinated changes: `NvmlCudaPlatform.is_fully_connected` accepts generic P2P read/write when NVLink is absent (stock requires NVLink specifically, rejecting PCIe-only boxes whose every pair has working P2P from the one-shot IPC path at world_size > 2 — measured +4.5% decode at TP2 over PCIe P2P), and `group_allows_custom_allreduce()` lets the `ep` group build CustomAllreduce alongside `tp` (#54371's ETP-scoped prefix gate excluded it as collateral; decode-time MoE combine all-reduces then pay the NCCL latency floor). The dispatch chain still falls through to PYNCCL on size/dtype gates, so large combines keep the ring path. Supersedes the ple-int4 plugin's TP4 force, which returned True unconditionally instead of probing. Mutually exclusive with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments` (workers die at custom_all_reduce.cuh:164) | fork-local |
+
+## Qwen3.8 patches
+
+### 27B stack
+
+| commit | what it does | origin |
+| --- | --- | --- |
+| `Enforce thinking-budget wrap-up sentence` | prepends a pre-tokenized wrap-up sentence to the forced `</think>` close at thinking-budget exhaustion, with a spec-decode-resync fix so multi-token wrap-ups survive MTP rejection sampling; Anthropic `/v1/messages` `thinking.budget_tokens` maps to `thinking_token_budget`. dormant unless `VLLM_THINKING_WRAPUP_TOKEN_IDS` is set | fork-local |
+
+### Flash-Next
+
+The in-tree PLE formats are BF16 and FP8 only, and the FP8 table pins
+~48 GiB of host RAM — and its pinned-lookup kernel is fp8e4nv-native
+Triton, which SM8x rejects at compile (no fallback; `_reduce_etp_`
+all-reduces raw fp8 bytes on the same Hopper assumption), so on Ampere
+the stock FP8 PLE is unservable outright. Both reasons point
+memory-constrained Ampere hosts at the int4 PLE plugin from this
+repo's `ple-int4/` (`vllm.general_plugins` entry point; on a non-int4
+config set `VLLM_PLUGINS=""` to unbind it and get truly stock
+behavior).
+
+| commit | what it does | origin |
+| --- | --- | --- |
+| `QSA: FP8 E4M3 KV on SM86 with a static per-layer scale sidecar` | Port of halt95's reader design to this fork's Qwen4Exp QSA kernel: the E4M3 bytes decode in software below SM89 under upstream's native FP8 QSA kernel from [#55557](https://github.com/vllm-project/vllm/pull/55557), which serves SM89+ directly, and the scales arrive as host floats folded into the softmax and output scales — bit-exact on all 254 finite codepoints, E4M3 subnormals included. Static scalar scales ride `layer._k_scale`/`_v_scale` (stock `reshape_and_cache_flash` write path quantizes unchanged): `k_scale` folds into the score multiply, `v_scale` into the attention epilogue, scalar-exact and split-K safe through the linear LSE merge. `VLLM_QSA_KV_SCALES` applies a strict sidecar after weight load (partial/unknown/non-positive entries fail loudly); the MTP drafter's QSA layer serves at scale 1.0 by design. Measured on the int4-PLE checkpoint at TP4: 317,406-token pool at the 2.5 GiB pin (1.84x bf16) with `max-model-len auto` resolving native 262,144; eval-parity at margins 1.10 and 1.20 against the bf16 reference | port of [halt95/qwen38-flash-next-3090s](https://github.com/halt95/qwen38-flash-next-3090s) v1 patches 0001/0002/0004 (Apache-2.0), re-derived against this fork's compressor-era store path; scales calibrated on the int4-PLE checkpoint, k_scales within 1-2% of their Merlin sidecar |
+| `QSA: KV clip counter and absmax calibration tooling` | Runtime under-coverage guard for the sidecar: counts K/V elements that would saturate E4M3 after scaling (`VLLM_QSA_KV_CLIP_COUNT`), drains per-layer totals once at engine shutdown — reading only where concurrency cannot exist — with a live reader behind `VLLM_QSA_KV_CLIP_READER` restricted to diagnostic `--enforce-eager` boots, per halt95's 0073 operator ruling (a live reader thread can never be safe alongside cudagraph capture: cross-thread syncs, pinned allocations, stream creation and event queries are all illegal or hazardous during capture, and no API exposes capture state to another thread). `VLLM_QSA_KV_COLLECT` + `calib/` produce the sidecar: per-rank running absmax dumps, fail-closed merge (`scale = absmax × margin / 448`), and a launch script mirroring the production entry with the calibration deltas (eager, no MTP, no prefix caching) | port of halt95's collector/counter design with their calibration tooling adapted; margin 1.10 rationale from their clip-count measurements |
+
+## Gemma-4 patches
+
+Gemma-4 (31B-it, W8A16 + FP8-KV checkpoints) has a 256-dim QK head and
+512-dim value head — FlashInfer's large-head class. Two serving modes
+on SM8x: FlashInfer text-only (`--language-model-only`, e4m3 KV with
+the calibrated scales), or Triton multimodal (image support, e5m2 KV —
+FlashInfer does not support this model's multimodal attention). With
+both opt-ins below, the full stack serves: MTP (the Gemma assistant
+drafter), fp8 KV, and tiered CPU + fs KV offload on the same
+cross-model integrity and pin patches above. Validated on v0.29.0z
+under warm/churn/extend restore traffic with the restore-accounting
+instrumentation reading full coverage; v0.31.0z has not booted Gemma-4
+(weights absent) and awaits revalidation.
+
+| commit | what it does | origin |
+| --- | --- | --- |
+| `flashinfer: widen the SM8 large-head opt-in to fp8 one-byte KV` | FlashInfer gates all one-byte-KV large-head (head_dim > 256 on either QK or VO) FA2 modules to SM100+ and its only SM8 opt-in (`allow_nvfp4_sm8_large_head`) is not recognized for fp8, so Gemma-4's 512-dim value head under fp8 KV fails JIT on SM8x with "No supported CUDA architectures found". `install_sm8_fp8_large_head_optin()` in `vllm.utils.flashinfer` extends the opted-in prefill path to fp8_e4m3/e5m2; nvfp4 semantics and non-opted-in paths unchanged; the FlashInfer backend installs it at import and a layout drift raises instead of silently serving the gate | fork-local |
+| `triton attention: serve FP8 KV on SM80+ via e5m2 storage` | FlashInfer does not support this model's multimodal attention and FLASH_ATTN rejects FP8 KV below SM90, so TRITON_ATTN is the only backend that serves Gemma-4 image support on pre-SM100 GPUs — and stock gates its FP8 KV path to SM89+ (triton cannot compile fp8e4nv below SM89). The gate widens to SM80+; below SM89 the quantized KV serves as e5m2 (selected by `kv_fp8_dtype_for_platform`), the cache-store wrappers quantize in torch with round-to-nearest-even (`quantize_kv_e5m2_sm80` — triton's implicit e5m2 cast rounds ties away from even), and large-head prefill tiles stage within SM80/86 shared memory (num_stages 1, halved tile for head_dim > 256). fp8_e5m2 with a calibrated kv_cache_scheme stays permitted below SM89 (e4m3-calibrated scales add mantissa noise but no range risk) and keeps raising on SM89+ | fork-local |
+
+## Rebase policy
+
+Each upstream release: check which patches upstream has absorbed
+(`git merge-base --is-ancestor <upstream-sha> <tag>`), re-port the rest.
+Patches here exist to be deleted — the permanent fixes are the
+fork-local ones until upstream takes them.
+
+<!-- fork-preamble-end -->
+
+<!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
