@@ -2,6 +2,9 @@
 #
 # usage:  scripts/build-fork-image.sh [--no-cache] [tag]
 # default tag: zankich/vllm-openai:0.30.0z
+# the default build also stamps zankich/vllm-openai:latest so the manual
+# push publishes both. an explicit tag argument never touches latest:
+# experiment builds must not repoint what latest tracks.
 #
 # regenerates forks/v0.30.0z.patch from the current tree (so a freshly
 # committed source change is always baked in), builds the Dockerfile at
@@ -18,7 +21,14 @@ if [[ "${1:-}" == "--no-cache" ]]; then
     shift
 fi
 
-TAG="${1:-zankich/vllm-openai:0.30.0z}"
+DEFAULT_TAG="zankich/vllm-openai:0.30.0z"
+TAG="${1:-$DEFAULT_TAG}"
+
+# latest only on the canonical stable build, never on experiment tags
+EXTRA_TAGS=()
+if [[ "$TAG" == "$DEFAULT_TAG" ]]; then
+    EXTRA_TAGS+=(-t "${TAG%%:*}:latest")
+fi
 
 # the diff is from vanilla vLLM (the upstream base) to the fork tip.
 # the upstream base is the vLLM v0.30.0 image, NOT this branch.
@@ -34,7 +44,12 @@ mkdir -p forks
 git diff v0.30.0 v0.30.0z -- vllm/ >forks/v0.30.0z.patch
 echo "patch: forks/v0.30.0z.patch ($(wc -l <forks/v0.30.0z.patch) lines)"
 
-docker build $NO_CACHE -t "$TAG" -f Dockerfile "$REPO_ROOT"
+docker build $NO_CACHE -t "$TAG" "${EXTRA_TAGS[@]}" -f Dockerfile "$REPO_ROOT"
 
 echo "built: $TAG"
-echo "push manually: docker push $TAG"
+if [[ ${#EXTRA_TAGS[@]} -gt 0 ]]; then
+    echo "built: ${TAG%%:*}:latest (same image)"
+    echo "push manually: docker push $TAG && docker push ${TAG%%:*}:latest"
+else
+    echo "push manually: docker push $TAG"
+fi
