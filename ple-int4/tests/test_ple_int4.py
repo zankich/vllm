@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -301,6 +302,17 @@ def test_int4_layer_constructs_with_bf16_prefetch_buffer():
         layer.embedding_dim,
     )
     assert layer._prefetch_stream is not None
+
+
+def test_install_refuses_on_common_ngram_drift(monkeypatch):
+    """The PLE base classes the plugin subclasses live in common/ since
+    v0.31.0; drift there must refuse install like drift in nvidia/."""
+    import ple_int4
+
+    monkeypatch.setattr(ple_int4, "PINNED_COMMON_NGRAM_SHA256", "0" * 64)
+    ple_int4.uninstall()
+    with pytest.raises(RuntimeError, match="common/ngram_embedding.py"):
+        ple_int4.install()
 
 
 if __name__ == "__main__":
