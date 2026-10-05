@@ -1302,6 +1302,14 @@ class OffloadingConnectorScheduler:
                     full_group_capacity += (
                         end_chunk_idx - start_chunk_idx
                     ) * tokens_per_chunk
+                    if partial_tail_boundary is not None:
+                        # The boundary key covers the tail tokens past the
+                        # last complete chunk: include its extent so the
+                        # capacity invariant covers the full ext on
+                        # partial-tail restores.
+                        full_group_capacity += (
+                            partial_tail_boundary - end_chunk_idx * tokens_per_chunk
+                        )
                     has_full_group = True
 
             dst_block_ids.extend(
