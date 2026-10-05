@@ -36,14 +36,19 @@ _LOCK = threading.Lock()
 _INSTALLED = False
 
 # SHA-256 of the installed vllm/models/qwen4_exp/nvidia/ngram_embedding.py
-# that this plugin was authored against (v0.31.0 base; the PLE base classes
-# the plugin subclasses live in vllm/models/qwen4_exp/common/ngram_embedding.py
-# since #57497, and that module is pinned in a separate constant added in the
-# follow-up commit). The pinned nvidia file still constructs
-# Qwen4ExpPLEPinnedHostEmbedding through its own module globals (lines 203 to
-# 212), so the global rebind, classmethod patch and load_weights replacement
-# keep working.
+# that this plugin was authored against (v0.31.0 base). The pinned nvidia
+# file still constructs Qwen4ExpPLEPinnedHostEmbedding through its own
+# module globals (lines 203 to 212), so the global rebind, classmethod
+# patch and load_weights replacement keep working.
 PINNED_NGRAM_SHA256 = "7c3f00b5b77b364062dd28b49f3fc43c52fd74b7b0d63a32870937eb10ff16e4"
+
+# SHA-256 of the vllm/models/qwen4_exp/common/ngram_embedding.py module
+# that holds the PLE base classes the plugin subclasses. Upstream #57497
+# moved the base classes out of nvidia/ngram_embedding.py into this common
+# module; drift here must refuse install just like drift in nvidia/ does.
+PINNED_COMMON_NGRAM_SHA256 = (
+    "1392f51ccf0b610542bf05c3021271bf6754221d9616ff92831b94f79fc3a892"
+)
 
 _ORIGINALS: dict[str, object] = {}
 
@@ -74,6 +79,20 @@ def install() -> None:
                 f"nightly (got sha256 {actual[:16]}..., pinned "
                 f"{PINNED_NGRAM_SHA256[:16]}...). Re-author the patches against "
                 "the installed wheel or pin the matching nightly."
+            )
+
+        import vllm.models.qwen4_exp.common.ngram_embedding as common_ng
+
+        actual_common = _sha256_of_source(common_ng)
+        if (
+            PINNED_COMMON_NGRAM_SHA256 != "TODO"
+            and actual_common != PINNED_COMMON_NGRAM_SHA256
+        ):
+            raise RuntimeError(
+                "ple_int4: vLLM's common/ngram_embedding.py does not match the "
+                f"pinned nightly (got sha256 {actual_common[:16]}..., pinned "
+                f"{PINNED_COMMON_NGRAM_SHA256[:16]}...). Re-author the patches "
+                "against the installed wheel or pin the matching nightly."
             )
 
         original_fqc = ng.Qwen4ExpPLEEmbeddingMethod.from_quant_config
