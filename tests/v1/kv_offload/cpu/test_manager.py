@@ -1887,15 +1887,16 @@ def test_lookup_confirmed_hit_pinned_until_prepare_load(cache_policy):
 
 @pytest.mark.parametrize("cache_policy", ["lru", "arc"])
 def test_prepare_load_takes_over_foreign_lookup_pin(cache_policy):
-    """Regression (2026-09-29): request A's
-    lookup pinned a key; request B's lookup confirmed the same key HIT
-    without pinning it (the pin branch requires ``key not in
-    _lookup_pinned``), so B never grew a ``_load_pins`` list. B's
-    prepare_load then keyed its take-over branch on ``pins is not None``
-    and fell into ``mark_non_evictable`` on an already-non-evictable key:
-    ``KeyError`` in the LRU policy, a dead EngineCore. The contract:
-    whoever loads a pinned key takes the pin over, regardless of which
-    request created it."""
+    """Regression (2026-09-29): request A's lookup
+    pinned a key; request B's lookup confirmed the same key HIT. B's
+    prepare_load takes its own share of the pin over. Before the
+    refcount, B never grew a ``_load_pins`` list and the take-over
+    branch keyed on ``pins is not None`` and fell into
+    ``mark_non_evictable`` on an already-non-evictable key: a
+    ``KeyError`` in the LRU policy and a dead EngineCore. The
+    contract: whoever loads a pinned key consumes its share of the
+    pin, regardless of which request created it, and the set survives
+    if other confirmers still hold a share."""
     manager = make_cpu_manager(num_chunks=2, cache_policy=cache_policy)
     ctx_a = make_req_context("a")
     ctx_b = make_req_context("b")
@@ -1906,13 +1907,19 @@ def test_prepare_load_takes_over_foreign_lookup_pin(cache_policy):
 
     assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
     assert manager.lookup(to_key(1), ctx_b) is LookupResult.HIT
-    # B confirmed a foreign pin and must not have grown its own list.
-    assert getattr(ctx_b, "_load_pins", None) is None
+    # Both lookups record a share.
+    assert getattr(ctx_b, "_load_pins", None) is not None
+    assert to_key(1) in ctx_b._load_pins
     assert to_key(1) in manager._lookup_pinned
+    assert manager._lookup_pin_refs[to_key(1)] == 2
 
     spec = manager.prepare_load(to_keys([1]), ctx_b)
     assert spec is not None
-    assert to_key(1) not in manager._lookup_pinned
+    # B's share is consumed by the take-over; A's share keeps the set
+    # entry alive.
+    assert to_key(1) in manager._lookup_pinned
+    assert manager._lookup_pin_refs[to_key(1)] == 1
+    assert to_key(1) not in ctx_b._load_pins
     block = manager._policy.get(to_key(1))
     assert block.ref_cnt == 1
 
@@ -1945,6 +1952,71 @@ def test_pin_owner_finish_after_takeover(cache_policy):
     manager.complete_load(to_keys([1]), ctx_b)
     assert manager._policy.get(to_key(1)).ref_cnt == 0
     assert manager._num_evictable_cache_chunks == 1
+
+
+@pytest.mark.parametrize("cache_policy", ["lru", "arc"])
+def test_lookup_pin_refcount_holds_under_cross_request_finish(cache_policy):
+    """The cross-request pin must refcount, not just set. When two
+    requests both confirm a key HIT, the second confirmer holds a
+    share. The bare set releases the key on the first finisher even
+    though a second request still expects to load it: an evict-pressure
+    store then evicts the key and the pending prepare_load hits the
+    missing-chunk path. The refcount keeps the key non-evictable until
+    the last share releases."""
+    manager = make_cpu_manager(num_chunks=2, cache_policy=cache_policy)
+    ctx_a = make_req_context("a")
+    ctx_b = make_req_context("b")
+
+    # Key 1 stored and completed — the shared hit.
+    out = manager.prepare_store(to_keys([1]), ctx_a)
+    assert out is not None
+    manager.complete_store(to_keys([1]), ctx_a)
+
+    # A and B both confirm key 1 HIT. Both lookups record a share.
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+    assert manager.lookup(to_key(1), ctx_b) is LookupResult.HIT
+    assert to_key(1) in manager._lookup_pinned
+    assert manager._lookup_pin_refs[to_key(1)] == 2
+    assert to_key(1) in ctx_a._load_pins
+    assert to_key(1) in ctx_b._load_pins
+
+    # A finishes. B's share keeps the key non-evictable.
+    manager.on_request_finished(ctx_a)
+    assert to_key(1) in manager._lookup_pinned
+    assert manager._lookup_pin_refs[to_key(1)] == 1
+    assert manager._num_evictable_cache_chunks == 0
+
+    # Evict-pressure store: needs 1 eviction. The key is still pinned
+    # by B, so the store refuses rather than evicting the shared key.
+    pressure = manager.prepare_store(
+        to_keys([2, 3]), make_req_context("pressure")
+    )
+    assert pressure is None
+    assert manager._policy.get(to_key(1)) is not None
+
+    # B's pending load: the chunk is still there, and the spec includes
+    # it. Without the refcount, the pressure store above would have
+    # evicted the key and prepare_load would hit `assert chunk is not
+    # None`.
+    spec = manager.prepare_load(to_keys([1]), ctx_b)
+    assert spec is not None
+    assert isinstance(spec, CPULoadStoreSpec)
+    assert len(spec.chunk_ids) == 1
+    assert to_key(1) not in manager._lookup_pinned
+    assert to_key(1) not in manager._lookup_pin_refs
+
+    # B's load and finish release the last share. The key is evictable
+    # again.
+    manager.complete_load(to_keys([1]), ctx_b)
+    manager.on_request_finished(ctx_b)
+    assert manager._num_evictable_cache_chunks == 1
+
+    # A subsequent pressure store can now evict the key.
+    final = manager.prepare_store(
+        to_keys([2, 3]), make_req_context("final")
+    )
+    assert final is not None
+    assert to_key(1) in final.evicted_keys
 
 
 def test_verify_stored_slot_cross_check():
