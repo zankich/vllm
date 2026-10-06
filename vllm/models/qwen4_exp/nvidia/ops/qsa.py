@@ -187,7 +187,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             )
             keys = _decode_e4m3_to_bf16(key_bytes)
             values = _decode_e4m3_to_bf16(value_bytes)
-        elif KV_DTYPE in (1, 3):
+        elif KV_DTYPE == 1 or KV_DTYPE == 3:
             # Native e4m3 cast on SM89+ (mode 3) and the e5m2 path (mode 1).
             # e4m3/e5m2 -> Q dtype is exact; keep the QK dot in Q's dtype (fp8
             # QK measured slower and less accurate).
@@ -242,7 +242,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
-        if KV_DTYPE in (1, 3):
+        if KV_DTYPE == 1 or KV_DTYPE == 3:
             # Dequant V to fp16 (not bf16) for the PV dot on the native fp8
             # modes. The mode-2 software decode path has already produced BF16
             # values from _decode_e4m3_to_bf16, so it skips this upcast and
