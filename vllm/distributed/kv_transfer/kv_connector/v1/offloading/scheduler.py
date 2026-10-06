@@ -1050,6 +1050,14 @@ class OffloadingConnectorScheduler:
                     hit_ceiling = min(
                         hit_ceiling, local_tokens + req_status.max_load_tokens
                     )
+                if (
+                    max_num_new_tokens is not None
+                    or req_status.max_load_tokens is not None
+                ):
+                    # The anchor sets the walk's floor, so the per-group probe
+                    # must not reach a chunk that ends past either cap; cdiv
+                    # would let the anchor probe such a chunk and the walk
+                    # would then reject everything past that floor.
                     chunk_ceiling = hit_ceiling // tokens_per_chunk
                 else:
                     chunk_ceiling = cdiv(hit_ceiling, tokens_per_chunk)
