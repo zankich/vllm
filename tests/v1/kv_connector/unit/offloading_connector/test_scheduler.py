@@ -5070,3 +5070,26 @@ def test_partial_lookup_anchor_after_gpu_prefix_hit():
     )
     assert scheduler.get_num_new_matched_tokens(request, 16) == (12, True)
     assert scheduler._req_status["req"].partial_tail_boundary == 28
+
+
+def test_partial_lookup_anchor_clamps_zero_probe_below_chunk_aligned_local():
+    # Geometry: local_tokens=4 (unaligned, floor(4/16)=0). A max_num_new_tokens
+    # cap of 4 makes the anchor loop's chunk_ceiling land at 0 (4+4=8,
+    # floor(8/16)=0 chunks), so probe is 0. The raw group_hit expression
+    # (0+0)*16 - 4 = -4 even though zero chunks contributed, so the true
+    # value is 0. The clamp raises full_attention_hit to 0 so the downstream
+    # anchor_hit = max(complete_hit, full_attention_hit) never underflows
+    # the complete hit. The returned boundary is unchanged in the current
+    # code path (complete_hit bounds the max), so this test pins the
+    # invariant rather than a behaviour change: the unaligned-local
+    # geometry the clamp is designed for must not regress the boundary
+    # or produce a negative anchor.
+    scheduler = _make_partial_tail_scheduler()
+    request, _ = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h6"}, 1: {b"h6"}}, num_tokens=30
+    )
+    result = scheduler.get_num_new_matched_tokens(
+        request, 4, max_num_new_tokens=4
+    )
+    assert result == (0, False)
+    assert scheduler._req_status["req"].partial_tail_boundary is None

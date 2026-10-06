@@ -1087,7 +1087,14 @@ class OffloadingConnectorScheduler:
                     # a chunk the anchor would use is being loaded.
                     full_attention_hit = None
                     break
-                group_hit = (start_chunk_idx + probe) * tokens_per_chunk - local_tokens
+                # Clamp at 0: when probe is 0 and local_tokens is not
+                # chunk-aligned, the floor-divided start_chunk_idx makes
+                # the subtraction underflow even though zero chunks
+                # contributed. The true value is 0.
+                group_hit = max(
+                    0,
+                    (start_chunk_idx + probe) * tokens_per_chunk - local_tokens,
+                )
                 full_attention_hit = (
                     group_hit
                     if full_attention_hit is None
