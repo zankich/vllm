@@ -1335,6 +1335,7 @@ def install_sm8_fp8_large_head_optin() -> None:
             allow_nvfp4_sm8_large_head=allow_nvfp4_sm8_large_head,
         )
 
+    # Drift sentinel for install_sm8_fp8_large_head_optin, must not be removed.
     _fa2_head_dim_nvcc_flags_fp8._vllm_sm8_fp8_optin = True  # type: ignore[attr-defined]
     _fi_modules._fa2_head_dim_nvcc_flags = _fa2_head_dim_nvcc_flags_fp8
 
