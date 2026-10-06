@@ -77,7 +77,15 @@ print("offload integrity:", hasattr(i, "block_checksum"))
 import vllm.utils.flashinfer as fi
 print("opt-in installed:", callable(getattr(fi, "install_sm8_fp8_large_head_optin", None)))
 
-# plugin leaf check.
+# plugin pin check: install() exercises both pin hashes (nvidia + common)
+# and raises on drift, failing the build at the pin check instead of at
+# first serve boot on the host.
 import ple_int4 as p
 print("plugin module:", p.__name__, "at", _source_path("ple_int4"))
+try:
+    p.install()
+    print("ple_int4 pin check: ok")
+except RuntimeError as e:
+    print(f"ple_int4 pin check: FAILED — {e}")
+    raise
 PY
