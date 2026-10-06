@@ -5,7 +5,7 @@
 
 Subclasses and patches live entirely in this package; the vLLM tree is never
 edited. Method semantics mirror Qwen4ExpPLEFp8EmbeddingMethod
-(vllm/models/qwen4_exp/nvidia/ngram_embedding.py) with three deltas:
+(vllm/models/qwen4_exp/common/ngram_embedding.py) with three deltas:
 
   - weight is int32 [rows, dim // 8] (8 packed symmetric int4 codes per word)
   - weight_scale is fp16 [rows, dim // group_size], per-group, pinned-host

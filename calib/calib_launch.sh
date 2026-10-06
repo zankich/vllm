@@ -26,8 +26,9 @@ COLLECT="${COLLECT:?set COLLECT=<existing dump dir>}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-# served deployment environment
-export VLLM_PLE_CPU_OFFLOAD=1 VLLM_SKIP_P2P_CHECK=1 NCCL_P2P_LEVEL=SYS HF_HUB_OFFLINE=1
+# served deployment environment. PLE offload state is auto-resolved
+# in v0.31.0 (no VLLM_PLE_CPU_OFFLOAD env var).
+export VLLM_SKIP_P2P_CHECK=1 NCCL_P2P_LEVEL=SYS HF_HUB_OFFLINE=1
 export VLLM_QSA_KV_COLLECT="$COLLECT"
 unset VLLM_QSA_KV_SCALES VLLM_QSA_KV_CLIP_COUNT PYTORCH_CUDA_ALLOC_CONF || true
 
