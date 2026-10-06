@@ -41,6 +41,19 @@ class _IntegrityVerified:
         self.keys: set[OffloadKey] = set()
 
 
+class _LoadPinState:
+    """ReqContext state: keys this request's confirming lookups pinned
+    (and not yet consumed by prepare_load). Released on request finish,
+    ahead of the cache-access state guards, so a stale or foreign
+    _RequestCacheAccess does not strand a pin's refcount share
+    (fork, 2026-10-06)."""
+
+    __slots__ = ("pins",)
+
+    def __init__(self) -> None:
+        self.pins: list[OffloadKey] = []
+
+
 @dataclass(slots=True)
 class _RequestCacheAccess:
     """Cache keys observed by one request, grouped in prefix order."""
@@ -247,6 +260,13 @@ class CPUOffloadingManager(OffloadingManager):
             req_context.set_state(state)
         return state
 
+    def _get_load_pin_state(self, req_context: ReqContext) -> _LoadPinState:
+        state = req_context.get_state(_LoadPinState)
+        if state is None:
+            state = _LoadPinState()
+            req_context.set_state(state)
+        return state
+
     def _record_request_cache_access(
         self,
         keys: Iterable[OffloadKey],
@@ -324,11 +344,7 @@ class CPUOffloadingManager(OffloadingManager):
             # loaded keys on finish.
             self._lookup_pinned.add(key)
             self._lookup_pin_refs[key] = 1
-            pins: list[OffloadKey] | None = getattr(req_context, "_load_pins", None)
-            if pins is None:
-                pins = []
-                req_context._load_pins = pins  # type: ignore[attr-defined]
-            pins.append(key)
+            self._get_load_pin_state(req_context).pins.append(key)
             self._policy.mark_non_evictable(key)
             self._num_evictable_cache_chunks -= 1
             assert self._num_evictable_cache_chunks >= 0
@@ -339,13 +355,7 @@ class CPUOffloadingManager(OffloadingManager):
             # non-evictable count is unchanged because the previous
             # pinner already moved it out of the evictable pool.
             self._lookup_pin_refs[key] += 1
-            existing_pins: list[OffloadKey] | None = getattr(
-                req_context, "_load_pins", None
-            )
-            if existing_pins is None:
-                existing_pins = []
-                req_context._load_pins = existing_pins  # type: ignore[attr-defined]
-            existing_pins.append(key)
+            self._get_load_pin_state(req_context).pins.append(key)
         return LookupResult.HIT
 
     @override
@@ -364,7 +374,8 @@ class CPUOffloadingManager(OffloadingManager):
         record_access: bool,
     ) -> LoadStoreSpec:
         chunks = []
-        pins: list[OffloadKey] | None = getattr(req_context, "_load_pins", None)
+        pin_state = req_context.get_state(_LoadPinState)
+        pins = pin_state.pins if pin_state is not None else None
         for key in keys:
             chunk = self._policy.get(key)
             if chunk is None and pins is not None and key in pins:
@@ -588,8 +599,12 @@ class CPUOffloadingManager(OffloadingManager):
         # without this, every confirmed-but-unloaded hit would stay
         # non-evictable forever. Refcounted release: each request's
         # share decrements, and the key only leaves the set when the
-        # last share goes (fork, 2026-10-05).
-        pins: list[OffloadKey] | None = getattr(req_context, "_load_pins", None)
+        # last share goes (fork, 2026-10-05). The release path runs
+        # ahead of the cache-access state guards below, so a stale or
+        # foreign _RequestCacheAccess does not strand a share
+        # (fork, 2026-10-06).
+        pin_state = req_context.get_state(_LoadPinState)
+        pins = pin_state.pins if pin_state is not None else None
         if pins:
             released: set[OffloadKey] = set()
             for key in pins:
