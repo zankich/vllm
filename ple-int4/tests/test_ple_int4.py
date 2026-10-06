@@ -232,6 +232,44 @@ def test_plugin_never_filters_offload_groups():
         uninstall()
 
 
+def test_int4_method_refuses_stock_pinned_host_layer():
+    """The int4 PLE method must only see layers that are themselves the int4
+    pinned-host backend. Upstream's AMD PLE path resolves the stock
+    Qwen4ExpPLEPinnedHostEmbedding through its own module globals, so the
+    plugin's from_quant_config wrapper can hand it the int4 method and the
+    stock lookup would then index int32-packed rows with the full row stride
+    and read out of bounds. The guard must raise before any allocation.
+    """
+    from ple_int4.method import Qwen4ExpPLEInt4EmbeddingMethod
+
+    from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
+        Qwen4ExpPLEPinnedHostEmbedding,
+    )
+
+    class _StockLikeLayer(Qwen4ExpPLEPinnedHostEmbedding):
+        """A stock pinned-host-shaped layer that is NOT the int4 subclass."""
+
+        def __init__(self) -> None:  # noqa: D401 - bypass the real ctor
+            # nn.Module setup only; the guard must trigger before
+            # allocate_embedding_weight or any UVA handle.
+            torch.nn.Module.__init__(self)
+
+        def allocate_embedding_weight(self, num_embeddings, embedding_dim, dtype):
+            return torch.empty(num_embeddings, embedding_dim, dtype=dtype, device="cpu")
+
+    method = Qwen4ExpPLEInt4EmbeddingMethod()
+    layer = _StockLikeLayer()
+    with pytest.raises(RuntimeError, match="int4 pinned-host"):
+        method.create_weights(
+            layer,
+            input_size_per_partition=DIM,
+            output_partition_sizes=[128],
+            input_size=DIM,
+            output_size=128,
+            params_dtype=torch.bfloat16,
+        )
+
+
 def test_install_refuses_on_common_ngram_drift(monkeypatch):
     """The PLE base classes the plugin subclasses live in common/ since
     v0.31.0; drift there must refuse install like drift in nvidia/."""

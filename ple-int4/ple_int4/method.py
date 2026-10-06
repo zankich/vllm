@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """INT4 PLE embedding method + pinned-host backend for Qwen3.8-Flash-Next.
 
 Subclasses and patches live entirely in this package; the vLLM tree is never
@@ -10,19 +13,19 @@ edited. Method semantics mirror Qwen4ExpPLEFp8EmbeddingMethod
     bf16 rows (global scale folded into group scales at pack time), so
     everything downstream of _lookup sees activation dtype directly.
 """
+
 from __future__ import annotations
 
 import torch
 
-from vllm.model_executor.parameter import ModelWeightParameter
+from ple_int4.kernel import lookup_ple_int4_from_pinned
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEPinnedHostEmbedding,
 )
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
-
-from ple_int4.kernel import lookup_ple_int4_from_pinned
 
 GROUP_SIZE = 32  # values per scale group; 5 groups on the 160-wide rows
 
@@ -40,6 +43,19 @@ class Qwen4ExpPLEInt4EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
+        from ple_int4.method import Qwen4ExpPLEPinnedHostInt4Embedding
+
+        if not isinstance(layer, Qwen4ExpPLEPinnedHostInt4Embedding):
+            raise RuntimeError(
+                "ple_int4: the int4 PLE method was constructed against a layer "
+                "that is not the int4 pinned-host embedding "
+                "(Qwen4ExpPLEPinnedHostInt4Embedding). Upstream's AMD PLE path "
+                "resolves the stock Qwen4ExpPLEPinnedHostEmbedding through its "
+                "own module globals, so this plugin's from_quant_config wrapper "
+                "can hand it the int4 method. The stock lookup then indexes "
+                "int32-packed rows with the full row stride and reads out of "
+                "bounds, silently. Refusing the mismatch."
+            )
         del input_size, output_size, params_dtype
         if input_size_per_partition % 8 or input_size_per_partition % GROUP_SIZE:
             raise ValueError(
@@ -190,7 +206,9 @@ def patched_load_weights(self, weights) -> set[str]:
         ) // self.split_ngram_parts
 
         matched_scale = name.startswith(shard_prefix) and name.endswith(".weight_scale")
-        if name.startswith(shard_prefix) and (name.endswith(".weight") or matched_scale):
+        if name.startswith(shard_prefix) and (
+            name.endswith(".weight") or matched_scale
+        ):
             suffix = ".weight_scale" if matched_scale else ".weight"
             shard_text = name[len(shard_prefix) : -len(suffix)]
             if not shard_text.isdigit():
