@@ -1343,3 +1343,29 @@ def test_symlink_in_shm_is_not_followed(iid, tmp_path):
             region.cleanup()
     finally:
         _cleanup_file(link)
+
+
+def test_orphaned_reglock_is_reclaimed_with_region(iid):
+    """An orphaned .reglock sibling is reclaimed alongside its region.
+
+    Registration opens the reglock file lazily and the orphan dies with its
+    flock released, so the sibling reglock is harmless on its own. Hygiene
+    reclaims it together with the region so the next start's glob scan is
+    not cluttered by stale siblings.
+    """
+    orphan_id = f"{iid}-orphan"
+    orphan = _write_orphan(orphan_id)
+    orphan_reglock = orphan + ".reglock"
+    with open(orphan_reglock, "wb") as f:
+        f.write(b"\0")
+
+    assert os.path.exists(orphan)
+    assert os.path.exists(orphan_reglock)
+
+    region = _make_region(iid)
+    try:
+        assert not os.path.exists(orphan)
+        assert not os.path.exists(orphan_reglock)
+    finally:
+        region.cleanup()
+        _cleanup_file(orphan_reglock)

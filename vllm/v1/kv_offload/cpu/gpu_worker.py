@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import fcntl
 import functools
+import os
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -206,36 +207,30 @@ def _region_registration_lock(region: SharedOffloadRegion):
 
     Concurrent registrations over the same pages intermittently fail with
     cudaErrorInvalidValue on some drivers (observed on RTX 3090 Ti, TP2,
-    where one rank succeeded while the other failed). flock on the region's
-    own fd orders the ranks without introducing a named lock file that
-    could itself be orphaned by a crash.
-
-    The LOCK_EX conversion replaces the fd's boot-time LOCK_SH liveness
-    mark for the duration of the critical section, then the fd re-acquires
-    the shared mark on release. The exclusive lock serializes registration
-    across ranks, and the re-acquired shared mark is what tells the orphan
-    reclaimer the region is still live. The barrier flow unlinks the path
-    on barrier release, but the tiering flow never unlinks it, so the
-    shared mark held by every participant for the engine's lifetime is the
-    only thing keeping a concurrent engine's reclaim sweep from unlinking
-    a full-size on-disk region between the last worker's release and the
-    scheduler's own LOCK_SH in its later SharedOffloadRegion construction.
+    where one rank succeeded while the other failed). The exclusive lock
+    serializes chunked registration across ranks through a dedicated lock
+    file at ``<region.mmap_path>.reglock``, so it can never conflict with
+    the shared liveness marks on the region itself, which is what the
+    previous same-inode conversion could deadlock against. Every
+    participant holds a LOCK_SH on the region fd for the engine's
+    lifetime, and that mark is what `_reclaim_orphaned_regions` probes
+    to tell a live region from an orphan. Routing the exclusive lock
+    through a separate inode keeps the boot-time LOCK_SH visible to the
+    reclaim sweep across the whole cudaHostRegister critical section,
+    which a same-fd LOCK_EX-then-LOCK_SH re-acquire would have left
+    observable to a racing reclaim only by luck.
     """
     if region.fd is None:
         yield
         return
-    fcntl.flock(region.fd, fcntl.LOCK_EX)
+    reglock_path = region.mmap_path + ".reglock"
+    reglock_fd = os.open(reglock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
+        fcntl.flock(reglock_fd, fcntl.LOCK_EX)
         yield
     finally:
-        # Mirror _hold_shared_lock in shared_offload_region: release the
-        # exclusive lock and re-acquire the boot-time shared liveness mark
-        # before any other code path can see an unlocked fd. The
-        # non-blocking re-acquire cannot fail while the fd holds no other
-        # lock, so an OSError here means the kernel state is broken and
-        # we let it propagate.
-        fcntl.flock(region.fd, fcntl.LOCK_UN)
-        fcntl.flock(region.fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        fcntl.flock(reglock_fd, fcntl.LOCK_UN)
+        os.close(reglock_fd)
 
 
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
