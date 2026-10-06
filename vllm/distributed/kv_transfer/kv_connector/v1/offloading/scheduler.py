@@ -1052,6 +1052,14 @@ class OffloadingConnectorScheduler:
                     hit_ceiling = min(
                         hit_ceiling, local_tokens + req_status.max_load_tokens
                     )
+                if (
+                    max_num_new_tokens is not None
+                    or req_status.max_load_tokens is not None
+                ):
+                    # The anchor sets the walk's floor, so the per-group probe
+                    # must not reach a chunk that ends past either cap; cdiv
+                    # would let the anchor probe such a chunk and the walk
+                    # would then reject everything past that floor.
                     chunk_ceiling = hit_ceiling // tokens_per_chunk
                 else:
                     chunk_ceiling = cdiv(hit_ceiling, tokens_per_chunk)
@@ -1081,7 +1089,14 @@ class OffloadingConnectorScheduler:
                     # a chunk the anchor would use is being loaded.
                     full_attention_hit = None
                     break
-                group_hit = (start_chunk_idx + probe) * tokens_per_chunk - local_tokens
+                # Clamp at 0: when probe is 0 and local_tokens is not
+                # chunk-aligned, the floor-divided start_chunk_idx makes
+                # the subtraction underflow even though zero chunks
+                # contributed. The true value is 0.
+                group_hit = max(
+                    0,
+                    (start_chunk_idx + probe) * tokens_per_chunk - local_tokens,
+                )
                 full_attention_hit = (
                     group_hit
                     if full_attention_hit is None

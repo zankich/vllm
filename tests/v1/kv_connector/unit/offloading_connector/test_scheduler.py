@@ -5245,6 +5245,26 @@ def test_partial_lookup_defers_while_anchor_chunk_is_loading():
     assert req_status.partial_tail_boundary is None
 
 
+def test_partial_lookup_defers_with_positive_complete_when_anchor_chunk_loading():
+    # Counter-fixture: both groups have a second complete chunk resident, and
+    # that chunk is in flight. _lookup_complete_chunks is bounded to the
+    # first chunk so it returns 16, but the per-group loop's cdiv branch
+    # probes both chunks and defers because the second is loading. The
+    # defer path must surface the positive complete_hit (16) rather than
+    # None, so a caller sizing the prefill budget from the match count
+    # sees the loadable chunk instead of a defer-with-zero. Pinned
+    # independently of the max_num_new_tokens cap fix.
+    scheduler = _make_partial_tail_scheduler()
+    _, req_status = _make_anchored_partial_tail_request(
+        scheduler,
+        {0: {b"h3", b"h7", b"h4"}, 1: {b"h3", b"h7", b"h4"}},
+        num_tokens=32,
+    )
+    scheduler._chunks_being_loaded.add(req_status.group_states[0].offload_keys[1])
+    assert scheduler._lookup(req_status) == 16
+    assert req_status.partial_tail_boundary is None
+
+
 def test_partial_lookup_defers_while_anchor_chunk_is_pending():
     # The chunk the tail depends on is still being written: wait for it rather
     # than report 0 and forfeit the tail.
@@ -5289,6 +5309,28 @@ def test_partial_lookup_anchor_honours_max_num_new_tokens():
     assert scheduler._req_status["req"].partial_tail_boundary == 20
 
 
+def test_partial_lookup_anchor_honours_max_num_new_tokens_with_two_chunks():
+    # Geometry: 32-token prompt keys 2 complete chunks (h3 at [0,16), h7 at
+    # [16,32)). The cap of 20 sits below the second chunk boundary. With
+    # cdiv under max_num_new_tokens, the per-group loop probes the second
+    # chunk, anchors at 32, the walk is rejected (max_boundary 20 <= anchor
+    # 32), and the lookup serves 0 instead of the valid tail at 20. Under
+    # max_load_tokens the floor branch already handles this. The fix is to
+    # floor the chunk ceiling under either cap, since the anchor sets the
+    # walk's floor and must not probe past the cap.
+    scheduler = _make_partial_tail_scheduler()
+    request, _ = _make_anchored_partial_tail_request(
+        scheduler,
+        {0: {b"h3", b"h7", b"h4"}, 1: {b"h4"}},
+        num_tokens=32,
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 0, max_num_new_tokens=20) == (
+        20,
+        True,
+    )
+    assert scheduler._req_status["req"].partial_tail_boundary == 20
+
+
 def test_partial_lookup_anchor_honours_max_load_tokens():
     # The cap sits below the first complete chunk: upstream's complete-chunk
     # lookup returns 0 and its boundary walk serves the hash-aligned tail at
@@ -5312,3 +5354,24 @@ def test_partial_lookup_anchor_after_gpu_prefix_hit():
     )
     assert scheduler.get_num_new_matched_tokens(request, 16) == (12, True)
     assert scheduler._req_status["req"].partial_tail_boundary == 28
+
+
+def test_partial_lookup_anchor_clamps_zero_probe_below_chunk_aligned_local():
+    # Geometry: local_tokens=4 (unaligned, floor(4/16)=0). A max_num_new_tokens
+    # cap of 4 makes the anchor loop's chunk_ceiling land at 0 (4+4=8,
+    # floor(8/16)=0 chunks), so probe is 0. The raw group_hit expression
+    # (0+0)*16 - 4 = -4 even though zero chunks contributed, so the true
+    # value is 0. The clamp raises full_attention_hit to 0 so the downstream
+    # anchor_hit = max(complete_hit, full_attention_hit) never underflows
+    # the complete hit. The returned boundary is unchanged in the current
+    # code path (complete_hit bounds the max), so this test pins the
+    # invariant rather than a behaviour change: the unaligned-local
+    # geometry the clamp is designed for must not regress the boundary
+    # or produce a negative anchor.
+    scheduler = _make_partial_tail_scheduler()
+    request, _ = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h6"}, 1: {b"h6"}}, num_tokens=30
+    )
+    result = scheduler.get_num_new_matched_tokens(request, 4, max_num_new_tokens=4)
+    assert result == (0, False)
+    assert scheduler._req_status["req"].partial_tail_boundary is None
