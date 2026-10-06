@@ -24,6 +24,7 @@ from vllm.v1.kv_offload.cpu.common import (
 )
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
+from vllm.v1.kv_offload.cpu.policies.base import ChunkStatus
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 from vllm.v1.kv_offload.tiering.manager import CPUPrimaryTierOffloadingManager
 
@@ -944,6 +945,39 @@ class TestARCPolicy:
         assert not arc_policy.b1
         assert not arc_policy.b2
 
+    def test_mark_non_evictable_excludes_pinned_key_from_evict(self):
+        """A key the manager pinned via mark_non_evictable must not be a
+        valid eviction candidate. Regression W2 of v0.31.0z: ARC inherited
+        the base-class no-op overrides, so a lookup-confirmed hit could
+        be picked by evict and drift the manager's evictable counter.
+        """
+        policy = ARCCachePolicy(cache_capacity=2)
+        pinned_key = to_key(1)
+        evictable_key = to_key(2)
+
+        # Seed two ready chunks (ref_cnt == 0, eligible by the existing
+        # next_candidate guard).
+        policy.insert(pinned_key, ChunkStatus(chunk_id=0))
+        policy.insert(evictable_key, ChunkStatus(chunk_id=1))
+        policy.t1[pinned_key].ref_cnt = 0
+        policy.t1[evictable_key].ref_cnt = 0
+
+        # Pin one — both chunks are still ref_cnt == 0, but only one is
+        # excluded from the eviction pool.
+        policy.mark_non_evictable(pinned_key)
+
+        result = policy.evict(1, protected=set())
+        assert result is not None
+        assert [key for key, _ in result] == [evictable_key]
+        # The pinned key survives.
+        assert pinned_key in policy.t1 or pinned_key in policy.t2
+
+        # Unpin and confirm the key returns to the eviction pool.
+        policy.mark_evictable(pinned_key)
+        result = policy.evict(1, protected=set())
+        assert result is not None
+        assert pinned_key in [key for key, _ in result]
+
     def test_ghost_list_bounds(self):
         """Tests that ghost lists (B1, B2) don't grow unbounded.
         They should be capped at cache_capacity.
@@ -1814,7 +1848,8 @@ def test_degraded_pinned_load_then_finish_tolerates_vanished_key(cache_policy):
     assert manager._policy.get(to_key(2)) is not None
 
 
-def test_lookup_confirmed_hit_pinned_until_prepare_load():
+@pytest.mark.parametrize("cache_policy", ["lru", "arc"])
+def test_lookup_confirmed_hit_pinned_until_prepare_load(cache_policy):
     """Regression (2026-09-18): a key the lookup
     confirmed HIT was evicted by an asynchronously-completing store before
     prepare_load pinned it — ref_cnt protection started only at
@@ -1823,7 +1858,7 @@ def test_lookup_confirmed_hit_pinned_until_prepare_load():
     pinned from the lookup until its load takes the pin over (or the
     request finishes); eviction pressure against a pinned key surfaces as
     store refusal, never as the key's disappearance."""
-    manager = make_cpu_manager(num_chunks=2, cache_policy="lru")
+    manager = make_cpu_manager(num_chunks=2, cache_policy=cache_policy)
     victim_ctx = make_req_context("victim")
     churn_ctx = make_req_context("churn")
 
@@ -1850,7 +1885,8 @@ def test_lookup_confirmed_hit_pinned_until_prepare_load():
         assert manager.lookup(to_key(2), churn_ctx) is not LookupResult.HIT
 
 
-def test_prepare_load_takes_over_foreign_lookup_pin():
+@pytest.mark.parametrize("cache_policy", ["lru", "arc"])
+def test_prepare_load_takes_over_foreign_lookup_pin(cache_policy):
     """Regression (2026-09-29): request A's
     lookup pinned a key; request B's lookup confirmed the same key HIT
     without pinning it (the pin branch requires ``key not in
@@ -1860,7 +1896,7 @@ def test_prepare_load_takes_over_foreign_lookup_pin():
     ``KeyError`` in the LRU policy, a dead EngineCore. The contract:
     whoever loads a pinned key takes the pin over, regardless of which
     request created it."""
-    manager = make_cpu_manager(num_chunks=2, cache_policy="lru")
+    manager = make_cpu_manager(num_chunks=2, cache_policy=cache_policy)
     ctx_a = make_req_context("a")
     ctx_b = make_req_context("b")
 
@@ -1881,13 +1917,14 @@ def test_prepare_load_takes_over_foreign_lookup_pin():
     assert block.ref_cnt == 1
 
 
-def test_pin_owner_finish_after_takeover():
+@pytest.mark.parametrize("cache_policy", ["lru", "arc"])
+def test_pin_owner_finish_after_takeover(cache_policy):
     """After request B's load took over A's lookup pin, A finishing must
     release nothing: its stale pin entry targets a key no longer in
     ``_lookup_pinned``. The load's ref_cnt protection and the evictable
     accounting must survive A's finish untouched, and complete_load must
     return the key to the evictable pool exactly once."""
-    manager = make_cpu_manager(num_chunks=2, cache_policy="lru")
+    manager = make_cpu_manager(num_chunks=2, cache_policy=cache_policy)
     ctx_a = make_req_context("a")
     ctx_b = make_req_context("b")
 

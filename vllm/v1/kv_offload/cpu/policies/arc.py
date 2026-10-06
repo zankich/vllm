@@ -57,6 +57,10 @@ class ARCCachePolicy(CachePolicy):
         # key -> None (only care about presence)
         self.b1: OrderedDict[OffloadKey, None] = OrderedDict()
         self.b2: OrderedDict[OffloadKey, None] = OrderedDict()
+        # Keys the manager has pinned via mark_non_evictable; ref_cnt is
+        # 0 but the chunk must not be a valid eviction candidate until
+        # mark_evictable is called. Mirrors LRU's _evictable membership.
+        self._pinned: set[OffloadKey] = set()
 
     @override
     def get(self, key: OffloadKey) -> ChunkStatus | None:
@@ -142,7 +146,20 @@ class ARCCachePolicy(CachePolicy):
         self.t2.clear()
         self.b1.clear()
         self.b2.clear()
+        self._pinned.clear()
         self.target_t1_size = 0.0
+
+    @override
+    def mark_non_evictable(self, key: OffloadKey) -> None:
+        # ref_cnt transitions from 0 — key must have been evictable
+        # before the pin. Exclude it from eviction candidates until
+        # mark_evictable releases it.
+        self._pinned.add(key)
+
+    @override
+    def mark_evictable(self, key: OffloadKey) -> None:
+        # ref_cnt transitions to 0 — key returns to the candidate pool.
+        self._pinned.discard(key)
 
     @override
     def evict(
@@ -166,7 +183,11 @@ class ARCCachePolicy(CachePolicy):
             entries: Iterator[tuple[OffloadKey, ChunkStatus]],
         ) -> tuple[OffloadKey, ChunkStatus] | None:
             for key, chunk in entries:
-                if chunk.ref_cnt == 0 and key not in protected:
+                if (
+                    chunk.ref_cnt == 0
+                    and key not in protected
+                    and key not in self._pinned
+                ):
                     return key, chunk
             return None
 
