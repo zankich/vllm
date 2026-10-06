@@ -92,3 +92,52 @@ def test_drifted_layout_raises():
     finally:
         fi_modules._fa2_head_dim_nvcc_flags = original
         vllm_fi_utils._ORIG_FA2_HEAD_DIM_NVCC_FLAGS = saved
+
+
+def test_install_rewraps_after_reload():
+    """Re-installing after the gate attribute was replaced with a
+    fresh un-wrapped function (e.g. flashinfer was reloaded, dropping
+    our wrapper) must re-wrap the new attribute. Otherwise the
+    SM8 fp8 large-head opt-in silently no-ops and the SM100+ gate
+    returns for fp8 large-head prefill on SM8x.
+    """
+    saved_attr = fi_modules._fa2_head_dim_nvcc_flags
+    saved_orig = vllm_fi_utils._ORIG_FA2_HEAD_DIM_NVCC_FLAGS
+    sentinel_calls: list = []
+
+    def _sentinel(
+        head_dim_qk,
+        head_dim_vo,
+        dtype_kv,
+        *,
+        allow_nvfp4_sm8_large_head=False,
+    ):
+        sentinel_calls.append(
+            (head_dim_qk, head_dim_vo, dtype_kv, allow_nvfp4_sm8_large_head)
+        )
+        return ["-gencode=arch=compute_90,code=sm_90"]
+
+    # Simulate flashinfer being reloaded: the module attribute now
+    # points to a fresh un-wrapped function (the sentinel) instead of
+    # the wrapper the autouse fixture installed.
+    fi_modules._fa2_head_dim_nvcc_flags = _sentinel
+    try:
+        vllm_fi_utils.install_sm8_fp8_large_head_optin()
+        wrapped = fi_modules._fa2_head_dim_nvcc_flags
+        # The install must re-wrap, not silently return and leave the
+        # sentinel bare (the buggy "already installed" tautology).
+        assert wrapped is not _sentinel
+        assert getattr(wrapped, "_vllm_sm8_fp8_optin", False) is True
+        # Opt-in is active again: fp8 large-head with the flag set
+        # returns the SM8-inclusive arch list.
+        flags = wrapped(512, 512, torch.float8_e4m3fn, allow_nvfp4_sm8_large_head=True)
+        assert any(80 <= m < 90 for m in _majors(flags)), flags
+        # The wrapper delegates the non-opted-in path to the new
+        # baseline, proving the sentinel is actually wrapped (not a
+        # no-op that left it bare for the SM100+ path to invoke).
+        flags = wrapped(512, 512, torch.bfloat16, allow_nvfp4_sm8_large_head=False)
+        assert _majors(flags) == {90}
+        assert sentinel_calls
+    finally:
+        fi_modules._fa2_head_dim_nvcc_flags = saved_attr
+        vllm_fi_utils._ORIG_FA2_HEAD_DIM_NVCC_FLAGS = saved_orig

@@ -1280,26 +1280,35 @@ _SM8_FP8_ONE_BYTE_DTYPES = (
 def install_sm8_fp8_large_head_optin() -> None:
     """Widen flashinfer's SM8 large-head opt-in to fp8 one-byte KV.
 
+    The install is idempotent: re-invocation while our wrapper is in
+    place is a no-op. If the gate attribute was replaced (for example,
+    flashinfer was reloaded and dropped our wrapper, or some other
+    path overwrote it), the install re-wraps the new attribute so the
+    opt-in stays installed across reloads.
+
     Raises:
         RuntimeError: if flashinfer's gate layout has drifted — the
             wrapper refuses to leave the SM100+ restriction silently in
             place.
+
     """
     global _ORIG_FA2_HEAD_DIM_NVCC_FLAGS
     from flashinfer.jit.attention import modules as _fi_modules
 
     gate = getattr(_fi_modules, "_fa2_head_dim_nvcc_flags", None)
-    if gate is None or _ORIG_FA2_HEAD_DIM_NVCC_FLAGS is not None:
-        if (
-            _ORIG_FA2_HEAD_DIM_NVCC_FLAGS is not None
-            and gate is _fi_modules._fa2_head_dim_nvcc_flags
-        ):
-            return  # already installed
+    if gate is None:
         raise RuntimeError(
             "flashinfer layout changed: _fa2_head_dim_nvcc_flags missing "
-            "or replaced — the SM8 fp8 large-head opt-in needs "
-            "re-porting. Refusing to serve the SM100+ gate silently."
+            "— the SM8 fp8 large-head opt-in needs re-porting. "
+            "Refusing to serve the SM100+ gate silently."
         )
+
+    if _ORIG_FA2_HEAD_DIM_NVCC_FLAGS is not None:
+        if getattr(gate, "_vllm_sm8_fp8_optin", False):
+            return  # our wrapper is already in place
+        # Drift: the attribute was replaced (flashinfer reloaded or
+        # some other path overwrote the gate). Re-wrap from the
+        # current attribute so the opt-in stays installed.
     _ORIG_FA2_HEAD_DIM_NVCC_FLAGS = gate
 
     @functools.wraps(gate)
