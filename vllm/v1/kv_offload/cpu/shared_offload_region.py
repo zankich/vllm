@@ -124,6 +124,12 @@ def _reclaim_orphaned_regions(own_path: str) -> None:
                 except OSError:
                     continue  # still held: a live engine owns this region
                 os.unlink(path)
+            # The orphan died and its reglock flock released with it. The
+            # sibling reglock file is harmless in isolation (flock died
+            # with the process), but reclaim it alongside the region so
+            # the glob stays clean for the next start.
+            with contextlib.suppress(OSError):
+                os.unlink(path + ".reglock")
         except OSError:
             logger.debug("Skipped reclaiming %s", path, exc_info=True)
         else:
