@@ -826,8 +826,7 @@ class NvmlCudaPlatform(CudaPlatformBase):
     @classmethod
     @with_nvml_context
     def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
-        """
-        query if the set of gpus are fully connected by nvlink (1 hop)
+        """Query if the set of gpus are fully connected by nvlink (1 hop).
 
         The fork falls back to the generic P2P capability when NVLink is
         absent: the CUSTOM all-reduce path needs direct peer access, not

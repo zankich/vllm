@@ -63,8 +63,9 @@ def _usage_of(event_tuple):
 class TestStreamingUsageBug1RemainderZero:
     """Contract pin: with the fix the converter sees the same fully-split
     usage on both events. See
-    ``TestStreamingUsageBug1ComposedPath.test_real_generator_into_real_converter_double_count_guard``
-    for the composed-path regression guard."""
+    ``TestStreamingUsageBug1ComposedPath.
+    test_real_generator_into_real_converter_double_count_guard`` for the
+    composed-path regression guard."""
 
     @pytest.mark.asyncio
     async def test_message_start_and_delta_carry_same_split_usage(self):
@@ -145,8 +146,9 @@ class TestStreamingUsageBug1RemainderZero:
 class TestStreamingUsageBug1RemainderPositive:
     """Contract pin: same split usage on both events even when the
     prompt total does not equal cached + created. See
-    ``TestStreamingUsageBug1ComposedPath.test_real_generator_into_real_converter_double_count_guard``
-    for the composed-path regression guard."""
+    ``TestStreamingUsageBug1ComposedPath.
+    test_real_generator_into_real_converter_double_count_guard`` for the
+    composed-path regression guard."""
 
     @pytest.mark.asyncio
     async def test_message_start_and_delta_carry_same_split_usage(self):
@@ -206,8 +208,9 @@ class TestStreamingUsageNoDetails:
     """Contract pin: with ``--enable-prompt-tokens-details off``, no
     chunk carries cache info so the field-wise merge reconstructs the
     prompt exactly. See
-    ``TestStreamingUsageBug1ComposedPath.test_real_generator_into_real_converter_double_count_guard``
-    for the composed-path regression guard."""
+    ``TestStreamingUsageBug1ComposedPath.
+    test_real_generator_into_real_converter_double_count_guard`` for the
+    composed-path regression guard."""
 
     @pytest.mark.asyncio
     async def test_no_cache_fields_present(self):

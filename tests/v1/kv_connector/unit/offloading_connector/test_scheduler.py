@@ -4924,9 +4924,14 @@ def test_restore_accounting_logs_no_violation(caplog, with_partial_tail):
 
 
 def test_partial_lookup_returns_zero_without_stored_tail():
+    # FA prefix absent (h3 evicted) so the anchor's per-group probe in
+    # _lookup returns zero, and the mamba group has its offload chunk (h3)
+    # resident so a mamba sliding-window miss is not what produces the zero.
+    # The boundary walk still fails because neither group has a tail key
+    # (h6), but the anchor itself is what pins the zero here.
     scheduler = _make_partial_tail_scheduler()
     _, req_status = _make_anchored_partial_tail_request(
-        scheduler, {0: {b"h3"}, 1: set()}
+        scheduler, {0: set(), 1: {b"h3"}}
     )
     assert scheduler._lookup(req_status) == 0
     assert req_status.partial_tail_boundary is None
