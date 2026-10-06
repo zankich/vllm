@@ -43,6 +43,19 @@ class Qwen4ExpPLEInt4EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
+        from ple_int4.method import Qwen4ExpPLEPinnedHostInt4Embedding
+
+        if not isinstance(layer, Qwen4ExpPLEPinnedHostInt4Embedding):
+            raise RuntimeError(
+                "ple_int4: the int4 PLE method was constructed against a layer "
+                "that is not the int4 pinned-host embedding "
+                "(Qwen4ExpPLEPinnedHostInt4Embedding). Upstream's AMD PLE path "
+                "resolves the stock Qwen4ExpPLEPinnedHostEmbedding through its "
+                "own module globals, so this plugin's from_quant_config wrapper "
+                "can hand it the int4 method. The stock lookup then indexes "
+                "int32-packed rows with the full row stride and reads out of "
+                "bounds, silently. Refusing the mismatch."
+            )
         del input_size, output_size, params_dtype
         if input_size_per_partition % 8 or input_size_per_partition % GROUP_SIZE:
             raise ValueError(
@@ -197,9 +210,7 @@ def patched_load_weights(self, weights) -> set[str]:
             embedding.org_vocab_size + self.split_ngram_parts - 1
         ) // self.split_ngram_parts
 
-        matched_scale = name.startswith(shard_prefix) and name.endswith(
-            ".weight_scale"
-        )
+        matched_scale = name.startswith(shard_prefix) and name.endswith(".weight_scale")
         if name.startswith(shard_prefix) and (
             name.endswith(".weight") or matched_scale
         ):
