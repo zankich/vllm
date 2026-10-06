@@ -76,6 +76,7 @@ class ARCCachePolicy(CachePolicy):
     def remove(self, key: OffloadKey) -> None:
         if self.t1.pop(key, None) is None:
             self.t2.pop(key, None)
+        self._pinned.discard(key)
 
     def _adapt_to_ghost_hit(self, key: OffloadKey) -> bool:
         if key in self.b1:

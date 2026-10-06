@@ -978,6 +978,22 @@ class TestARCPolicy:
         assert result is not None
         assert pinned_key in [key for key, _ in result]
 
+    def test_remove_clears_pinned_entry(self):
+        """remove() must discard the key from `_pinned` the same way LRU's
+        remove clears `_evictable` at lru.py:86-89. Without it a pinned
+        key survives the removal and leaks a stale membership until
+        mark_evictable happens to be called on the same key.
+        """
+        policy = ARCCachePolicy(cache_capacity=2)
+        key = to_key(1)
+        policy.insert(key, ChunkStatus(chunk_id=0))
+        policy.t1[key].ref_cnt = 0
+        policy.mark_non_evictable(key)
+
+        assert key in policy._pinned
+        policy.remove(key)
+        assert key not in policy._pinned
+
     def test_ghost_list_bounds(self):
         """Tests that ghost lists (B1, B2) don't grow unbounded.
         They should be capped at cache_capacity.
