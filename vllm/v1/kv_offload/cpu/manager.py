@@ -387,8 +387,9 @@ class CPUOffloadingManager(OffloadingManager):
             chunk = self._policy.get(key)
             if chunk is None and pins is not None and key in pins:
                 # This request's confirming lookup pinned the key, but a
-                # later integrity rejection evicted it in between (pins do
-                # not refcount, so the rejector's ref_cnt==0 gate passes).
+                # later integrity rejection evicted it in between (the
+                # rejector gates on the chunk's load ref_cnt, which lookup
+                # pins never hold, and evicts past surviving pin shares).
                 # Degrade to a miss for this key: drop the stale pin (the
                 # rejection already settled its non-evictable count) and
                 # skip, instead of asserting mid-batch. The corrupt bytes
