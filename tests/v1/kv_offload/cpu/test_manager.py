@@ -2193,6 +2193,54 @@ def test_relookup_after_corruption_rejection_keeps_the_new_holder_share():
     assert to_key(1) not in manager._lookup_pinned
 
 
+def test_finish_after_rejection_releases_nothing_for_the_new_holder():
+    """The finish-side half of the claim model: a request that never
+    looked the key up again releases nothing for the request that holds
+    the key's current pin. A corruption rejection evicts the chunk and
+    drops the pin, the key is stored and pinned again by another request,
+    and the first request finishes without looking the key up again. Its
+    claim belongs to the dropped pin, so releasing it would take the new
+    holder's share, and the new holder's pending load would lose its
+    pin."""
+    region, write_slot, tamper_slot = _make_integrity_region(num_chunks=1)
+    manager = make_tiering_cpu_manager(num_chunks=1, mmap_region=region)
+    _store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
+
+    ctx_a = make_req_context(req_id="req-a")
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+
+    # The rejection evicts the chunk and drops the pin A held.
+    tamper_slot(0)
+    assert manager.lookup(to_key(1), make_req_context(req_id="rejector")) is (
+        LookupResult.MISS
+    )
+    assert manager._lookup_pin_refs == {}
+    assert to_key(1) not in manager._lookup_pinned
+
+    # The key is stored and pinned again, by another request.
+    _store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
+    ctx_b = make_req_context(req_id="req-b")
+    assert manager.lookup(to_key(1), ctx_b) is LookupResult.HIT
+    assert manager._lookup_pin_refs[to_key(1)] == 1
+    assert manager._num_evictable_cache_chunks == 0
+
+    # A finishes without looking the key up again: nothing is released, B's
+    # share and B's pin survive.
+    manager.on_request_finished(ctx_a)
+    assert manager._lookup_pin_refs[to_key(1)] == 1
+    assert to_key(1) in manager._lookup_pinned
+    assert manager._num_evictable_cache_chunks == 0
+
+    # B's finish releases the last share, and the one resident chunk
+    # returns to the evictable pool.
+    manager.on_request_finished(ctx_b)
+    assert manager._lookup_pin_refs == {}
+    assert to_key(1) not in manager._lookup_pinned
+    chunk = manager._policy.get(to_key(1))
+    assert chunk is not None and chunk.ref_cnt == 0
+    assert manager._num_evictable_cache_chunks == 1
+
+
 def test_verify_stored_slot_cross_check():
     """The cascade cross-check source: whether given bytes match the
     checksum recorded at this key's CPU-store completion. True/False for
