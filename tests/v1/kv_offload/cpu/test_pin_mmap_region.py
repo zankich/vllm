@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""pin_mmap_region takes an exclusive flock on the region fd across its
-whole chunked registration, so concurrent ranks on the same shared mmap
-serialize against one another and the host_register mock receives the
-full sequence under the lock.
+"""pin_mmap_region takes an exclusive flock on the dedicated
+``<mmap_path>.reglock`` fd across its whole chunked registration, so
+concurrent ranks on the same shared mmap serialize against one another
+and the host_register mock receives the full sequence under the lock,
+leaving the region fd's LOCK_SH liveness mark untouched.
 
 The multi-process test pins the flock serialization: two ranks racing
 the registration path on the same region file must not overlap their
