@@ -2317,6 +2317,49 @@ def test_swa_load_does_not_wait_for_unusable_pending_suffix(
     assert manager.lookup(swa[3], state.req_context) is LookupResult.HIT_PENDING
 
 
+def test_deferred_lookup_takes_one_pin_share_per_key(request_runner):
+    """A deferred lookup re-runs the request's prefix lookup on the next
+    scheduler step, and the keys it already confirmed must not take a
+    second pin share. The request's finish releases one share per key, so
+    a second share stranded the key in the manager's pin set: the chunk
+    never returned to the evictable pool."""
+    runner = request_runner(block_size=4, num_gpu_blocks=32, async_scheduling=False)
+    sched = runner.connector_scheduler
+    manager = CPUOffloadingManager(num_chunks=16)
+    sched.manager = manager
+    runner.new_request(token_ids=list(range(8)))
+    state = sched._req_status["0"]
+    state.update_offload_keys()
+    keys = state.group_states[0].offload_keys
+    assert len(keys) == 2
+
+    # The first chunk is resident, the second is still being written, so
+    # the lookup confirms the first and defers on the second.
+    ready = manager.prepare_store(keys[:1], state.req_context)
+    assert ready is not None
+    manager.complete_store(ready.keys_to_store, state.req_context)
+    pending = manager.prepare_store(keys[1:], state.req_context)
+    assert pending is not None
+
+    assert sched.get_num_new_matched_tokens(state.req, 0) == (None, False)
+    assert manager._lookup_pin_refs[keys[0]] == 1
+
+    # The next scheduler step re-runs the lookup for the same request.
+    assert sched.get_num_new_matched_tokens(state.req, 0) == (None, False)
+    assert manager._lookup_pin_refs[keys[0]] == 1
+
+    # The request finishes without loading: the pin is released and the
+    # chunk returns to the evictable pool.
+    state.req.status = RequestStatus.FINISHED_ABORTED
+    sched.request_finished(state.req)
+    output = SchedulerOutput.make_empty()
+    output.finished_req_ids = {"0"}
+    sched.build_connector_meta(output)
+    assert manager._lookup_pin_refs == {}
+    assert keys[0] not in manager._lookup_pinned
+    assert manager._num_evictable_cache_chunks == 1
+
+
 @pytest.mark.parametrize("alignment_chunk_count", [4, 8, 64])
 @pytest.mark.parametrize("sliding_window_chunks", [1, 2, 3])
 @pytest.mark.parametrize("is_eagle_group", [False, True])

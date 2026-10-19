@@ -2061,6 +2061,138 @@ def test_lookup_pin_refcount_holds_under_cross_request_finish(cache_policy):
     assert to_key(1) in final.evicted_keys
 
 
+@pytest.mark.parametrize("cache_policy", ["lru", "arc"])
+def test_repeated_lookup_by_one_request_takes_one_pin_share(cache_policy):
+    """A request that looks the same ready key up twice holds ONE pin
+    share, not two. The duplicate lookup is normal serving: a deferred
+    request re-runs its prefix lookup every scheduler step, and the
+    hybrid anchor probe re-looks-up the keys the complete-chunk walk
+    already covered. The release path settles one share per DISTINCT key,
+    so a second share stranded the key in `_lookup_pinned` forever (it
+    never became evictable again) whenever the request never loaded it."""
+    manager = make_cpu_manager(num_chunks=2, cache_policy=cache_policy)
+    ctx = make_req_context("a")
+
+    out = manager.prepare_store(to_keys([1]), ctx)
+    assert out is not None
+    manager.complete_store(to_keys([1]), ctx)
+    evictable_before = manager._num_evictable_cache_chunks
+
+    assert manager.lookup(to_key(1), ctx) is LookupResult.HIT
+    assert manager.lookup(to_key(1), ctx) is LookupResult.HIT
+    assert manager._lookup_pin_refs[to_key(1)] == 1
+
+    # The request never loads the key, so its finish releases the share.
+    manager.on_request_finished(ctx)
+    assert to_key(1) not in manager._lookup_pinned
+    assert to_key(1) not in manager._lookup_pin_refs
+    assert manager._num_evictable_cache_chunks == evictable_before
+
+
+@pytest.mark.parametrize("cache_policy", ["lru", "arc"])
+def test_repeated_lookup_by_one_request_does_not_overcount_evictable(
+    cache_policy,
+):
+    """The same request looking the key up twice and then loading it must
+    not inflate the evictable count. The load hands the pin over to the
+    chunk's ref_cnt, and the finish release settles the share the load
+    left behind: with a duplicate share the key was counted evictable by
+    the load's completion AND by the finish release, leaving two
+    evictable chunks for one resident chunk."""
+    manager = make_cpu_manager(num_chunks=2, cache_policy=cache_policy)
+    ctx = make_req_context("a")
+
+    out = manager.prepare_store(to_keys([1]), ctx)
+    assert out is not None
+    manager.complete_store(to_keys([1]), ctx)
+
+    assert manager.lookup(to_key(1), ctx) is LookupResult.HIT
+    assert manager.lookup(to_key(1), ctx) is LookupResult.HIT
+    spec = manager.prepare_load(to_keys([1]), ctx)
+    assert spec is not None
+    manager.complete_load(to_keys([1]), ctx)
+    manager.on_request_finished(ctx)
+
+    # One chunk resident, ref_cnt back at zero, one evictable chunk.
+    chunk = manager._policy.get(to_key(1))
+    assert chunk is not None and chunk.ref_cnt == 0
+    assert manager._num_evictable_cache_chunks == 1
+    assert to_key(1) not in manager._lookup_pinned
+    assert manager._lookup_pin_refs == {}
+
+
+@pytest.mark.parametrize("cache_policy", ["lru", "arc"])
+def test_two_requests_sharing_a_key_keep_one_share_each(cache_policy):
+    """The legitimate share: two DIFFERENT requests confirm the same key
+    HIT. Each holds its own share, so the first finisher's release must
+    not pull the key out from under the second request's pending load."""
+    manager = make_cpu_manager(num_chunks=2, cache_policy=cache_policy)
+    ctx_a = make_req_context("a")
+    ctx_b = make_req_context("b")
+
+    out = manager.prepare_store(to_keys([1]), ctx_a)
+    assert out is not None
+    manager.complete_store(to_keys([1]), ctx_a)
+
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+    assert manager.lookup(to_key(1), ctx_b) is LookupResult.HIT
+    assert manager._lookup_pin_refs[to_key(1)] == 2
+
+    # The first finisher's release leaves the second request's share.
+    manager.on_request_finished(ctx_a)
+    assert to_key(1) in manager._lookup_pinned
+    assert manager._lookup_pin_refs[to_key(1)] == 1
+    assert manager._num_evictable_cache_chunks == 0
+
+    # The second finisher releases the last share.
+    manager.on_request_finished(ctx_b)
+    assert to_key(1) not in manager._lookup_pinned
+    assert manager._lookup_pin_refs == {}
+    assert manager._num_evictable_cache_chunks == 1
+
+
+def test_relookup_after_corruption_rejection_keeps_the_new_holder_share():
+    """A claim left behind by a replaced pin releases nothing. A corruption
+    rejection evicts the chunk and settles the confirming request's share;
+    the key is stored and pinned again, and the original request looks it
+    up once more. That request's old claim is settled, so it takes a fresh
+    share — releasing the settled one instead would take a share that
+    belongs to the new holder, whose pending load would then lose its
+    pin."""
+    region, write_slot, tamper_slot = _make_integrity_region(num_chunks=1)
+    manager = make_tiering_cpu_manager(num_chunks=1, mmap_region=region)
+    _store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
+
+    ctx_a = make_req_context(req_id="req-a")
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+
+    # The rejection evicts the chunk and settles A's share.
+    tamper_slot(0)
+    assert manager.lookup(to_key(1), make_req_context(req_id="rejector")) is (
+        LookupResult.MISS
+    )
+    assert manager._lookup_pin_refs == {}
+
+    # The key is stored and pinned again, by another request.
+    _store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
+    ctx_b = make_req_context(req_id="req-b")
+    assert manager.lookup(to_key(1), ctx_b) is LookupResult.HIT
+    assert manager._lookup_pin_refs[to_key(1)] == 1
+
+    # A looks the key up again: it holds no live share, so it takes one.
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+    assert manager._lookup_pin_refs[to_key(1)] == 2
+
+    # A's finish releases A's share only; B's share survives.
+    manager.on_request_finished(ctx_a)
+    assert manager._lookup_pin_refs[to_key(1)] == 1
+    assert to_key(1) in manager._lookup_pinned
+
+    manager.on_request_finished(ctx_b)
+    assert manager._lookup_pin_refs == {}
+    assert to_key(1) not in manager._lookup_pinned
+
+
 def test_verify_stored_slot_cross_check():
     """The cascade cross-check source: whether given bytes match the
     checksum recorded at this key's CPU-store completion. True/False for
