@@ -49,6 +49,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingManager,
     OffloadingSpec,
     OffloadKey,
+    OffloadKeyVanishedError,
     OffloadPolicy,
     ReqContext,
     RequestOffloadingContext,
@@ -660,6 +661,9 @@ class OffloadingConnectorScheduler:
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
+        # Requests whose load cannot be served; the workers report them as
+        # failed receives.
+        self._current_batch_failed_loads: set[ReqId] = set()
         self._current_batch_jobs_to_flush: set[int] = set()
         # GPU block IDs allocated in the current engine step
         self._current_batch_allocated_block_ids: set[int] = set()
@@ -1408,7 +1412,16 @@ class OffloadingConnectorScheduler:
             if req_status.offloading_context.policy == OffloadPolicy.CHUNK_LEVEL:
                 group_state.next_stored_chunk_idx = num_chunks
 
-        src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
+        try:
+            src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
+        except OffloadKeyVanishedError:
+            # The base scheduler parks the request in WAITING_FOR_REMOTE_KVS
+            # and kv_load_failure_policy decides its fate once the workers
+            # report the failed receive.
+            req_status.load_key_ranges.clear()
+            req_status.partial_tail_boundary = None
+            self._current_batch_failed_loads.add(request.request_id)
+            return
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
@@ -2059,6 +2072,7 @@ class OffloadingConnectorScheduler:
             load_jobs=self._current_batch_load_jobs,
             store_jobs=partial_store_jobs | normal_store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
+            failed_loads=self._current_batch_failed_loads,
         )
 
         # All prepare_store calls for finished requests have been issued.
@@ -2072,6 +2086,7 @@ class OffloadingConnectorScheduler:
             if not req_status.transfer_jobs:
                 del self._req_status[req_id]
         self._current_batch_load_jobs = {}
+        self._current_batch_failed_loads = set()
         self._current_batch_jobs_to_flush = set()
         self._current_batch_allocated_block_ids = set()
         return meta
@@ -2238,6 +2253,7 @@ class OffloadingConnectorScheduler:
         """Reset the offloading manager cache, evicting all stored chunks."""
         # reset_cache cannot be called in the middle of a schedule step
         assert not self._current_batch_load_jobs
+        assert not self._current_batch_failed_loads
         assert not self._current_batch_jobs_to_flush
         assert not self._current_batch_allocated_block_ids
 

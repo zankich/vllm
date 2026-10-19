@@ -70,6 +70,8 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     load_jobs: dict[int, TransferJob]
     store_jobs: dict[int, TransferJob]
     jobs_to_flush: set[int] | None = None
+    # Requests whose load was never issued; reported as failed receives.
+    failed_loads: set[ReqId] = field(default_factory=set)
 
 
 @dataclass

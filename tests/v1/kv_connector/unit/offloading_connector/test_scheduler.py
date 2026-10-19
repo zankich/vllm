@@ -19,6 +19,7 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
 from vllm.config import KVEventsConfig
 from vllm.distributed.kv_events import MEDIUM_CPU, BlockRemoved, BlockStored
+from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
@@ -52,6 +53,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
     SlidingWindowManager,
 )
+from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
@@ -69,6 +71,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingEvent,
     OffloadingKVEventsConfig,
     OffloadingManager,
+    OffloadKeyVanishedError,
     OffloadPolicy,
     ReqContext,
     RequestOffloadingContext,
@@ -894,6 +897,86 @@ def test_scheduler_reports_allocation_failure(request_runner):
     # Two attempts: once while running (block becomes full during prefill),
     # once from finished_req_ids on the next step.
     assert reduced[_ConnectorMetricName.ALLOCATION_FAILURE] == 2
+
+
+@pytest.mark.parametrize("policy", ["fail", "recompute"])
+def test_vanished_pinned_load_follows_kv_load_failure_policy(
+    request_runner, policy: str
+):
+    """A load the manager can no longer serve reaches the core scheduler as
+    a failed receive: "fail" finishes the request with an error, while
+    "recompute" reschedules it with nothing computed."""
+    block_size = 4
+    num_tokens = 3 * block_size
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=10,
+        async_scheduling=False,
+        kv_load_failure_policy=policy,
+    )
+    scheduler = runner.scheduler
+    num_free_blocks = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+
+    def vanished(keys, req_context):
+        raise OffloadKeyVanishedError(next(iter(keys)))
+
+    runner.manager.lookup.return_value = LookupResult.HIT
+    runner.manager.prepare_load = vanished
+    runner.new_request(token_ids=[0] * num_tokens)
+    req_id = str(runner.req_id)
+    request = scheduler.requests[req_id]
+
+    scheduler_output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    meta = scheduler_output.kv_connector_metadata
+    assert isinstance(meta, OffloadingConnectorMetadata)
+    assert not meta.load_jobs
+    assert meta.failed_loads == {req_id}
+
+    runner.worker_connector.bind_connector_metadata(meta)
+    runner.worker_connector.start_load_kv(runner._dummy_ctx)
+    results = runner.worker_connector.get_transfer_results(
+        scheduler_output.finished_req_ids
+    )
+    runner.worker_connector.clear_connector_metadata()
+    model_runner_output = KVOutputAggregator(1).aggregate(
+        [
+            ModelRunnerOutput.with_kv_conn_output_only(
+                KVConnectorOutput(
+                    finished_recving=results.finished_recving,
+                    failed_recving=results.failed_recving,
+                )
+            )
+        ]
+    )
+    assert model_runner_output is not None
+    engine_outputs = scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    if policy == "fail":
+        assert request.status == RequestStatus.FINISHED_ERROR
+        (output,) = engine_outputs[0].outputs
+        assert output.request_id == req_id
+        assert output.finish_reason == FinishReason.ERROR
+        # The next step signals the finish to the connector and frees all.
+        scheduler.schedule()
+        assert req_id not in scheduler.requests
+        assert req_id not in runner.connector_scheduler._req_status
+        assert (
+            scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+            == num_free_blocks
+        )
+    else:
+        assert not any(out.outputs for out in engine_outputs.values())
+        assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert request.num_computed_tokens == 0
+        # The vanished key now answers MISS: the retry recomputes it all.
+        runner.manager.lookup.return_value = LookupResult.MISS
+        scheduler_output = scheduler.schedule()
+        assert request.status == RequestStatus.RUNNING
+        (new_req,) = scheduler_output.scheduled_new_reqs
+        assert new_req.req_id == req_id
+        assert new_req.num_computed_tokens == 0
+        assert scheduler_output.num_scheduled_tokens[req_id] == num_tokens
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])

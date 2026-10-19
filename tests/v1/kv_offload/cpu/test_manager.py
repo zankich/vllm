@@ -14,6 +14,7 @@ from vllm.v1.kv_offload.base import (
     Medium,
     OffloadingEvent,
     OffloadKey,
+    OffloadKeyVanishedError,
     PrepareStoreOutput,
     ReqContext,
     make_offload_key,
@@ -1777,14 +1778,14 @@ def test_integrity_verification_once_per_request_context():
     assert manager.lookup(to_key(1), ctx_b) is LookupResult.MISS
 
 
-def test_prepare_load_degrades_pinned_key_to_miss_after_rejection(caplog):
-    """Pin-vs-reject race: request A's confirming lookup pins a hit, the
-    slot corrupts, and request B's fresh lookup rejects and evicts the
-    chunk (pins do not refcount, so the rejector's ref_cnt==0 gate
-    passes). A's prepare_load must answer a graceful miss for the key —
-    skip it and keep loading the rest — instead of hitting
-    `assert chunk is not None` and killing the engine. The reject path
-    stays intact: the corrupt bytes are gone and the slot is reusable."""
+def test_prepare_load_raises_on_vanished_pinned_key_before_consuming(caplog):
+    """Pin-vs-reject race: request A's confirming lookup pins two hits, the
+    slot corrupts, and request B's fresh lookup rejects and evicts one chunk
+    (pins do not refcount ref_cnt, so the rejector's ref_cnt==0 gate passes).
+    A's prepare_load must signal the vanished key instead of hitting
+    `assert chunk is not None`, and must not consume the keys ahead of it:
+    the load is all-or-nothing. The reject path stays intact: the corrupt
+    bytes are gone and the slot is reusable."""
     region, write_slot, tamper_slot = _make_integrity_region()
     manager = make_tiering_cpu_manager(num_chunks=2, mmap_region=region)
     _store_and_complete(manager, to_keys([1, 2]), _EMPTY_REQ_CTX, write_slot)
@@ -1792,44 +1793,36 @@ def test_prepare_load_degrades_pinned_key_to_miss_after_rejection(caplog):
     ctx_a = make_req_context(req_id="req-a")
     ctx_b = make_req_context(req_id="req-b")
 
-    # A's confirming lookup: both keys HIT and pinned for A's load.
     assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
     assert manager.lookup(to_key(2), ctx_a) is LookupResult.HIT
     assert set(manager._lookup_pinned) == set(to_keys([1, 2]))
 
-    # The slot corrupts after A's verification; B's fresh lookup rejects
-    # and evicts key 1, silently discarding A's pin on it.
     tamper_slot(0)
     assert manager.lookup(to_key(1), ctx_b) is LookupResult.MISS
     assert manager._policy.get(to_key(1)) is None
 
-    # A's load catches up. Before the fix this is the engine-killing assert.
-    with caplog.at_level("WARNING", logger="vllm.v1.kv_offload.cpu.manager"):
-        spec = manager.prepare_load(to_keys([1, 2]), ctx_a)
-    assert isinstance(spec, CPULoadStoreSpec)
-    # The rejected key is a graceful miss: only the surviving key loads.
-    assert len(spec.chunk_ids) == 1
+    # The vanished key comes last, so an incremental consumer would already
+    # have taken key 2 over from its pin.
+    with (
+        caplog.at_level("WARNING", logger="vllm.v1.kv_offload.cpu.manager"),
+        pytest.raises(OffloadKeyVanishedError) as excinfo,
+    ):
+        manager.prepare_load(to_keys([2, 1]), ctx_a)
+    assert excinfo.value.key == to_key(1)
+    assert len([r for r in caplog.records if "vanished" in r.message]) == 1
 
-    # The stale pin is discarded, not leaked to request finish.
-    assert to_key(1) not in manager._get_load_pin_state(ctx_a).pins
-    # Accounting symmetry: completing the one real load restores the idle
-    # count for it alone — a leaked pin count would leave usage nonzero.
-    manager.complete_load(to_keys([2]), ctx_a)
+    # Key 2 is untouched: still pinned by A, no load reference taken.
+    chunk = manager._policy.get(to_key(2))
+    assert chunk is not None and chunk.ref_cnt == 0
+    assert manager._lookup_pin_refs == {to_key(2): 1}
+    assert manager._get_load_pin_state(ctx_a).pins == to_keys([1, 2])
+
+    # Request finish releases both pins; key 2 returns to the evictable pool.
+    manager.on_request_finished(ctx_a)
+    assert not manager._lookup_pinned
+    assert manager._lookup_pin_refs == {}
     assert manager._num_evictable_cache_chunks == 1
-    stats = manager.get_stats()
-    assert stats is not None
-    assert stats.reduce()[CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC] == (
-        pytest.approx(0.0)
-    )
 
-    # One warning names the degraded key.
-    degrade_warnings = [
-        record for record in caplog.records if "degrad" in record.message
-    ]
-    assert len(degrade_warnings) == 1
-
-    # The reject path is unweakened: key 1 stays a MISS and its slot was
-    # freed for reuse by the next store.
     assert manager.lookup(to_key(1), make_req_context(req_id="req-c")) is (
         LookupResult.MISS
     )
@@ -1840,9 +1833,10 @@ def test_prepare_load_degrades_pinned_key_to_miss_after_rejection(caplog):
 
 
 @pytest.mark.parametrize("cache_policy", ["lru", "arc"])
-def test_degraded_pinned_load_then_finish_tolerates_vanished_key(cache_policy):
-    """A key dropped by corruption rejection is still in the request's
-    reused set; finishing the request must not fault in either policy."""
+def test_vanished_pinned_load_then_finish_tolerates_vanished_key(cache_policy):
+    """A key dropped by corruption rejection is still in the request's pin
+    list after its load fails; finishing the request must not fault in
+    either policy."""
     region, write_slot, tamper_slot = _make_integrity_region()
     manager = make_tiering_cpu_manager(
         num_chunks=2, mmap_region=region, cache_policy=cache_policy
@@ -1856,12 +1850,48 @@ def test_degraded_pinned_load_then_finish_tolerates_vanished_key(cache_policy):
     ctx_b = make_req_context(req_id="req-b")
     assert manager.lookup(to_key(1), ctx_b) is LookupResult.MISS
 
-    manager.prepare_load(to_keys([1, 2]), ctx_a)
-    manager.complete_load(to_keys([2]), ctx_a)
+    with pytest.raises(OffloadKeyVanishedError):
+        manager.prepare_load(to_keys([1, 2]), ctx_a)
     manager.on_request_finished(ctx_a)
 
     assert manager._policy.get(to_key(1)) is None
     assert manager._policy.get(to_key(2)) is not None
+
+
+def test_second_confirmer_pin_share_drains_when_both_loads_fail():
+    """Two confirmers hold shares of one pin; a corruption rejection evicts
+    the chunk and settles only ONE implicit share. Both confirmers' failed
+    loads keep their pins for request finish, which settles the surviving
+    share. A stranded share would keep the key in _lookup_pinned with no
+    holder, and a future re-store would inflate the count. The pin
+    bookkeeping fully drains once both confirmers have finished."""
+    region, write_slot, tamper_slot = _make_integrity_region(num_chunks=1)
+    manager = make_tiering_cpu_manager(num_chunks=1, mmap_region=region)
+    _store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
+
+    ctx_a = make_req_context(req_id="req-a")
+    ctx_b = make_req_context(req_id="req-b")
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+    assert manager.lookup(to_key(1), ctx_b) is LookupResult.HIT
+    assert manager._lookup_pin_refs[to_key(1)] == 2
+
+    # The rejector settles one implicit share; one survives the eviction.
+    tamper_slot(0)
+    assert manager.lookup(to_key(1), make_req_context(req_id="rejector")) is (
+        LookupResult.MISS
+    )
+    assert manager._lookup_pin_refs[to_key(1)] == 1
+
+    # Both confirmers' loads fail, leaving their pins for request finish.
+    with pytest.raises(OffloadKeyVanishedError):
+        manager.prepare_load(to_keys([1]), ctx_a)
+    with pytest.raises(OffloadKeyVanishedError):
+        manager.prepare_load(to_keys([1]), ctx_b)
+    manager.on_request_finished(ctx_a)
+    manager.on_request_finished(ctx_b)
+
+    assert to_key(1) not in manager._lookup_pinned
+    assert manager._lookup_pin_refs == {}
 
 
 @pytest.mark.parametrize("cache_policy", ["lru", "arc"])

@@ -162,6 +162,18 @@ class PrepareStoreOutput:
     evicted_keys: list[OffloadKey]
 
 
+class OffloadKeyVanishedError(Exception):
+    """A key this request's lookup confirmed left the cache before its load.
+
+    Raised by prepare_load before any key is consumed, so the request's
+    pins and every chunk's ref_cnt are as lookup left them.
+    """
+
+    def __init__(self, key: OffloadKey):
+        super().__init__(f"Offloaded key {key!r} vanished before its load")
+        self.key = key
+
+
 @dataclass
 class OffloadingEvent:
     keys: list[OffloadKey]
@@ -279,6 +291,10 @@ class OffloadingManager(ABC):
         Returns:
             A LoadStoreSpec that can be used by a worker to locate and load
             the actual offloaded KV data.
+
+        Raises:
+            OffloadKeyVanishedError: a key confirmed by this request's lookup
+                is no longer offloaded; no key was prepared.
 
         """
         pass

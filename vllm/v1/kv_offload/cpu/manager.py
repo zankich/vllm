@@ -17,6 +17,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingEvent,
     OffloadingManager,
     OffloadKey,
+    OffloadKeyVanishedError,
     PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
@@ -175,7 +176,7 @@ class CPUOffloadingManager(OffloadingManager):
         # moved it out of the evictable count.
         if key in self._lookup_pinned:
             # Another request's share may survive; their prepare_load
-            # will see the chunk is gone and degrade to a miss.
+            # will see the chunk is gone and fail the load.
             # Decrement this rejector's implicit share (it never pinned
             # because integrity-check failures short-circuit before the
             # pin branch). Refcounted: only discard from the set when
@@ -383,25 +384,24 @@ class CPUOffloadingManager(OffloadingManager):
         chunks = []
         pin_state = req_context.get_state(_LoadPinState)
         pins = pin_state.pins if pin_state is not None else None
+        if pins:
+            for key in keys:
+                if self._policy.get(key) is None and key in pins:
+                    # This request's confirming lookup pinned the key, but a
+                    # later integrity rejection evicted it in between (the
+                    # rejector gates on the chunk's load ref_cnt, which
+                    # lookup pins never hold). Fail before consuming any key;
+                    # the pins release at request finish, whose stale-pin
+                    # skip tolerates the vanished key.
+                    logger.warning(
+                        "CPU offload tier: pinned key %.16s vanished before "
+                        "its load (rejected by another request's integrity "
+                        "check); failing the load",
+                        key,
+                    )
+                    raise OffloadKeyVanishedError(key)
         for key in keys:
             chunk = self._policy.get(key)
-            if chunk is None and pins is not None and key in pins:
-                # This request's confirming lookup pinned the key, but a
-                # later integrity rejection evicted it in between (the
-                # rejector gates on the chunk's load ref_cnt, which lookup
-                # pins never hold, and evicts past surviving pin shares).
-                # Degrade to a miss for this key: drop the stale pin (the
-                # rejection already settled its non-evictable count) and
-                # skip, instead of asserting mid-batch. The corrupt bytes
-                # were evicted by the reject path and stay evicted.
-                logger.warning(
-                    "CPU offload tier: pinned key %.16s vanished before its "
-                    "load (rejected by another request's integrity check); "
-                    "degrading to a miss for this key",
-                    key,
-                )
-                pins.remove(key)
-                continue
             assert chunk is not None, f"Chunk {key!r} not found in cache"
             assert chunk.is_ready, f"Chunk {key!r} is not ready for reading"
             if key in self._lookup_pinned:
