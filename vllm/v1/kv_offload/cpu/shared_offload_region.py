@@ -447,4 +447,9 @@ class SharedOffloadRegion:
                 logger.warning(
                     "Failed to unlink path %s", self.mmap_path, exc_info=True
                 )
+            # pin_mmap_region creates <mmap_path>.reglock lazily; remove it
+            # with the region so a graceful shutdown leaves /dev/shm clean.
+            # A missing reglock is normal for a never-registered region.
+            with contextlib.suppress(OSError):
+                os.unlink(self.mmap_path + ".reglock")
             self._creator = False

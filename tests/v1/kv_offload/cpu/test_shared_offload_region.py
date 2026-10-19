@@ -851,6 +851,30 @@ def test_cleanup_unregisters_every_pinned_chunk(iid, monkeypatch):
     ]
 
 
+def test_cleanup_removes_reglock_file(iid, host_register):
+    """cleanup() on the creator must remove the .reglock registration file.
+
+    Registration creates ``<mmap_path>.reglock`` lazily and closes its fd
+    when done, but nothing on the graceful path unlinked the inode, so
+    every engine start left a zero-byte file in /dev/shm.
+    """
+    region = _make_region(iid)
+    reglock_path = region.mmap_path + ".reglock"
+    try:
+        gpu_worker.pin_mmap_region(region)
+        assert os.path.exists(reglock_path), "registration must create the reglock"
+
+        region.cleanup()
+
+        assert not os.path.exists(reglock_path), (
+            "creator cleanup must remove the reglock file"
+        )
+        assert not os.path.exists(region.mmap_path)
+    finally:
+        _cleanup_file(region.mmap_path)
+        _cleanup_file(reglock_path)
+
+
 @pytest.fixture
 def host_register(monkeypatch):
     """Mock the cross-platform host_register/host_unregister helpers with
