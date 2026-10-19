@@ -11,7 +11,7 @@ FROM nvidia/cuda:13.0.0-devel-ubuntu24.04
 # produces upstream vLLM without the fork patches. ple_int4.install()'s
 # hash check fails at boot, so the image refuses to serve. Build the
 # fork image instead: the root Dockerfile via tools/build-fork-image.sh,
-# which applies forks/v0.31.0z.patch and installs this plugin. Kept
+# which applies forks/v0.32.0z.patch and installs this plugin. Kept
 # only as a minimal reference for the plugin's runtime deps.
 ARG VLLM_WHEEL=https://wheels.vllm.ai/ba2ae9f23961ac67bc5c055da8c26fbd660989c6/vllm-0.29.1rc1.dev102%2Bgba2ae9f23-cp38-abi3-manylinux_2_28_x86_64.whl
 
