@@ -334,6 +334,21 @@ def test_qsa_kv_mode_for_e4m3_pins_capability(monkeypatch):
     assert qsa_ops._qsa_kv_mode(torch.float8_e4m3fn, dev) == 3
 
 
+def test_unfused_kv_write_required_where_fused_prepare_cannot_cast(monkeypatch):
+    """Upstream's fused qsa_prepare casts to fp8e4nv, which Triton cannot lower
+    below SM89; those layers must keep the unfused reshape_and_cache writer."""
+    dev = torch.device("cuda", 0)
+
+    def check(cap, dtype):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: cap)
+        return qsa_mod._qsa_needs_unfused_kv_write(dtype, dev)
+
+    assert check((8, 6), "fp8_e4m3") is True
+    assert check((8, 6), "fp8") is True
+    assert check((8, 6), "auto") is False
+    assert check((8, 9), "fp8_e4m3") is False
+
+
 def test_backend_supports_kv_cache_dtype_bypasses_fa_hardware_check():
     # The inherited FlashAttentionBackend.supports_kv_cache_dtype defers
     # quantized dtypes to flash_attn_supports_kv_cache_dtype, which is False

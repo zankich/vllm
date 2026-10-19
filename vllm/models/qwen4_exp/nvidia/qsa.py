@@ -76,6 +76,23 @@ def _is_qsa_fp8_cache_dtype(cache_dtype: str) -> bool:
     return cache_dtype in _QSA_FP8_CACHE_DTYPES
 
 
+def _qsa_needs_unfused_kv_write(
+    kv_cache_dtype: CacheDType, device: torch.device
+) -> bool:
+    """True where the fused qsa_prepare cannot write this layer's KV cache.
+
+    The fused launch casts K/V to fp8e4nv, which Triton cannot lower below
+    SM89, so an E4M3 cache there must keep the unfused reshape_and_cache
+    writer. Only the cache-dtype string can decide this: fp8 and fp8_e4m3
+    both surface as torch.uint8 storage, so the torch dtype cannot
+    distinguish them."""
+    if not _is_qsa_fp8_cache_dtype(kv_cache_dtype):
+        return False
+    from .ops.qsa import _qsa_kv_mode
+
+    return _qsa_kv_mode(torch.float8_e4m3fn, device) == 2
+
+
 class Qwen4ExpQSAQKVIndexerLinear(MergedColumnParallelLinear):
     """Pack sharded Q/gate, K, V and replicated indexer Q/K in one GEMM."""
 
@@ -504,9 +521,16 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         # One launch does the indexer prepare, the main QK-norm/RoPE/gate and
         # the main K/V cache write (see QSAIndexer.forward); otherwise all of
-        # them take the separate kernels.
+        # them take the separate kernels. The final conjunct keeps FP8-e4m3
+        # caches on SM<89 on the unfused writer, because the fused launch's
+        # fp8e4nv cast does not compile below SM89.
         self.use_fused_qsa_prepare = (
-            self.use_fused_qk_norm_rope_gate and self.indexer.use_fused_pre_indexer
+            self.use_fused_qk_norm_rope_gate
+            and self.indexer.use_fused_pre_indexer
+            and not _qsa_needs_unfused_kv_write(
+                self.kv_cache_dtype,
+                torch.device("cuda", torch.accelerator.current_device_index()),
+            )
         )
         self.fuse_indexer_projection = vllm_config.lora_config is None
         if self.fuse_indexer_projection:
