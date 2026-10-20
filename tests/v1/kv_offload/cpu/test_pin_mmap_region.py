@@ -611,3 +611,37 @@ def test_registration_completes_when_sibling_region_holds_lock(monkeypatch):
             own_region.cleanup()
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(own_region.mmap_path + ".reglock")
+
+
+def test_registration_lock_releases_fd_when_recheck_raises(monkeypatch, tmp_path):
+    """The fd must close, releasing its lock, if the inode re-check raises.
+
+    The re-check runs after the exclusive lock is taken. If its stat
+    raises something other than FileNotFoundError -- EACCES, ELOOP,
+    ENOTDIR -- the exception must not leave the fd open: an open fd
+    keeps the lock, and every later rank blocks until the leaking
+    process exits.
+    """
+    reglock_path = tmp_path / "region.reglock"
+    reglock_path.write_bytes(b"")
+    path = str(reglock_path)
+
+    real_stat = os.stat
+
+    def stat_raises_on_reglock(p, *args, **kwargs):
+        if os.fspath(p) == path:
+            raise PermissionError(13, "Permission denied", os.fspath(p))
+        return real_stat(p, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", stat_raises_on_reglock)
+
+    with pytest.raises(PermissionError):
+        gpu_worker._open_and_lock_reglock(path)
+
+    # The fd was closed before the exception propagated, so the exclusive
+    # lock was released and a later rank takes it instead of blocking.
+    probe = os.open(path, os.O_RDWR)
+    try:
+        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(probe)

@@ -218,11 +218,14 @@ def _open_and_lock_reglock(reglock_path: str) -> int:
         fd = os.open(reglock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
+            if _reglock_matches_path(fd, reglock_path):
+                return fd
         except BaseException:
+            # The lock is taken by the time the re-check runs, so the fd
+            # must close before any exception propagates: an open fd
+            # keeps the lock and every later rank blocks until exit.
             os.close(fd)
             raise
-        if _reglock_matches_path(fd, reglock_path):
-            return fd
         os.close(fd)
 
 
