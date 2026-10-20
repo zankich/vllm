@@ -282,7 +282,9 @@ def test_loader_strict_applies_scales(tmp_path):
 
 def test_loader_strict_rejects_partial_and_unknown(tmp_path):
     layers = {"a.attn": _fake_qsa_layer("a.attn"), "b.attn": _fake_qsa_layer("b.attn")}
-    with pytest.raises(ValueError, match="Unknown QSA layer names"):
+    # A typo'd local name is skipped as non-local and its layer surfaces
+    # through the strict missing check instead.
+    with pytest.raises(ValueError, match="Missing QSA layer scales"):
         qsa_mod.load_qsa_static_kv_scales(
             layers,
             _sidecar(
@@ -301,6 +303,32 @@ def test_loader_strict_rejects_partial_and_unknown(tmp_path):
         )
     with pytest.raises(ValueError, match="Missing QSA layer scales"):
         qsa_mod.load_qsa_static_kv_scales(layers, _sidecar(tmp_path, {}), strict=True)
+
+
+def test_loader_skips_non_local_names_under_pipeline_parallel(tmp_path):
+    """Under pipeline parallelism each rank's module holds only its stage's
+    layers, so a complete sidecar names layers this rank does not own. Those
+    names must be skipped, not rejected: strict semantics still hold for the
+    local names, whose scales must all be present."""
+    local = {
+        "model.layers.3.self_attn.attn": _fake_qsa_layer(
+            "model.layers.3.self_attn.attn"
+        )
+    }
+    p = _sidecar(
+        tmp_path,
+        {
+            "model.layers.3.self_attn.attn": {"k_scale": 0.02, "v_scale": 0.04},
+            "model.layers.7.self_attn.attn": {"k_scale": 0.03, "v_scale": 0.05},
+        },
+    )
+    applied = qsa_mod.load_qsa_static_kv_scales(local, p, strict=True)
+    assert applied == ["model.layers.3.self_attn.attn"]
+    layer = local["model.layers.3.self_attn.attn"]
+    assert layer._k_scale.item() == pytest.approx(0.02, rel=1e-6)
+    assert layer._v_scale.item() == pytest.approx(0.04, rel=1e-6)
+    assert layer._k_scale_float == pytest.approx(0.02)
+    assert layer._v_scale_float == pytest.approx(0.04)
 
 
 def test_loader_rejects_bad_values_and_non_fp8_layers(tmp_path):

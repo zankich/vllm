@@ -922,8 +922,10 @@ def load_qsa_static_kv_scales(
         {"model.layers.3.self_attn.attn": {"k_scale": 0.25, "v_scale": 2.0}}
 
     ``strict=False`` permits a deliberate subset; omitted layers keep the
-    vLLM default scale of 1.0. Unknown names and non-scalar values are always
-    errors.
+    vLLM default scale of 1.0. Names absent from ``layers`` are skipped
+    (under pipeline parallelism they belong to another rank's stage);
+    non-scalar values are always errors, and ``strict=True`` still requires
+    every supplied layer to be covered.
     """
     path = Path(sidecar_path)
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -956,15 +958,25 @@ def load_qsa_static_kv_scales(
             f"non-FP8 layers: {non_fp8_layers}"
         )
 
-    unknown = sorted(name for name in raw if name not in qsa_layers)
-    if unknown:
-        raise ValueError(f"Unknown QSA layer names in {path}: {unknown}")
+    # Under pipeline parallelism each rank loads only its stage's layers, so
+    # a complete sidecar names layers this rank does not hold. Skip them:
+    # strict still requires every local layer to be covered, so a typo'd
+    # local name surfaces through the missing check below.
+    non_local = sorted(name for name in raw if name not in qsa_layers)
+    if non_local:
+        logger.debug(
+            "Skipping %d non-local QSA layer names in %s: %s",
+            len(non_local),
+            path,
+            non_local,
+        )
     missing = sorted(name for name in qsa_layers if name not in raw)
     if strict and missing:
         raise ValueError(f"Missing QSA layer scales in {path}: {missing}")
 
     validated: dict[str, tuple[float, float]] = {}
-    for layer_name, entry in raw.items():
+    for layer_name in sorted(name for name in raw if name in qsa_layers):
+        entry = raw[layer_name]
         if not isinstance(entry, dict):
             raise ValueError(f"{layer_name} scales must be a JSON object")
         if set(entry) != {"k_scale", "v_scale"}:
