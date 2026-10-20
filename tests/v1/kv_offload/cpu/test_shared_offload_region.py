@@ -5,6 +5,7 @@
 import contextlib
 import ctypes
 import errno
+import fcntl
 import mmap
 import os
 import threading
@@ -875,6 +876,31 @@ def test_cleanup_removes_reglock_file(iid, host_register):
         _cleanup_file(reglock_path)
 
 
+def test_barrier_cleanup_removes_reglock_file(iid, host_register):
+    """cleanup() must remove the reglock on the barrier flow too.
+
+    The barrier drops the region name at construction, so the creator
+    flag that gated the old unlink is already false by the time
+    cleanup() runs. The reglock is then the only name the engine leaves
+    in /dev/shm, and it leaked one inode per boot.
+    """
+    region = _make_region(iid, barrier=lambda: None)
+    reglock_path = region.mmap_path + ".reglock"
+    try:
+        gpu_worker.pin_mmap_region(region)
+        assert os.path.exists(reglock_path), "registration must create the reglock"
+
+        region.cleanup()
+
+        assert not os.path.exists(reglock_path), (
+            "barrier-flow cleanup must remove the reglock file"
+        )
+    finally:
+        region.cleanup()
+        _cleanup_file(region.mmap_path)
+        _cleanup_file(reglock_path)
+
+
 @pytest.fixture
 def host_register(monkeypatch):
     """Mock the cross-platform host_register/host_unregister helpers with
@@ -1382,3 +1408,149 @@ def test_orphaned_reglock_is_reclaimed_with_region(iid):
     finally:
         region.cleanup()
         _cleanup_file(orphan_reglock)
+
+
+def _write_orphan_reglock(engine_id: str, age_s: float = 0.0) -> str:
+    """Leave behind a registration lock whose region name is gone.
+
+    The barrier flow drops the region name at construction, so a crashed
+    engine leaves its reglock behind with no region file beside it. The
+    age backdates the lock's mtime past the sweeper's orphan window.
+    """
+    path = f"/dev/shm/vllm_offload_{engine_id}.mmap.reglock"
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.close(fd)
+    if age_s:
+        stamp = time.time() - age_s
+        os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_orphaned_reglock_without_region_is_reclaimed(iid):
+    """A reglock with no region file beside it is reclaimed by the next start.
+
+    The region name is gone, so the region sweep never matches the lock
+    file and nothing else removes it: one inode leaked per engine boot.
+    """
+    orphan = _write_orphan_reglock(f"{iid}-orphan", age_s=3600)
+    try:
+        region = _make_region(iid)
+        try:
+            assert not os.path.exists(orphan), (
+                "an orphaned reglock must be reclaimed by the next start"
+            )
+        finally:
+            region.cleanup()
+    finally:
+        _cleanup_file(orphan)
+
+
+def test_reglock_held_by_a_live_registration_is_not_reclaimed(iid):
+    """A reglock a rank still holds is in use, not residue.
+
+    The lock is held for the whole registration critical section, so a
+    sweeper that took it would delete the file the other ranks are
+    serializing on.
+    """
+    orphan = _write_orphan_reglock(f"{iid}-held", age_s=3600)
+    fd = os.open(orphan, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        region = _make_region(iid)
+        try:
+            assert os.path.exists(orphan), (
+                "a reglock held by a live registration must survive the sweep"
+            )
+        finally:
+            region.cleanup()
+    finally:
+        os.close(fd)
+        _cleanup_file(orphan)
+
+
+def test_reglock_inside_the_orphan_window_is_not_reclaimed(iid):
+    """A reglock younger than the orphan window may belong to a booting engine.
+
+    Its region name is already gone while its ranks are still registering,
+    so only its age says whether it is residue.
+    """
+    orphan = _write_orphan_reglock(f"{iid}-fresh")
+    try:
+        region = _make_region(iid)
+        try:
+            assert os.path.exists(orphan), (
+                "a reglock inside the orphan window must survive the sweep"
+            )
+        finally:
+            region.cleanup()
+    finally:
+        _cleanup_file(orphan)
+
+
+def test_sweep_leaves_a_reglock_a_rank_recreated(iid, monkeypatch):
+    """A remover must not unlink a path it does not own.
+
+    Two removers can open the same reglock: the first one locks it and
+    unlinks it, and a rank that is registering then creates the path
+    again and locks the new inode. The second remover's fd still names
+    the old inode and its lock is free again, so it takes the lock and
+    would unlink the path -- which now names the file the rank is
+    registering on, leaving that rank's lock on an inode nothing else
+    can see. The removal must leave the path alone.
+    """
+    orphan = _write_orphan_reglock(f"{iid}-orphan", age_s=3600)
+    orphan_ino = os.stat(orphan).st_ino
+
+    real_flock = fcntl.flock
+    state = {"raced": False}
+    registrar_fd = []
+
+    def racing_flock(fd, operation):
+        # The sweep's remover has opened the reglock and is about to take
+        # its lock. Before it does, another remover completes its own
+        # removal of the same path, and a rank registers on a new file
+        # created under the same name.
+        if (
+            not state["raced"]
+            and operation == fcntl.LOCK_EX | fcntl.LOCK_NB
+            and os.fstat(fd).st_ino == orphan_ino
+        ):
+            state["raced"] = True
+            other = os.open(orphan, os.O_RDWR | os.O_NOFOLLOW)
+            try:
+                real_flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                os.unlink(orphan)
+            finally:
+                os.close(other)
+            fd_y = os.open(orphan, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            real_flock(fd_y, fcntl.LOCK_EX)
+            registrar_fd.append(fd_y)
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", racing_flock)
+    try:
+        region = _make_region(iid)
+        try:
+            assert state["raced"], "the sweep never took the orphan's lock"
+            assert os.path.exists(orphan), (
+                "the remover unlinked a path that a rank had recreated"
+            )
+            st = os.stat(orphan)
+            assert st.st_ino == os.fstat(registrar_fd[0]).st_ino, (
+                "the path must still name the file the rank registered on"
+            )
+            assert st.st_nlink == 1
+            # The rank's lock on the surviving file still excludes
+            # everyone else: no other rank can enter the critical section.
+            probe = os.open(orphan, os.O_RDWR)
+            try:
+                with pytest.raises(OSError):
+                    real_flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+        finally:
+            region.cleanup()
+    finally:
+        for fd in registrar_fd:
+            os.close(fd)
+        _cleanup_file(orphan)
