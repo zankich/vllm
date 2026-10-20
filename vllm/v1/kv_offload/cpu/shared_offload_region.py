@@ -88,6 +88,27 @@ def _hold_shared_lock(fd: int, path: str) -> None:
         logger.debug("Could not flock %s; orphan reclaim disabled for it", path)
 
 
+def _reglock_matches_path(fd: int, path: str) -> bool:
+    """Whether the locked fd is still the file the path names.
+
+    A remover that unlinks the reglock under the lock leaves a rank that
+    opened the path earlier holding a lock on an inode the path no longer
+    names, and the next rank to open the path creates a second inode. The
+    two ranks then hold different inodes and their critical sections
+    overlap. A rank whose fd names a stale inode retries on the file the
+    path names now, and a remover whose fd names a stale inode must not
+    unlink the path: the file the path names now belongs to someone else.
+    """
+    st = os.fstat(fd)
+    if st.st_nlink == 0:
+        return False
+    try:
+        path_st = os.stat(path)
+    except FileNotFoundError:
+        return False
+    return (st.st_dev, st.st_ino) == (path_st.st_dev, path_st.st_ino)
+
+
 def _reclaim_orphaned_regions(own_path: str) -> None:
     """Remove offload regions left behind by an engine that died hard.
 

@@ -346,6 +346,170 @@ def _hold_region_child(engine_id: str, release, held) -> None:
         region.cleanup()
 
 
+def test_registration_lock_reverifies_inode_after_removal(tmp_path, monkeypatch):
+    """A removal of the reglock must not split the registration.
+
+    The registration lock only excludes the other ranks while they hold it
+    on the same inode. A remover that unlinks the reglock between a rank's
+    open and its lock leaves that rank holding a lock on an orphaned inode,
+    while the next rank to open the path creates a second inode the first
+    rank does not exclude: the two registrations then run at once, which is
+    the concurrent cudaHostRegister failure the lock file exists to
+    prevent.
+
+    The rank must therefore end up holding the lock on the inode the path
+    names once the removal has happened, and a late rank that opens the
+    path must not be able to take the lock while that rank is inside the
+    critical section.
+    """
+    region_path = tmp_path / "region"
+    region_path.write_bytes(b"\0" * 4096)
+    reglock_path = str(region_path) + ".reglock"
+
+    region_fd = os.open(region_path, os.O_RDWR)
+    region = _make_region(fd=region_fd)
+    region.mmap_path = str(region_path)
+
+    real_flock = fcntl.flock
+    remover_ran = threading.Event()
+    b_lock_fds: list[int] = []
+    b_thread: threading.Thread | None = None
+
+    def tracked_flock(fd, operation):
+        is_rank_b = b_thread is not None and threading.current_thread() is b_thread
+        if is_rank_b and operation == fcntl.LOCK_EX:
+            b_lock_fds.append(fd)
+            if not remover_ran.is_set():
+                # The remover: take the lock on the inode the rank has
+                # open and unlink the path under it, the way the crash
+                # sweep and a failing rank's cleanup do. The rank has
+                # not locked yet, so the lock is free and the removal
+                # succeeds.
+                remover_ran.set()
+                remover_fd = os.open(reglock_path, os.O_RDWR | os.O_NOFOLLOW)
+                try:
+                    real_flock(remover_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    os.unlink(reglock_path)
+                finally:
+                    os.close(remover_fd)
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", tracked_flock)
+
+    errors: list[BaseException] = []
+    inside = 0
+    overlap: list[str] = []
+    state_lock = threading.Lock()
+
+    def enter(rank: str) -> None:
+        nonlocal inside
+        with state_lock:
+            inside += 1
+            if inside > 1:
+                overlap.append(rank)
+
+    def leave() -> None:
+        nonlocal inside
+        with state_lock:
+            inside -= 1
+
+    b_inside = threading.Event()
+    release_b = threading.Event()
+    d_go = threading.Event()
+    d_inside = threading.Event()
+    release_d = threading.Event()
+
+    def run_b() -> None:
+        try:
+            with gpu_worker._region_registration_lock(region):
+                enter("B")
+                try:
+                    b_inside.set()
+                    if not release_b.wait(timeout=30):
+                        errors.append(AssertionError("rank B was never released"))
+                finally:
+                    leave()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def run_d() -> None:
+        try:
+            if not d_go.wait(timeout=30):
+                errors.append(AssertionError("rank D was never started"))
+            with gpu_worker._region_registration_lock(region):
+                enter("D")
+                try:
+                    d_inside.set()
+                    if not release_d.wait(timeout=30):
+                        errors.append(AssertionError("rank D was never released"))
+                finally:
+                    leave()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    b_thread = threading.Thread(target=run_b, name="rank-b")
+    d_thread = threading.Thread(target=run_d, name="rank-d")
+    b_thread.start()
+    d_thread.start()
+    try:
+        assert b_inside.wait(timeout=30), "rank B never entered the critical section"
+
+        # The rank must hold the lock on the file the path names: an
+        # unlinked inode excludes nobody, and a replacement inode the path
+        # names later is a different lock.
+        b_st = os.fstat(b_lock_fds[-1])
+        try:
+            path_st = os.stat(reglock_path)
+        except FileNotFoundError:
+            path_st = None
+        assert path_st is not None, (
+            "the reglock path was removed while a rank held its lock; the "
+            "registration now excludes nobody"
+        )
+        assert (b_st.st_dev, b_st.st_ino) == (path_st.st_dev, path_st.st_ino), (
+            f"the registration lock is on inode {b_st.st_ino} but the path "
+            f"names inode {path_st.st_ino}"
+        )
+        assert b_st.st_nlink > 0, "the registration lock is on an unlinked inode"
+
+        # A late rank that opens the path now must not be able to take the
+        # lock: it would register concurrently with rank B.
+        late_fd = os.open(reglock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(late_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            late_rank_blocked = True
+        else:
+            late_rank_blocked = False
+            fcntl.flock(late_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(late_fd)
+        assert late_rank_blocked, (
+            "a late rank could take the registration lock while rank B held "
+            "it: the two registrations would run concurrently"
+        )
+
+        # Rank D goes through the real lock: it must wait for rank B.
+        d_go.set()
+        release_b.set()
+        assert d_inside.wait(timeout=30), (
+            "the late rank never entered the critical section"
+        )
+        release_d.set()
+    finally:
+        release_b.set()
+        release_d.set()
+        d_go.set()
+        b_thread.join(timeout=30)
+        d_thread.join(timeout=30)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(reglock_path)
+        os.close(region_fd)
+
+    assert not overlap, f"two ranks were inside the critical section: {overlap}"
+    assert not errors, errors
+
+
 def test_registration_completes_when_sibling_region_holds_lock(monkeypatch):
     """CPU-runnable stand-in for the cross_topology_roundtrip gate.
 

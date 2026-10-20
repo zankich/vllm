@@ -30,7 +30,10 @@ from vllm.v1.kv_offload.base import (
     TransferResult,
 )
 from vllm.v1.kv_offload.cpu.host_register import host_register, host_unregister
-from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.kv_offload.cpu.shared_offload_region import (
+    SharedOffloadRegion,
+    _reglock_matches_path,
+)
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
     swap_blocks_batch,
@@ -201,6 +204,28 @@ def _canonical_block_sizes(
 MAX_HOST_REGISTER_CHUNK_BYTES = 64 * 1024**3
 
 
+def _open_and_lock_reglock(reglock_path: str) -> int:
+    """Open the registration lock file and take the exclusive lock on it.
+
+    The lock excludes the other ranks only while they all hold it on the
+    same inode, so the fd is checked against the path once the lock is
+    taken: a remover that unlinked the path in between leaves this rank
+    holding an inode the path no longer names, and the next rank's
+    O_CREAT makes a second one. Such a rank closes the fd and retries on
+    the file the path names now.
+    """
+    while True:
+        fd = os.open(reglock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(fd)
+            raise
+        if _reglock_matches_path(fd, reglock_path):
+            return fd
+        os.close(fd)
+
+
 @contextmanager
 def _region_registration_lock(region: SharedOffloadRegion):
     """Serialize chunked cudaHostRegister and its rollback across ranks.
@@ -219,14 +244,20 @@ def _region_registration_lock(region: SharedOffloadRegion):
     reclaim sweep across the whole cudaHostRegister critical section,
     which a same-fd LOCK_EX-then-LOCK_SH re-acquire would have left
     observable to a racing reclaim only by luck.
+
+    The lock is only an exclusion while every rank holds it on the same
+    inode, so a rank that finds the file it opened no longer named by the
+    path retries on the current one. Without that check, a remover that
+    unlinks the reglock under the lock lets one rank register on the
+    orphaned inode while a later rank creates a fresh one, and the two
+    critical sections run at once.
     """
     if region.fd is None:
         yield
         return
     reglock_path = region.mmap_path + ".reglock"
-    reglock_fd = os.open(reglock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    reglock_fd = _open_and_lock_reglock(reglock_path)
     try:
-        fcntl.flock(reglock_fd, fcntl.LOCK_EX)
         yield
     finally:
         fcntl.flock(reglock_fd, fcntl.LOCK_UN)
