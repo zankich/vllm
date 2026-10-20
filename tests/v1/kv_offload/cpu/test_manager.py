@@ -1859,12 +1859,13 @@ def test_vanished_pinned_load_then_finish_tolerates_vanished_key(cache_policy):
 
 
 def test_second_confirmer_pin_share_drains_when_both_loads_fail():
-    """Two confirmers hold shares of one pin; a corruption rejection evicts
-    the chunk and settles only ONE implicit share. Both confirmers' failed
-    loads keep their pins for request finish, which settles the surviving
-    share. A stranded share would keep the key in _lookup_pinned with no
-    holder, and a future re-store would inflate the count. The pin
-    bookkeeping fully drains once both confirmers have finished."""
+    """Two confirmers hold shares of one pin; a corruption rejection
+    evicts the chunk and drops the pin with every share. Both
+    confirmers' loads fail with the vanished-key pre-scan, their claims
+    are stale, and their finishes release nothing. A surviving share
+    would keep the key in _lookup_pinned with no chunk behind it, and a
+    future re-store would inflate the count. The pin bookkeeping fully
+    drains once both confirmers have finished."""
     region, write_slot, tamper_slot = _make_integrity_region(num_chunks=1)
     manager = make_tiering_cpu_manager(num_chunks=1, mmap_region=region)
     _store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
@@ -1875,14 +1876,16 @@ def test_second_confirmer_pin_share_drains_when_both_loads_fail():
     assert manager.lookup(to_key(1), ctx_b) is LookupResult.HIT
     assert manager._lookup_pin_refs[to_key(1)] == 2
 
-    # The rejector settles one implicit share; one survives the eviction.
+    # The rejection drops the pin with both confirmers' shares.
     tamper_slot(0)
     assert manager.lookup(to_key(1), make_req_context(req_id="rejector")) is (
         LookupResult.MISS
     )
-    assert manager._lookup_pin_refs[to_key(1)] == 1
+    assert to_key(1) not in manager._lookup_pinned
+    assert manager._lookup_pin_refs == {}
 
-    # Both confirmers' loads fail, leaving their pins for request finish.
+    # Both confirmers' loads fail on the vanished key; their stale claims
+    # sit until request finish.
     with pytest.raises(OffloadKeyVanishedError):
         manager.prepare_load(to_keys([1]), ctx_a)
     with pytest.raises(OffloadKeyVanishedError):
@@ -2239,6 +2242,100 @@ def test_finish_after_rejection_releases_nothing_for_the_new_holder():
     chunk = manager._policy.get(to_key(1))
     assert chunk is not None and chunk.ref_cnt == 0
     assert manager._num_evictable_cache_chunks == 1
+
+
+def test_re_store_confirmer_after_rejection_takes_a_fresh_pin():
+    """A rejection with two or more confirmers must not leave the pin
+    alive under the old id. If it does, the re-stored key's next
+    confirmer joins the leftover pin through the share branch, which
+    never marks the new chunk non-evictable: the re-stored chunk stays
+    evictable under a pin its confirmer believes in, so an eviction can
+    steal it mid-load and a request that never saw the corruption takes
+    the failed receive."""
+    region, write_slot, tamper_slot = _make_integrity_region(num_chunks=1)
+    manager = make_tiering_cpu_manager(num_chunks=1, mmap_region=region)
+    _store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
+
+    ctx_a = make_req_context(req_id="req-a")
+    ctx_b = make_req_context(req_id="req-b")
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+    assert manager.lookup(to_key(1), ctx_b) is LookupResult.HIT
+    pin_id_before = manager._lookup_pin_ids[to_key(1)]
+    evictable_held = manager._num_evictable_cache_chunks
+
+    tamper_slot(0)
+    assert manager.lookup(to_key(1), make_req_context(req_id="rejector")) is (
+        LookupResult.MISS
+    )
+
+    # The key is re-stored and confirmed by a request that never saw the
+    # corruption. The confirmer must take a fresh pin: one share under a
+    # new id, with the re-stored chunk leaving the evictable pool. One
+    # resident chunk is pinned, so the count matches the held state from
+    # before the rejection.
+    _store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
+    ctx_c = make_req_context(req_id="req-c")
+    assert manager.lookup(to_key(1), ctx_c) is LookupResult.HIT
+    assert manager._lookup_pin_refs[to_key(1)] == 1
+    assert manager._lookup_pin_ids[to_key(1)] != pin_id_before
+    assert manager._num_evictable_cache_chunks == evictable_held
+
+
+def test_reject_then_re_store_finish_leaves_no_evictable_overcount():
+    """The reject-then-re-store instance of the pin accounting drift: two
+    confirmers, a rejection, a re-store, then the confirmers' finishes.
+    The pre-rejection claims must release nothing against the re-stored
+    chunk, and the evictable count must equal the number of resident
+    evictable chunks."""
+    region, write_slot, tamper_slot = _make_integrity_region(num_chunks=1)
+    manager = make_tiering_cpu_manager(num_chunks=1, mmap_region=region)
+    _store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
+
+    ctx_a = make_req_context(req_id="req-a")
+    ctx_b = make_req_context(req_id="req-b")
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+    assert manager.lookup(to_key(1), ctx_b) is LookupResult.HIT
+
+    tamper_slot(0)
+    assert manager.lookup(to_key(1), make_req_context(req_id="rejector")) is (
+        LookupResult.MISS
+    )
+
+    _store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
+    # One resident, unpinned, evictable chunk.
+    assert manager._num_evictable_cache_chunks == 1
+
+    manager.on_request_finished(ctx_a)
+    manager.on_request_finished(ctx_b)
+    assert manager._policy.get(to_key(1)) is not None
+    assert manager._num_evictable_cache_chunks == 1
+
+
+def test_single_confirmer_rejection_drops_the_whole_pin():
+    """The single-confirmer rejection shape is unchanged: the rejection
+    drops the key's entire pin, the chunk leaves the cache, and the
+    confirmer's finish releases nothing more."""
+    region, write_slot, tamper_slot = _make_integrity_region(num_chunks=1)
+    manager = make_tiering_cpu_manager(num_chunks=1, mmap_region=region)
+    _store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
+
+    ctx_a = make_req_context(req_id="req-a")
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+    assert manager._lookup_pin_refs[to_key(1)] == 1
+
+    tamper_slot(0)
+    assert manager.lookup(to_key(1), make_req_context(req_id="rejector")) is (
+        LookupResult.MISS
+    )
+    assert to_key(1) not in manager._lookup_pinned
+    assert manager._lookup_pin_refs == {}
+    assert to_key(1) not in manager._lookup_pin_ids
+    assert manager._policy.get(to_key(1)) is None
+    assert manager._num_evictable_cache_chunks == 0
+
+    manager.on_request_finished(ctx_a)
+    assert manager._lookup_pin_refs == {}
+    assert manager._num_evictable_cache_chunks == 0
 
 
 def test_verify_stored_slot_cross_check():

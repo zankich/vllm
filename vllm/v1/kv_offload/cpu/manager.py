@@ -52,9 +52,10 @@ class _LoadPinState:
 
     One claim per key: a request that looks the same key up twice holds
     one share of that pin, not two (fork, 2026-10-19). Each claim records
-    the pin it was taken under, so a claim left behind by a pin that has
-    since been replaced (the key was evicted by a corruption rejection
-    and another request re-pinned it) is stale and releases nothing."""
+    the pin it was taken under, so a claim is stale whenever that pin
+    has been dropped, and releases nothing. A corruption rejection drops
+    the key's pin with every share, so each surviving confirmer's claim
+    from before a rejection is stale."""
 
     __slots__ = ("pins", "pin_ids")
 
@@ -136,11 +137,10 @@ class CPUOffloadingManager(OffloadingManager):
         self._lookup_pinned: set[OffloadKey] = set()
         self._lookup_pin_refs: dict[OffloadKey, int] = {}
         # Identity of each key's current pin. A request's claim records
-        # the pin it was taken under, so a claim left behind by a pin
-        # that has been replaced (the key was evicted by a corruption
-        # rejection and another request re-pinned it) is stale and
-        # releases nothing (fork, 2026-10-19). Ids start at 1; 0 is the
-        # "no recorded identity" fallback.
+        # the pin it was taken under, so a claim is stale whenever that
+        # pin has been dropped and releases nothing; a corruption
+        # rejection drops the pin with every share (fork, 2026-10-19).
+        # Ids start at 1; 0 is the "no recorded identity" fallback.
         self._lookup_pin_ids: dict[OffloadKey, int] = {}
         self._next_pin_id: int = 0
 
@@ -213,16 +213,15 @@ class CPUOffloadingManager(OffloadingManager):
         # so it is counted as evictable — unless a lookup pin already
         # moved it out of the evictable count.
         if key in self._lookup_pinned:
-            # Another request's share may survive; their prepare_load
-            # will see the chunk is gone and fail the load.
-            # Decrement this rejector's implicit share (it never pinned
-            # because integrity-check failures short-circuit before the
-            # pin branch). Refcounted: only discard from the set when
-            # the last share goes.
-            self._lookup_pin_refs[key] -= 1
-            assert self._lookup_pin_refs[key] >= 0
-            if self._lookup_pin_refs[key] == 0:
-                self._drop_lookup_pin(key)
+            # Drop the pin with every share, not just one. Surviving
+            # confirmers' claims record this pin's id, so they go stale:
+            # finish releases nothing and their prepare_load pre-scan
+            # reports the vanished key as a failed receive. A refcounted
+            # remnant would survive under the old pin id with no chunk
+            # behind it, and a confirmer of a later re-store would join
+            # it through the share branch, which never marks the new
+            # chunk non-evictable.
+            self._drop_lookup_pin(key)
         else:
             self._num_evictable_cache_chunks -= 1
             assert self._num_evictable_cache_chunks >= 0
@@ -667,11 +666,12 @@ class CPUOffloadingManager(OffloadingManager):
         if pin_state is not None:
             for key, pin_id in pin_state.pin_ids.items():
                 if self._lookup_pin_ids.get(key) != pin_id:
-                    # Stale claim: the key's pin was replaced (a corruption
-                    # rejection evicted it and another request re-pinned
-                    # it), so this claim's share was settled with the old
-                    # pin. Releasing it now would take a share that
-                    # belongs to the new pin's holder.
+                    # Stale claim: the pin it was taken under has been
+                    # dropped (a corruption rejection dropped it, or a
+                    # re-store's confirmer took a fresh one), so this
+                    # claim holds no live share. Releasing it now would
+                    # take a share that belongs to the current pin's
+                    # holder, or decrement a pin that no longer exists.
                     continue
                 self._lookup_pin_refs[key] -= 1
                 assert self._lookup_pin_refs[key] >= 0

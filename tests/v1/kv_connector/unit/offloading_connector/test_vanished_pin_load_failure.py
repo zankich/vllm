@@ -133,8 +133,8 @@ def test_vanished_pinned_load_is_reported_failed_by_every_worker() -> None:
     the output aggregator to surface the failure to the core scheduler.
 
     Trigger chain: requests A and B confirm the same two chunks (two lookup
-    pin shares each); a corruption rejection evicts the first chunk, settling
-    one implicit share; A's prepare_load then finds that key gone. Before the
+    pin shares each); a corruption rejection evicts the first chunk and
+    drops its pin; A's prepare_load then finds that key gone. Before the
     fix the manager degraded it to a miss and the short spec, paired with A's
     full GPU block list, tripped the worker's transfer-planning assert."""
     region, write_slot, tamper_slot = _make_integrity_region(
