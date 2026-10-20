@@ -12,6 +12,7 @@ host_register sections (the observed 3090 Ti TP2 failure mode).
 """
 
 import contextlib
+import errno
 import fcntl
 import os
 import threading
@@ -611,6 +612,46 @@ def test_registration_completes_when_sibling_region_holds_lock(monkeypatch):
             own_region.cleanup()
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(own_region.mmap_path + ".reglock")
+
+
+def test_registration_refuses_symlinked_reglock(monkeypatch, tmp_path):
+    """/dev/shm is world-writable, and both reglock removers open with
+    O_NOFOLLOW because a local user may plant a symlink under the name.
+    The registration opener locks through whatever the path names, so it
+    must refuse the same planted symlink instead of flocking the target
+    inode, and the open failure must propagate out of the retry loop
+    rather than spin: each iteration that does not return raises or
+    reopens a path that changed underneath."""
+    rec_register = MagicMock(return_value=True)
+    rec_unregister = MagicMock()
+    monkeypatch.setattr(gpu_worker, "host_register", rec_register)
+    monkeypatch.setattr(gpu_worker, "host_unregister", rec_unregister)
+
+    region_path = tmp_path / "region"
+    region_path.write_bytes(b"\0" * 4096)
+    decoy = tmp_path / "decoy"
+    decoy.write_bytes(b"")
+    reglock_path = tmp_path / "region.reglock"
+    os.symlink(decoy, reglock_path)
+
+    region_fd = os.open(region_path, os.O_RDWR)
+    try:
+        region = _make_region(fd=region_fd)
+        region.mmap_path = str(region_path)
+
+        deadline = time.monotonic() + 10.0
+        with pytest.raises(OSError) as exc_info:
+            gpu_worker.pin_mmap_region(region)
+        assert time.monotonic() < deadline, (
+            "pin_mmap_region spun on the symlinked reglock instead of raising"
+        )
+        assert exc_info.value.errno == errno.ELOOP
+        # The refusal happens before any registration work, so the region
+        # stays unpinned and the decoy was never locked through.
+        rec_register.assert_not_called()
+        assert not region.is_pinned
+    finally:
+        os.close(region_fd)
 
 
 def test_registration_lock_releases_fd_when_recheck_raises(monkeypatch, tmp_path):

@@ -212,10 +212,15 @@ def _open_and_lock_reglock(reglock_path: str) -> int:
     taken: a remover that unlinked the path in between leaves this rank
     holding an inode the path no longer names, and the next rank's
     O_CREAT makes a second one. Such a rank closes the fd and retries on
-    the file the path names now.
+    the file the path names now. The open failure propagates out of the
+    loop: the retry only covers a path that changed between a successful
+    open and the re-check, never a failing open.
     """
     while True:
-        fd = os.open(reglock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        # /dev/shm is world-writable, so refuse to follow a symlink a local
+        # user may have planted under this name, the way both removers of
+        # the same path do; O_NOFOLLOW makes os.open raise ELOOP.
+        fd = os.open(reglock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             if _reglock_matches_path(fd, reglock_path):
