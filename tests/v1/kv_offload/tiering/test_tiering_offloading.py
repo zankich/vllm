@@ -1646,3 +1646,90 @@ def test_tiering_lookup_promotes_from_fs_across_restart(tmp_path):
         )
     finally:
         manager.shutdown()
+
+
+def test_fs_cascade_store_refuses_bytes_diverged_from_primary_record(tmp_path):
+    """The cascade cross-check wiring, end to end on a real tier pair.
+
+    The wiring test pins that the manager assigns the primary's
+    verify_stored_slot into the fs tier's slot; this one proves the
+    assignment is live: a fresh fs write whose bytes no longer match the
+    checksum the primary recorded at store completion is refused at the
+    mint. Load-side integrity binds the key to whatever bytes land on
+    disk, so without this check a mislabeled write would verify clean
+    forever."""
+    import os
+
+    from tests.v1.kv_offload.tiering.test_fs_tier import (
+        _BLOCK_ELEMENTS,
+        _NUM_BLOCKS,
+        _make_offloading_spec,
+        _page_aligned_rand_tensor,
+    )
+    from tests.v1.kv_offload.tiering.test_fs_tier import key as fs_key
+    from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
+
+    def cascade_resident_key(round_no: int) -> None:
+        ctx = ReqContext(req_id=f"round{round_no}")
+        manager.on_new_request(ctx)
+        job = manager.create_store_job([target], ctx, 0)
+        fs.submit_store(job)
+
+    fs_spec = _make_offloading_spec(enable_kv_cache_events=False)
+    tensor = _page_aligned_rand_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    region = MagicMock()
+    region.create_kv_memoryview.return_value = memoryview(tensor.numpy())
+    primary = CPUPrimaryTierOffloadingManager(
+        num_chunks=_NUM_BLOCKS, mmap_region=region
+    )
+    fs = FileSystemTierManager(
+        offloading_spec=fs_spec,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=2,
+        n_write_threads=2,
+    )
+    manager = TieringOffloadingManager(primary_tier=primary, secondary_tiers=[fs])
+    schedule_end = ScheduleEndContext(new_req_ids=[], preempted_req_ids=())
+    target = fs_key(1)
+    path = fs.file_mapper.get_file_name(target)
+    try:
+        # Mint: the full GPU-facing flow records the slot checksum and the
+        # manager's own cascade writes the file.
+        ctx = ReqContext(req_id="mint")
+        manager.on_new_request(ctx)
+        manager.prepare_store([target], ctx)
+        manager.complete_store([target], ctx, success=True)
+        fs.drain_jobs()
+        manager.on_schedule_end(schedule_end)
+        assert os.path.exists(path)
+
+        # Control: a re-cascade of the resident key re-writes the fresh
+        # file, so the cross-check passing is observable, not assumed.
+        os.unlink(path)
+        cascade_resident_key(1)
+        fs.drain_jobs()
+        manager.on_schedule_end(schedule_end)
+        assert os.path.exists(path)
+
+        # Refusal: tamper the primary slot behind the tier's back, delete
+        # the file, and cascade again. The bytes about to be persisted no
+        # longer match the recorded checksum, so the write is refused and
+        # no file appears.
+        chunk_id = primary._policy.get(target).chunk_id
+        original = tensor[chunk_id, 0].item()
+        tensor[chunk_id, 0] = original + 1.0
+        assert (
+            primary.verify_stored_slot(target, bytes(tensor[chunk_id].numpy())) is False
+        ), "tamper must be visible to the primary's own record"
+        os.unlink(path)
+        cascade_resident_key(2)
+        fs.drain_jobs()
+        manager.on_schedule_end(schedule_end)
+        assert not os.path.exists(path), (
+            "cascade cross-check wired the wrong callable or none: diverged "
+            "bytes were persisted to the fs tier"
+        )
+    finally:
+        manager.shutdown()

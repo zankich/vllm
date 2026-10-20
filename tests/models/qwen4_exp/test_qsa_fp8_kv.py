@@ -391,6 +391,111 @@ def test_clip_on_forces_the_unfused_writer(monkeypatch):
     assert qsa_mod._qsa_needs_unfused_kv_write("auto", torch.device("cuda", 0)) is True
 
 
+@pytest.fixture
+def tp1_gloo(tmp_path):
+    """Single-rank gloo group so the layer's real __init__ can size its
+    TP-sharded projections. Gloo never touches CUDA."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+
+    with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method=f"file://{tmp_path / 'dist'}",
+            backend="gloo",
+        )
+        initialize_model_parallel(tensor_model_parallel_size=1)
+    yield
+    destroy_model_parallel()
+    destroy_distributed_environment()
+
+
+def _build_real_qsa_layer(cache_dtype: str, layer_id: int):
+    """Construct the production layer far enough that __init__ itself
+    evaluates the fused-prepare conjunct against the mocked device."""
+    from types import SimpleNamespace
+
+    from transformers import Qwen4ExpTextConfig
+
+    from vllm.config import CacheConfig, VllmConfig, set_current_vllm_config
+
+    hf_cfg = Qwen4ExpTextConfig(
+        vocab_size=128,
+        eos_token_id=0,
+        hidden_size=256,
+        num_hidden_layers=2,
+        layer_types=["qwen_sparse_attention"] * 2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        indexer_n_heads=2,
+        indexer_kv_heads=1,
+        indexer_head_dim=128,
+        indexer_budget=4,
+        indexer_compress_ratio=4,
+        rope_parameters={"rope_theta": 10000.0, "rope_type": "default"},
+    )
+    vc = VllmConfig(cache_config=CacheConfig(cache_dtype=cache_dtype))
+    vc.model_config = SimpleNamespace(
+        dtype=torch.bfloat16,
+        hf_text_config=hf_cfg,
+        multimodal_config=None,
+        uses_mrope=False,
+    )
+    # The engine builds models under the model dtype as the default dtype;
+    # the rope gate requires a bf16 rope.
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with set_current_vllm_config(vc):
+            return qsa_mod.Qwen4ExpQSAAttention(
+                vllm_config=vc,
+                config=hf_cfg,
+                layer_id=layer_id,
+                prefix=f"model.layers.{layer_id}.self_attn",
+            )
+    finally:
+        torch.set_default_dtype(prev)
+
+
+def test_use_fused_qsa_prepare_wiring_pins_sm86_fp8_to_unfused_writer(
+    monkeypatch, tp1_gloo
+):
+    """The wired value of use_fused_qsa_prepare was never evaluated: the
+    predicate tests call _qsa_needs_unfused_kv_write in isolation and the
+    loader fixtures bypass __init__ via __new__. This drives the real
+    constructor with the device mocked, so the conjunct's own inputs —
+    the layer's kv_cache_dtype and the device it computes on — flow from
+    the config, not from a test-chosen argument. Both upstream conjuncts
+    hold, so the flip between the two legs is the D1 conjunct alone:
+    fused prepare must be off for an e4m3 cache on SM86 (the fused
+    launch's fp8e4nv cast does not compile below SM89) and on for an
+    auto cache on SM89."""
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(qsa_mod.current_platform, "is_cuda", lambda: True)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (8, 6))
+    low = _build_real_qsa_layer("fp8_e4m3", 0)
+    assert low.kv_cache_dtype == "fp8_e4m3"
+    assert low.use_fused_qk_norm_rope_gate
+    assert low.indexer.use_fused_pre_indexer
+    assert low.use_fused_qsa_prepare is False
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (8, 9))
+    high = _build_real_qsa_layer("auto", 1)
+    assert high.kv_cache_dtype == "auto"
+    assert high.use_fused_qk_norm_rope_gate
+    assert high.indexer.use_fused_pre_indexer
+    assert high.use_fused_qsa_prepare is True
+
+
 def test_backend_supports_kv_cache_dtype_bypasses_fa_hardware_check():
     # The inherited FlashAttentionBackend.supports_kv_cache_dtype defers
     # quantized dtypes to flash_attn_supports_kv_cache_dtype, which is False
