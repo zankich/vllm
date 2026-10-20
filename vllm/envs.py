@@ -2205,6 +2205,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_SKIP_MODEL_NAME_VALIDATION", "0").strip().lower()
         in ("1", "true")
     ),
+    # Comma-separated token ids injected before the forced </think> at
+    # thinking-budget exhaustion (fork). Read raw by
+    # vllm/v1/sample/thinking_budget_state.py; declared here so the engine
+    # does not warn about an unknown environment variable on every boot.
+    "VLLM_THINKING_WRAPUP_TOKEN_IDS": lambda: (
+        os.getenv("VLLM_THINKING_WRAPUP_TOKEN_IDS", "")
+    ),
     # Whether it is a scale up launch engine for elastic EP,
     # Should only be set by EngineCoreClient.
     "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH": lambda: bool(
@@ -2434,6 +2441,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENABLE_CUDA_COMPATIBILITY",
         "VLLM_CUDA_COMPATIBILITY_PATH",
         "VLLM_SKIP_MODEL_NAME_VALIDATION",
+        "VLLM_THINKING_WRAPUP_TOKEN_IDS",
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
