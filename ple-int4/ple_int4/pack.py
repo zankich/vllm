@@ -3,7 +3,7 @@
 
 """Streaming FP8 -> INT4 repack of the Qwen3.8-Flash-Next PLE n-gram table.
 
-Library surface (used by the CLI, the always-on self-check, and the G3f
+Library surface (used by the CLI, the always-on self-check, and the
 synthetic gate):
     pack_table_to_int4(tensor, group_size, global_scale) -> (words, scales)
     decode_int4(words, scales, group_size) -> fp32 tensor
@@ -273,7 +273,8 @@ def convert(
                 table = f.get_tensor(name)
             if tuple(table.shape) != (expected_rows, head_dim):
                 raise ValueError(
-                    f"{name}: expected {(expected_rows, head_dim)}, got {tuple(table.shape)}"
+                    f"{name}: expected {(expected_rows, head_dim)}, "
+                    f"got {tuple(table.shape)}"
                 )
             if table.dtype not in (
                 torch.float8_e4m3fn,
@@ -301,7 +302,8 @@ def convert(
             rel = (residual / (s + 1e-30)).max().item() if rows else 0.0
             if (residual > bound).any():
                 raise ValueError(
-                    f"{name}: {int((residual > bound).sum())} sampled values exceed round-trip bound"
+                    f"{name}: {int((residual > bound).sum())} sampled values "
+                    f"exceed round-trip bound"
                 )
             zero_rows = ref.abs().amax(dim=-1) == 0
             if zero_rows.any() and not torch.all(dec[zero_rows] == 0):
@@ -337,7 +339,8 @@ def convert(
 
     os.makedirs(out_dir, exist_ok=True)
 
-    # Symlink every non-PLE file from the source; absolute paths (compose bind-mounts /models).
+    # Symlink every non-PLE file from the source; absolute paths
+    # (compose bind-mounts /models).
     ple_src_files = set(by_src_file)
     for entry in os.listdir(src_dir):
         src_path = os.path.join(src_dir, entry)

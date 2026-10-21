@@ -505,7 +505,7 @@ class TritonAttentionImpl(AttentionImpl):
             cap = current_platform.get_device_capability()
             cap_str = cap.as_version_str() if cap is not None else "unknown"
             dev = current_platform.get_device_name()
-            # PATCH triton-fp8kv-sm80: widen the FP8 KV gate to SM80+; the
+            # Fork patch (triton fp8 KV, SM80+): widen the FP8 KV gate to SM80+; the
             # kernel dequantizes FP8 K/V in software (_cast_kv_tile), and the
             # cache is stored as e5m2 below SM89 where triton lacks fp8e4nv.
             if self.kv_cache_dtype.startswith("fp8") and not (
@@ -538,7 +538,7 @@ class TritonAttentionImpl(AttentionImpl):
 
         self.attn_type = attn_type
         self.fp8_dtype = current_platform.fp8_dtype()
-        # PATCH triton-fp8kv-sm80: below SM89 triton cannot compile
+        # Fork patch (triton fp8 KV, SM80+): below SM89 triton cannot compile
         # fp8e4nv; see kv_fp8_dtype_for_platform.
         if is_quantized_kv_cache(self.kv_cache_dtype):
             self.fp8_dtype = kv_fp8_dtype_for_platform(self.fp8_dtype)

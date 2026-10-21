@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""G3 synthetic gates for ple_int4 (no serve, no full checkpoint).
+"""Synthetic gates for ple_int4 (no serve, no full checkpoint).
 
 Run inside the pinned venv:
     python -m pytest ple-int4/tests/test_ple_int4.py -q
@@ -150,7 +150,7 @@ def test_kernel_shard_partitioning_exact_zeros():
 
 
 def test_fp16_and_int32_uva_views():
-    """G3c: burn down the untested fp16 UVA surface empirically."""
+    """Burn down the untested fp16 UVA surface empirically."""
     if not torch.cuda.is_available():
         print("SKIP (no cuda)")
         return
@@ -168,7 +168,7 @@ def test_fp16_and_int32_uva_views():
 
 
 def test_dispatch_marker_and_env():
-    """G3a: the wrapped from_quant_config returns the int4 method on the
+    """The wrapped from_quant_config returns the int4 method on the
     marker, delegates on everything else, and the stock path still raises
     NotImplementedError for CompressedTensors configs."""
     from ple_int4 import install, uninstall
@@ -223,7 +223,7 @@ def test_dispatch_marker_and_env():
 
 
 def test_plugin_never_filters_offload_groups():
-    """Task 13's in-tree exclusion owns group filtering; the plugin must
+    """The in-tree exclusion owns group filtering; the plugin must
     not install _aligned_group_ids even on trees where the upstream symbol
     exists (v0.30.0+)."""
     from ple_int4 import install, uninstall

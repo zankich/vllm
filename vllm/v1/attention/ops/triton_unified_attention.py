@@ -995,7 +995,7 @@ def unified_attention(
         head_size, sliding_window_val, q.element_size(), is_prefill=False
     )
 
-    # PATCH triton-fp8kv-sm80: SM80/86 shared memory (100KB per block) cannot
+    # Fork patch (triton fp8 KV, SM80+): SM80/86 shared memory (100KB per block) cannot
     # hold the default head_dim-512 prefill tiles with Triton's default
     # pipelining (required ~112KB, limit 101376). Cap num_stages at 1 and
     # halve the prefill tile for large heads on sub-SM90 devices — only for

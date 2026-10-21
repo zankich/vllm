@@ -124,9 +124,8 @@ def install() -> None:
 # The TP4 all-reduce force moved into the fork source (2026-09-20):
 # NvmlCudaPlatform.is_fully_connected accepts P2P read/write when NVLink
 # is absent, and cuda_communicator allows the ep group. The plugin no
-# longer patches it — the probe in source asks the hardware instead of
-# forcing True, and the expandable_segments exclusion stays documented
-# in the composes (custom_all_reduce.cuh:164).
+# longer patches it, and the expandable_segments exclusion stays documented
+# alongside the custom-all-reduce incompatibility (custom_all_reduce.cuh:164).
 
 
 def uninstall() -> None:

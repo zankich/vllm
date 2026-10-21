@@ -51,7 +51,7 @@ def test_boundary_beyond_prompt_is_a_violation():
 
 def test_boundary_misaligned_to_chunk_is_not_flagged():
     # Boundary = GPU-prefix hits (16-token blocks) + offload chunks (800):
-    # mixed granularity, alignment is NOT an invariant and the real r3
+    # mixed granularity, alignment is NOT an invariant and the real
     # arithmetic (1950 + 14400 = 16350) is legitimately misaligned.
     line, violations = _summary()
     assert violations == []

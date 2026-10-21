@@ -1,16 +1,19 @@
-"""G5b gate: full-checkpoint int4-PLE serve inside the capped container.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""Gate: full-checkpoint int4-PLE serve inside the capped container.
 
 Prints the generation and top-5 logprobs of the first sampled token so a
-degenerate distribution is visible immediately (the first attempt's `!!!!`
-was caused by an index that loaded only the PLE files; the logprob spread is
-how we tell 'model loaded' from 'logits collapsed' if anything recurs).
+degenerate distribution is visible immediately (a collapsed logprob spread
+distinguishes 'logits collapsed' from 'model loaded' if anything recurs).
 """
 
 
 def main() -> None:
     from vllm import LLM, SamplingParams
 
-    MODEL = "models/local/Qwen3.8-Flash-Next-W4A16-INT4PLE"  # deploy-repo-relative
+    # relative to the deployment tree
+    MODEL = "models/local/Qwen3.8-Flash-Next-W4A16-INT4PLE"
 
     llm = LLM(
         model=MODEL,

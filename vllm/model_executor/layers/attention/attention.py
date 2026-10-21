@@ -211,7 +211,7 @@ def _init_kv_cache_quant(
                 CompressedTensorsKVCacheMethod,
             )
 
-            # PATCH triton-fp8kv-sm80: below SM89, e5m2 is the only fp8 KV
+            # Fork patch (triton fp8 KV, SM80+): below SM89, e5m2 is the only fp8 KV
             # flavor triton can compile, so allow it even for checkpoints
             # with a calibrated kv_cache_scheme. The static scales were
             # calibrated for e4m3 semantics: serving them with e5m2 storage
@@ -481,7 +481,7 @@ class Attention(nn.Module, AttentionLayerBase):
         if (
             self.impl.supports_quant_query_input
             and (
-                # PATCH triton-fp8kv-sm80: query quant targets e4m3 kernels
+                # Fork patch (triton fp8 KV, SM80+): query quant targets e4m3 kernels
                 # only; e5m2 KV runs with bf16 queries and in-kernel KV
                 # dequant, so skip QuantFP8 setup for it.
                 self.kv_cache_dtype in ("fp8", "fp8_e4m3")

@@ -24,7 +24,7 @@ def _is_supported_kv_cache_dtype(kv_cache_dtype: str) -> bool:
     ):
         return False
     if kv_cache_dtype.startswith("fp8"):
-        # PATCH triton-fp8kv-sm80: SM80+ served via e5m2 storage with
+        # Fork patch (triton fp8 KV, SM80+): SM80+ served via e5m2 storage with
         # torch-side RNE quantization in the wrappers below.
         return current_platform.has_device_capability(80) or current_platform.is_xpu()
     if kv_cache_dtype == "bfloat16":
@@ -59,7 +59,7 @@ def _quantize_kv_e5m2_for_sm80(
     v_scale: torch.Tensor | None,
     *caches: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
-    """PATCH triton-fp8kv-sm80, shared by both cache-store wrappers: below
+    """Fork patch (triton fp8 KV, SM80+), shared by both cache-store wrappers: below
     SM89 triton cannot compile fp8e4nv, and its implicit e5m2 cast rounds
     ties away from even. Quantize in torch (RNE) and let the kernel's
     is_fp8 input branch store raw bytes. Returns the (key, value) pair to
@@ -462,7 +462,7 @@ def triton_reshape_and_cache_flash(
         key_cache = key_cache.view(kv_cache_torch_dtype)
         value_cache = value_cache.view(kv_cache_torch_dtype)
     FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype)
-    # PATCH triton-fp8kv-sm80: torch-side RNE quantize and e5m2 cache views
+    # Fork patch (triton fp8 KV, SM80+): torch-side RNE quantize and e5m2 cache views
     # below SM89; the branch lives once in _quantize_kv_e5m2_for_sm80.
     key, value, (key_cache, value_cache) = _quantize_kv_e5m2_for_sm80(
         kv_cache_dtype,
@@ -631,7 +631,7 @@ def triton_reshape_and_cache_flash_diffkv(
         # (e.g. explicit cast to fp8e4m3fnuz is not supported in triton 3.4)
         kv_cache = kv_cache.view(kv_cache_torch_dtype)
     FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype)
-    # PATCH triton-fp8kv-sm80: torch-side RNE quantize, see main wrapper.
+    # Fork patch (triton fp8 KV, SM80+): torch-side RNE quantize, see main wrapper.
     key, value, (kv_cache,) = _quantize_kv_e5m2_for_sm80(
         kv_cache_dtype,
         kv_cache_torch_dtype,

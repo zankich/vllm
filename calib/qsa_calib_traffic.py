@@ -146,7 +146,7 @@ def image_chat(n_words):
     )
 
 
-# Measured on halt95's server for the same tokenizer: the word list tokenizes
+# Measured for the same tokenizer upstream of the adaptation: the word list tokenizes
 # at ~1.26 tokens/word, so words = tokens / 1.26. The deepest arm sits just
 # under max-model-len 262144.
 RATIO = 1.26

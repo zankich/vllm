@@ -165,8 +165,8 @@ def _qsa_collect_absmax(
 # both safe by construction. Reading is the hazardous half: CUDA forbids a
 # whole class of calls from another thread while a cudagraph capture is
 # active, and the reader cannot detect capture (the API reports the calling
-# thread), so a live reader cannot be made safe alongside graphs (halt95's
-# rc3-rc7 arc concluded the same, 0073 "default off, operator ruling").
+# thread), so a live reader cannot be made safe alongside graphs (the
+# upstream adaptation reached the same conclusion; see halt95's repo).
 # Reading therefore happens in two safe places only:
 #   - VLLM_QSA_KV_CLIP_COUNT=1: counters on; per-layer totals drained and
 #     logged ONCE at engine shutdown, on the engine thread with capture gone.

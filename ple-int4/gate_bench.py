@@ -1,6 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Decode/prefill profiling harness for the int4-PLE Flash-Next serve.
 
-Env knobs (docker compose run -e K=V flashnext-int4ple):
+Env knobs (docker compose run -e K=V <service>):
   EAGER=1|0   enforce_eager (default 0 = graphs on)
   MTPK=int    MTP speculative tokens (default 3; 0 = off)
   CAPTURES    comma list of cudagraph capture sizes (default: auto, or
@@ -14,10 +17,12 @@ Env knobs (docker compose run -e K=V flashnext-int4ple):
   COLD=1      skip the warmup so the timed run pays cold prefill (TTFT probe)
   MAXTOK      timed generation length (default 256)
 """
+
 import os
 import time
 
-MODEL = "models/local/Qwen3.8-Flash-Next-W4A16-INT4PLE"  # deploy-repo-relative
+# relative to the deployment tree
+MODEL = "models/local/Qwen3.8-Flash-Next-W4A16-INT4PLE"
 SHORT_PROMPT = "Write a Python function that reverses a linked list."
 
 EAGER = os.environ.get("EAGER", "0") == "1"
@@ -41,10 +46,9 @@ def build_prompt(depth: int) -> str:
 
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     para = (
-        "The deployment layer keeps compose files, exporters and operational "
-        "scripts in one repository per artifact type. Validation is a config "
-        "check plus a pytest suite, and deploy verification happens in the "
-        "live environment. "
+        "One repository holds deployment artifacts, organized one directory "
+        "per artifact type. Validation is a config check plus a pytest suite, "
+        "and deploy verification happens in the live environment. "
     )
     ids = tok.encode(para)
     reps = depth // len(ids) + 1
@@ -90,13 +94,20 @@ def main() -> None:
     )
     sp = SamplingParams(max_tokens=MAXTOK, temperature=0, ignore_eos=True)
     if not COLD:
-        llm.generate([prompt], SamplingParams(max_tokens=32, temperature=0, ignore_eos=True), use_tqdm=False)
+        llm.generate(
+            [prompt],
+            SamplingParams(max_tokens=32, temperature=0, ignore_eos=True),
+            use_tqdm=False,
+        )
     t0 = time.perf_counter()
     out = llm.generate([prompt] * NSEQ, sp, use_tqdm=False)
     wall = time.perf_counter() - t0
     n = sum(len(o.outputs[0].token_ids) for o in out)
-    label = (f"eager={int(EAGER)} mtp={MTPK} batch={BATCHTOK} seqs={MAXSEQS} "
-             f"ctx={CTX} util={UTIL:.2f} kvb={KVB:g} depth={DEPTH} nseq={NSEQ} cold={int(COLD)}")
+    label = (
+        f"eager={int(EAGER)} mtp={MTPK} batch={BATCHTOK} seqs={MAXSEQS} "
+        f"ctx={CTX} util={UTIL:.2f} kvb={KVB:g} depth={DEPTH} nseq={NSEQ} "
+        f"cold={int(COLD)}"
+    )
     print(f"BENCH {label} tokens={n} wall={wall:.2f}s agg_rate={n / wall:.2f} tok/s")
 
 

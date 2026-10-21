@@ -948,7 +948,7 @@ class TestARCPolicy:
 
     def test_mark_non_evictable_excludes_pinned_key_from_evict(self):
         """A key the manager pinned via mark_non_evictable must not be a
-        valid eviction candidate. Regression W2 of v0.31.0z: ARC inherited
+        valid eviction candidate. Regression of v0.31.0z: ARC inherited
         the base-class no-op overrides, so a lookup-confirmed hit could
         be picked by evict and drift the manager's evictable counter.
         """

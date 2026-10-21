@@ -1,4 +1,4 @@
-# flashnext-int4ple serve image.
+# int4 PLE serve image.
 # Base MUST be the devel flavor: a runtime JIT step after weight load (MoE
 # setup) invokes torch cpp_extension, which requires nvcc and /usr/local/cuda;
 # runtime-only bases fail with "Could not find nvcc and default

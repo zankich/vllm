@@ -4,8 +4,8 @@
 
 The dispatch helper `_qsa_kv_mode` is unit-tested CPU-side by mocking
 `torch.cuda.get_device_capability`. The kernel-bit-exactness and direct
-path / split-K path / warmup-compiles tests require CUDA and run as
-GPU-OWED on the production fleet.
+path / split-K path / warmup-compiles tests require CUDA; the engine-level
+boot proof runs where GPUs are free.
 """
 
 import json
@@ -351,7 +351,7 @@ def test_loader_rejects_bad_values_and_non_fp8_layers(tmp_path):
 
 
 def test_qsa_kv_mode_for_e4m3_pins_capability(monkeypatch):
-    """After pick #25 retired the SM86-only validation gate, the kernel
+    """The SM86-only validation gate is retired; the kernel
     serves e4m3 on every capability. The dispatch helper drives the mode
     decision: mode 2 on SM<89 (software decode) and mode 3 on SM89+
     (native cast)."""
@@ -474,7 +474,7 @@ def test_use_fused_qsa_prepare_wiring_pins_sm86_fp8_to_unfused_writer(
     constructor with the device mocked, so the conjunct's own inputs —
     the layer's kv_cache_dtype and the device it computes on — flow from
     the config, not from a test-chosen argument. Both upstream conjuncts
-    hold, so the flip between the two legs is the D1 conjunct alone:
+    hold, so the flip between the two legs is the fused-prepare conjunct alone:
     fused prepare must be off for an e4m3 cache on SM86 (the fused
     launch's fp8e4nv cast does not compile below SM89) and on for an
     auto cache on SM89."""
