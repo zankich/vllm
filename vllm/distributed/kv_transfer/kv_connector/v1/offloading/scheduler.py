@@ -1075,13 +1075,100 @@ class OffloadingConnectorScheduler:
         if complete_hit is None or not self.config.supports_partial_tail:
             return complete_hit
 
+        # A recurrent "align" group keeps one state per producer request, at
+        # that prompt's tail, so it rarely has a state at a full-attention
+        # chunk boundary; requiring every group to hit at the chunk grid
+        # hides every partial tail beyond the first recurrent block and no
+        # cross-restart restore can assemble on a hybrid model. Anchor the
+        # boundary search on the full-attention complete chunks alone and
+        # check the remaining groups only at the candidate boundary, where
+        # their state actually lives. Eagle groups opt out: their
+        # volatile-tail widening lives in _lookup_complete_chunks and the
+        # per-group probe here would under-query them.
         local_tokens = req_status.num_locally_computed_tokens
-        complete_boundary = local_tokens + complete_hit
+        full_attention_hit: int | None = complete_hit
+        if self._full_attention_groups and not any(
+            self.config.kv_group_configs[idx].is_eagle_group
+            for idx in self._full_attention_groups
+        ):
+            full_attention_hit = None
+            for idx in self._full_attention_groups:
+                group_config = self.config.kv_group_configs[idx]
+                group_state = req_status.group_states[idx]
+                tokens_per_chunk = group_config.tokens_per_chunk
+                hit_ceiling = req_status.req.num_tokens
+                if max_num_new_tokens is not None:
+                    hit_ceiling = min(hit_ceiling, local_tokens + max_num_new_tokens)
+                if req_status.max_load_tokens is not None:
+                    # Mirrors _lookup_complete_chunks: under a load cap only
+                    # whole chunks inside the cap count.
+                    hit_ceiling = min(
+                        hit_ceiling, local_tokens + req_status.max_load_tokens
+                    )
+                if (
+                    max_num_new_tokens is not None
+                    or req_status.max_load_tokens is not None
+                ):
+                    # The anchor sets the walk's floor, so the per-group
+                    # probe must not reach a chunk that ends past either
+                    # cap; cdiv would let the anchor probe such a chunk and
+                    # the walk would then reject everything past that floor.
+                    chunk_ceiling = hit_ceiling // tokens_per_chunk
+                else:
+                    chunk_ceiling = cdiv(hit_ceiling, tokens_per_chunk)
+                num_chunks = min(chunk_ceiling, len(group_state.offload_keys))
+                start_chunk_idx = local_tokens // tokens_per_chunk
+                probe: int | None
+                if num_chunks <= start_chunk_idx:
+                    probe = 0
+                else:
+                    probe = self._maximal_prefix_lookup(
+                        group_state.offload_keys[start_chunk_idx:num_chunks],
+                        req_status.req_context,
+                        req_status.req,
+                        group_config,
+                        start_chunk_idx,
+                    )
+                if probe is None:
+                    full_attention_hit = None
+                    break
+                if self._chunks_being_loaded and any(
+                    key in self._chunks_being_loaded
+                    for key in group_state.offload_keys[
+                        start_chunk_idx : start_chunk_idx + probe
+                    ]
+                ):
+                    # Mirrors the in-flight defer in _lookup_complete_chunks:
+                    # a chunk the anchor would use is being loaded.
+                    full_attention_hit = None
+                    break
+                # Clamp at 0: when probe is 0 and local_tokens is not
+                # chunk-aligned, the floor-divided start_chunk_idx makes
+                # the subtraction underflow even though zero chunks
+                # contributed. The true value is 0.
+                group_hit = max(
+                    0,
+                    (start_chunk_idx + probe) * tokens_per_chunk - local_tokens,
+                )
+                full_attention_hit = (
+                    group_hit
+                    if full_attention_hit is None
+                    else min(full_attention_hit, group_hit)
+                )
+        if full_attention_hit is None and complete_hit == 0:
+            # An anchor chunk the tail depends on is not ready or still
+            # being loaded: wait for it rather than report 0 and forfeit
+            # the tail. With a positive complete hit the walk still runs
+            # from the complete boundary and serves what it verifies.
+            return None
+        # The anchor raises the walk's floor; an anchor that deferred or
+        # confirmed nothing leaves the stock floor in place.
+        anchor_boundary = local_tokens + max(complete_hit, full_attention_hit or 0)
         tokens_per_hash = self.config.tokens_per_hash
         # A partial tail carries its own EAGLE proof, so it may also lie in
         # the block after the chunk that the complete-chunk lookup pops.
         num_search_blocks = 2 if self._max_eagle_proof_margin else 1
-        block_end = complete_boundary + (
+        block_end = anchor_boundary + (
             num_search_blocks * self._partial_tail_block_size
         )
         max_boundary = min(req_status.req.num_prompt_tokens - 1, block_end - 1)
@@ -1100,15 +1187,15 @@ class OffloadingConnectorScheduler:
                 local_tokens + req_status.max_load_tokens,
             )
         max_boundary = round_down(max_boundary, tokens_per_hash)
-        if max_boundary <= complete_boundary:
+        if max_boundary <= anchor_boundary:
             return complete_hit
 
-        # A boundary past the block of complete_boundary also loads that
+        # A boundary past the block of the anchor boundary also loads that
         # block's complete chunk. Look it up once, and only if it is needed.
         # Partial tails use one block per chunk, so a block index is a chunk
         # index.
         block_size = self._partial_tail_block_size
-        bridge_chunk_idx = complete_boundary // block_size
+        bridge_chunk_idx = anchor_boundary // block_size
         bridge_boundary = (bridge_chunk_idx + 1) * block_size
         # Bridge keys that the complete-chunk lookup did not confirm.
         unconfirmed_bridge_keys: list[tuple[GroupOffloadConfig, OffloadKey]] = []
@@ -1131,7 +1218,7 @@ class OffloadingConnectorScheduler:
                     break
                 pending |= result is not LookupResult.HIT
         bridge_pending = pending
-        for boundary in range(max_boundary, complete_boundary, -tokens_per_hash):
+        for boundary in range(max_boundary, anchor_boundary, -tokens_per_hash):
             loads_bridge = boundary >= bridge_boundary
             hit, boundary_pending = self._lookup_partial_tail(
                 req_status, boundary, loads_bridge and bridge_pending
