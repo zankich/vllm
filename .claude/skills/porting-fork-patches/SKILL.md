@@ -45,23 +45,7 @@ Then measure drift per file the fork touches (`git diff --numstat <merge-base>..
 11. **Keep the plan and ledger safe.** Back the plan up outside the worktree and ban `git clean` in every dispatch. The ledger lives in the worktree and records every ruling, deferral and GPU-owed item with a name, a reason and an owner.
 12. **Treat commit messages and README prose as public.** No hostnames, addresses, names, topology or process narration. A message-only rewrite must leave every tree hash unchanged.
 13. **Record every deviation inside a vendored file.** An edit to a vendored copy (for example the pynvml P2P caps constants, which must be ints for the ctypes binding, where upstream ships trailing-comma tuples) dies silently at the next re-vendor, and the crash surfaces far from the cause. Each port's ledger lists every vendored-file deviation with its failing symptom, a collected test pins the deviation, and a dependency refresh re-applies and re-verifies the list.
-
-## Ruled by the owner (v0.33.0z port, 2026-11-02)
-
-- **Upstream first.** Where upstream provides a capability, use upstream's implementation, enabling it by configuration if needed. Keep only the tweaks upstream lacks, as separate labeled commits. Minimize custom code maintained.
-- **No verbatim cherry-picks.** Land the content and spirit of each fork change as fresh authored commits against the new base. The fork's history is the source of intent, not a patch series to replay.
-- **Mechanic.** Simulate cherry-picks only to map drift and find hazards. Landing is re-authoring against the upstream seam, with the fork commit named in the message.
-
-## Unsettled across ports
-
-| Question | Working default |
-|---|---|
-| Is an upstream-side or static claim enough for `DROP-ABSORBED`? | No for anything runtime-visible, boot stock upstream. |
-| Fix source-branch defects during the port? | No, land them after as labeled commits. |
-| Baseline with known deterministic errors | Fix the invocation and re-record before the first pick. |
-| Is a split admissible when its hunks are not adjacent to their new home? | No, leave it whole. |
-| Plugin packaging | `pip install <dir>` in every image. |
-
-## Before starting a port
-
-Use the previous port's plan (`docs/superpowers/plans/*-port.md`) as the structural template. Check the registry for the upstream image at the new tag, which has appeared more than a day after the tag. Never substitute a nightly.
+14. **Finish with an adversarial whole-branch review, then re-review the fix wave for composition.** Task-scoped reviews cannot see cross-task seams, where one task's contract change meets another task's unchanged consumer, and a clean per-task record does not clear the branch. After the final task, run a whole-branch adversarial review; confirmed findings land as labeled fix commits, each red-observed first. The fix wave then gets its own scoped review for cross-fix interactions: per-fix tests never construct another fix's precondition, so individually correct fixes can compose into a defect. Whatever review machinery is available, the loop is whole-branch adversarial pass, labeled fixes, composition re-review over the fix diff.
+15. **Validate performance against a live instance of the previous version, not recorded baselines.** Recorded numbers rot when the live configuration drifts, and a stale reference reads as a regression that does not exist. When both versions can run side by side, the comparison is the reference; the archived number is only a hypothesis.
+16. **Fixes in live-proven paths owe the corresponding live proof a re-run.** When a fix wave touches code a live proof already validated, re-run that proof against the new tip: unit suites cannot construct the cross-process and cross-rank interleavings the live path exercises, and the re-run is cheap next to a regression discovered in deployment.
+17. **Serving validation runs an instance derived from the production deployment's resolved configuration.** Resolve the production stack to its effective values, then change only the image, the accelerator assignment, the network exposure and the storage mounts, so the real model, quantization and backend are exercised with nothing hand-transcribed. Before choosing the network exposure, verify no retired deployment still holds a routing entry for it: a stale entry will scrape or route to whatever new thing answers there.

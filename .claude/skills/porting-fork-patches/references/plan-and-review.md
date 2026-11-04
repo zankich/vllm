@@ -160,7 +160,7 @@ A claim checklist is a plain script. One assertion per finding, each one re-runn
 
 ```bash
 # fix-claims checklist: one assertion per plan-review finding
-plan=docs/superpowers/plans/2026-10-18-v0.32.0z-port.md
+plan=docs/superpowers/plans/<current-port>.md
 
 grep -q 'self._full_attention_groups: tuple' "$plan" && echo "PASS finding-01" || echo "FAIL finding-01"
 grep -q 'check 39 40' tools/foldcheck.sh && echo "PASS finding-02" || echo "FAIL finding-02"
