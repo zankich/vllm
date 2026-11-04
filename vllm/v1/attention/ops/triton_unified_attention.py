@@ -931,6 +931,18 @@ def unified_attention(
         assert k_scale_cache is not None and v_scale_cache is not None, (
             f"{kv_quant_mode.name} requires k_scale_cache / v_scale_cache"
         )
+    if (
+        kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+        and q_descale is None
+        and q.dtype == current_platform.fp8_dtype()
+    ):
+        # USE_FP8_Q_DESCALE compiles true for a platform-fp8 query, so
+        # the kernel would read the null q_scale pointer.
+        raise ValueError(
+            "fp8 query with per-tensor quantized KV requires q_descale; "
+            "pass the query scale or keep queries in bf16 for in-kernel "
+            "KV dequant."
+        )
 
     use_mm_prefix = False
     max_mm_ranges = 0

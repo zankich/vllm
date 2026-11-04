@@ -574,7 +574,14 @@ class TritonAttentionImpl(AttentionImpl):
             )
         self.use_alibi_sqrt = use_alibi_sqrt
         self.chunk_lookback = chunk_lookback
-        self.supports_quant_query_input = current_platform.is_cuda()
+        self.supports_quant_query_input = current_platform.is_cuda() and (
+            # When quantized KV serves as e5m2 (below SM89, see
+            # kv_fp8_dtype_for_platform) queries must stay bf16: an
+            # e4m3 query would leave the q_descale guard below without
+            # a scale while the kernel still compiles
+            # USE_FP8_Q_DESCALE true.
+            self.fp8_dtype == current_platform.fp8_dtype()
+        )
         if current_platform.is_rocm():
             # Enable GPUs with fp8 MMA support
             from vllm.platforms.rocm import on_gfx11, on_gfx90a

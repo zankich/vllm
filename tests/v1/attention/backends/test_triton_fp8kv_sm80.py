@@ -297,10 +297,24 @@ def test_e5m2_kv_skips_query_quant_setup():
     assert layer.query_quant is None
 
 
-@pytest.mark.skipif(not _IS_SUB_SM89_CUDA, reason="needs a CUDA device below SM89")
-def test_e4m3_kv_keeps_query_quant_setup():
-    layer = _make_attention_layer("fp8")
-    assert layer.query_quant is not None
+@pytest.mark.parametrize(
+    "cap,cache_dtype,armed",
+    [
+        # Below SM89 the "fp8" string serves e5m2 KV (see
+        # kv_fp8_dtype_for_platform), so queries must stay bf16.
+        (86, "fp8", False),
+        (86, "fp8_e5m2", False),
+        # SM89+ keeps e4m3 KV and arms query quantization.
+        (90, "fp8", True),
+    ],
+)
+def test_query_quant_arming_follows_effective_kv_dtype(cap, cache_dtype, armed):
+    with patch(
+        "vllm.v1.attention.backends.triton_attn.current_platform",
+        _FakePlatform(cap),
+    ):
+        layer = _make_attention_layer(cache_dtype)
+    assert (layer.query_quant is not None) == armed
 
 
 # --- calibrated fp8 checkpoints: e5m2 allowed below SM89 ---
@@ -538,3 +552,51 @@ def test_store_and_attend_e5m2_end_to_end(head_size):
     got = out[:, 0].to(torch.float32)
     rel = (got - ref).abs().max() / ref.abs().max().clamp_min(1e-6)
     assert rel < 2e-2, f"max relative error {rel}"
+
+
+@pytest.mark.skipif(not _IS_SUB_SM90_CUDA, reason="needs a CUDA device below SM90")
+def test_unified_attention_rejects_null_q_scale_for_fp8_query():
+    """A platform-fp8 query with per-tensor fp8 KV and no q_descale must
+    raise before launch: USE_FP8_Q_DESCALE compiles true for such a query,
+    so the kernel would read the null q_scale pointer instead of failing
+    with a diagnosable error."""
+    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+    from vllm.v1.kv_cache_interface import KVQuantMode
+
+    dev = "cuda"
+    head_size, num_tokens = 128, 8
+    block_size, num_blocks = 16, 4
+    torch.manual_seed(0)
+
+    k_e5m2 = torch.randn(
+        num_blocks, block_size, 1, head_size, dtype=torch.bfloat16, device=dev
+    ).to(torch.float8_e5m2)
+    v_e5m2 = torch.randn_like(k_e5m2, dtype=torch.bfloat16).to(torch.float8_e5m2)
+    q = torch.randn(num_tokens, 1, head_size, device=dev)
+    q = q.to(current_platform.fp8_dtype())
+    out = torch.zeros(num_tokens, 1, head_size, dtype=torch.float32, device=dev)
+    cu_seqlens_q = torch.tensor([0, num_tokens], dtype=torch.int32, device=dev)
+    seqused_k = torch.tensor([num_tokens], dtype=torch.int32, device=dev)
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device=dev).view(1, -1)
+    descale = torch.ones(1, 1, dtype=torch.float32, device=dev)
+
+    with pytest.raises(ValueError, match="q_descale"):
+        unified_attention(
+            q,
+            k_e5m2,
+            v_e5m2,
+            out,
+            cu_seqlens_q,
+            num_tokens,
+            seqused_k,
+            num_tokens,
+            head_size**-0.5,
+            True,
+            (-1, -1),
+            block_table,
+            0.0,
+            None,
+            descale,
+            descale,
+            kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
+        )
