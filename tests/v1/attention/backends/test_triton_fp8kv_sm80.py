@@ -554,6 +554,69 @@ def test_store_and_attend_e5m2_end_to_end(head_size):
     assert rel < 2e-2, f"max relative error {rel}"
 
 
+@pytest.mark.skipif(not _IS_SUB_SM89_CUDA, reason="needs a CUDA device below SM89")
+def test_store_e5m2_end_to_end_diffkv_wrapper():
+    """The diffkv cache-store wrapper is the store path for three backends
+    and shares the e5m2 helper with the interleaved wrapper, but nothing
+    else drives it. Pin its stored bytes: the cache is pre-viewed to the
+    platform fp8 dtype, the helper re-views it to e5m2, and the raw store
+    writes K to the first head_size_k lanes and V to the rest, in torch
+    round-to-nearest-even exactly as the interleaved path stores. Gated
+    below SM89, not below SM90 like the sibling e2e: this reference is
+    fixed to e5m2, and the helper is a no-op at SM89+, so an SM89 host
+    would store e4m3 and legitimately fail the comparison."""
+    from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+        triton_reshape_and_cache_flash_diffkv,
+    )
+
+    dev = "cuda"
+    head_size_k, head_size_v = 128, 64
+    block_size, num_blocks = 16, 8
+    num_tokens, num_kv_heads = 32, 1
+    torch.manual_seed(0)
+
+    key = torch.randn(num_tokens, num_kv_heads, head_size_k, device=dev).to(
+        torch.bfloat16
+    )
+    value = torch.randn(num_tokens, num_kv_heads, head_size_v, device=dev).to(
+        torch.bfloat16
+    )
+    kv_cache = torch.zeros(
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_size_k + head_size_v,
+        dtype=torch.uint8,
+        device=dev,
+    )
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=dev)
+    ones = torch.ones(1, dtype=torch.float32, device=dev)
+
+    triton_reshape_and_cache_flash_diffkv(
+        key,
+        value,
+        kv_cache,
+        slot_mapping,
+        "fp8",
+        ones,
+        ones,
+    )
+    torch.cuda.synchronize()
+
+    flat = (
+        kv_cache.view(torch.float8_e5m2)
+        .view(num_blocks * block_size, num_kv_heads, head_size_k + head_size_v)[
+            :num_tokens, 0
+        ]
+    )
+    stored_k = flat[:, :head_size_k].to(torch.float32)
+    stored_v = flat[:, head_size_k:].to(torch.float32)
+    ref_k = key[:, 0].to(torch.float32).to(torch.float8_e5m2).to(torch.float32)
+    ref_v = value[:, 0].to(torch.float32).to(torch.float8_e5m2).to(torch.float32)
+    assert torch.equal(stored_k, ref_k), "K lanes must hold the e5m2 store"
+    assert torch.equal(stored_v, ref_v), "V lanes must hold the e5m2 store"
+
+
 @pytest.mark.skipif(not _IS_SUB_SM90_CUDA, reason="needs a CUDA device below SM90")
 def test_unified_attention_rejects_null_q_scale_for_fp8_query():
     """A platform-fp8 query with per-tensor fp8 KV and no q_descale must
