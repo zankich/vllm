@@ -1074,11 +1074,17 @@ class AnthropicServingMessages(OpenAIServingChat):
                         # Set explicitly so exclude_unset=True keeps it.
                         stop_sequence=anthropic_stop_sequence,
                     )
+                    # Serialized with exclude_unset=True, so metrics is
+                    # only passed when populated: a null value would
+                    # otherwise land on every message_delta wire frame.
+                    delta_kwargs = {}
+                    if origin_chunk.metrics is not None:
+                        delta_kwargs["metrics"] = origin_chunk.metrics
                     chunk = AnthropicStreamEvent(
                         type="message_delta",
                         delta=stop_delta,
                         usage=_build_anthropic_usage(origin_chunk.usage),
-                        metrics=origin_chunk.metrics,
+                        **delta_kwargs,
                     )
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield wrap_data_with_event(data, "message_delta")

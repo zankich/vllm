@@ -1496,6 +1496,30 @@ class TestPerRequestMetricsSurface:
             == 1
         )
 
+    @pytest.mark.asyncio
+    async def test_message_delta_omits_metrics_key_when_absent(self):
+        """The message_delta frame is serialized with exclude_unset=True;
+        passing an explicit None metrics would emit ``"metrics": null``
+        on every stream. Without metrics on the source chunk the key
+        must be absent from the wire entirely."""
+
+        async def chunk_input():
+            yield _make_stream_chunk(delta=DeltaMessage(role="assistant"))
+            yield _make_stream_chunk(finish_reason="stop")
+            yield _make_stream_chunk(
+                choices=[],
+                usage=UsageInfo(prompt_tokens=10, completion_tokens=2, total_tokens=12),
+            )
+
+        converter = _make_stream_converter()
+        events = _parse_sse_events(
+            [e async for e in converter.message_stream_converter(chunk_input())]
+        )
+
+        deltas = [data for ev, data in events if ev == "message_delta"]
+        assert len(deltas) == 1
+        assert "metrics" not in deltas[0]
+
     def test_full_converter_forwards_metrics_on_response(self):
         from vllm.entrypoints.generate.base.protocol import PerRequestMetrics
 
