@@ -623,6 +623,25 @@ def test_clip_env_fail_closed(monkeypatch):
     importlib.reload(qsa_mod)  # restore
 
 
+def test_qsa_env_vars_declared_and_not_compile_factors():
+    """Every VLLM_QSA_* var must live in the envs registry: undeclared, a
+    sidecar-armed boot warns about an unknown environment variable and
+    hard-fails under --fail-on-environ-validation. None may hash into
+    compile_factors: the sidecar path and the diagnostics are data
+    inputs, not compilation inputs, so toggling them must not recompile."""
+    from vllm import envs
+
+    names = [
+        "VLLM_QSA_KV_SCALES",
+        "VLLM_QSA_KV_COLLECT",
+        "VLLM_QSA_KV_CLIP_COUNT",
+        "VLLM_QSA_KV_CLIP_READER",
+    ]
+    for name in names:
+        assert name in envs.environment_variables, name
+        assert name not in envs.compile_factors(), name
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_clip_drain_reads_counters_armed_under_inference_mode(monkeypatch):
     """Production arms inside a forward running under torch.inference_mode.

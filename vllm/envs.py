@@ -2210,6 +2210,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_THINKING_WRAPUP_TOKEN_IDS": lambda: (
         os.getenv("VLLM_THINKING_WRAPUP_TOKEN_IDS", "")
     ),
+    # Path to the QSA KV scale sidecar file. Read raw by
+    # vllm/models/qwen4_exp/nvidia/model.py; declared so a sidecar-armed
+    # boot does not warn about an unknown environment variable, and
+    # ignored as a compile factor because the sidecar is a data file,
+    # not a compilation input.
+    "VLLM_QSA_KV_SCALES": lambda: os.getenv("VLLM_QSA_KV_SCALES", ""),
+    # QSA calibration collector and clip-counter diagnostics, read raw by
+    # vllm/models/qwen4_exp/nvidia/qsa.py; same declaration and
+    # compile-factor treatment as the sidecar path.
+    "VLLM_QSA_KV_COLLECT": lambda: os.getenv("VLLM_QSA_KV_COLLECT", ""),
+    "VLLM_QSA_KV_CLIP_COUNT": lambda: os.getenv("VLLM_QSA_KV_CLIP_COUNT", ""),
+    "VLLM_QSA_KV_CLIP_READER": lambda: os.getenv("VLLM_QSA_KV_CLIP_READER", ""),
     # Whether it is a scale up launch engine for elastic EP,
     # Should only be set by EngineCoreClient.
     "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH": lambda: bool(
@@ -2449,6 +2461,10 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CUDA_COMPATIBILITY_PATH",
         "VLLM_SKIP_MODEL_NAME_VALIDATION",
         "VLLM_THINKING_WRAPUP_TOKEN_IDS",
+        "VLLM_QSA_KV_SCALES",
+        "VLLM_QSA_KV_COLLECT",
+        "VLLM_QSA_KV_CLIP_COUNT",
+        "VLLM_QSA_KV_CLIP_READER",
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
