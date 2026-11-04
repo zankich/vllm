@@ -760,8 +760,8 @@ def test_external_cache_hit_sources_reconcile_different_group_chunk_sizes(
     )
     scheduler = runner.connector_scheduler
     request = MagicMock(request_id="mixed")
-    # The restore-accounting summary reads the request's prompt extent.
-    request.num_prompt_tokens = 2 * block_size
+    # The restore-accounting summary reads the request's total extent.
+    request.num_prompt_tokens = request.num_tokens = 2 * block_size
     req_status = RequestOffloadState(
         config=scheduler.config,
         req=request,
@@ -897,8 +897,8 @@ def test_external_cache_hit_sources_use_loaded_attention_ranges(
     spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
     scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
     request = MagicMock(request_id="sparse")
-    # The restore-accounting summary reads the request's prompt extent.
-    request.num_prompt_tokens = 4 * chunk_size
+    # The restore-accounting summary reads the request's total extent.
+    request.num_prompt_tokens = request.num_tokens = 4 * chunk_size
     req_status = RequestOffloadState(
         config=scheduler.config,
         req=request,

@@ -830,6 +830,24 @@ def test_successful_store_emits_stored_event(fs_tier_with_events):
     assert list(tier.take_events()) == []
 
 
+def test_store_event_omits_cross_check_rejected_keys(fs_tier_with_events):
+    """A key the cascade cross-check refuses never reaches the tier, so
+    the stored event must not report it as stored."""
+    tier = fs_tier_with_events
+    keys = [key(1), key(2)]
+
+    def reject_second(k, _payload):
+        return k != keys[1]
+
+    tier._store_cross_check = reject_second
+    tier.submit_store(make_job(1, keys, [0, 1]))
+    assert all(r.success for r in drain(tier))
+
+    events = list(tier.take_events())
+    assert len(events) == 1
+    assert events[0].keys == [keys[0]]
+
+
 @pytest.mark.parametrize(
     ("locality", "expected"),
     [(None, None), ("REMOTE", Locality.REMOTE)],

@@ -320,6 +320,11 @@ class FileSystemTierManager(SecondaryTierManager):
             # job_id, written on the pool worker before task_done, no extra
             # lock.
             self._job_block_counts[job_metadata.job_id] = len(sel_keys)
+            if self.events is not None:
+                # Report only what the cross-check persisted: a rejected
+                # key never reached the tier and must not appear in the
+                # stored event.
+                self._store_job_keys[job_metadata.job_id] = sel_keys
 
         self._pool.enqueue_store(job_metadata.job_id, 1, [store_task])
 

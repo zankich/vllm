@@ -18,6 +18,7 @@ def _summary(**kw):
     base = dict(
         req_id="req-1",
         num_prompt_tokens=16_620,
+        num_request_tokens=16_620,
         num_locally_computed=1_950,
         num_external=14_400,
         keys_loaded=18,
@@ -42,10 +43,19 @@ def test_summary_line_carries_the_correlation_fields():
         assert needle in line, line
 
 
-def test_boundary_beyond_prompt_is_a_violation():
+def test_boundary_beyond_request_tokens_is_a_violation():
     # An over-claiming boundary shape.
     _, violations = _summary(num_external=15_000)
-    assert any("boundary exceeds prompt" in v for v in violations)
+    assert any("boundary exceeds request" in v for v in violations)
+
+
+def test_boundary_covering_generated_tokens_on_resume_is_clean():
+    # A recompute-preempted request keeps its sampled output tokens, so a
+    # restore may legitimately cover tokens past the prompt boundary: the
+    # bound is the request's total length, not the prompt.
+    line, violations = _summary(num_request_tokens=17_000, num_external=15_000)
+    assert violations == []
+    assert "boundary=16950" in line
 
 
 def test_boundary_misaligned_to_chunk_is_not_flagged():

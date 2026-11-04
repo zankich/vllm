@@ -159,6 +159,7 @@ def resolve_mamba_align_size(
 def restore_accounting_summary(
     req_id: str,
     num_prompt_tokens: int,
+    num_request_tokens: int,
     num_locally_computed: int,
     num_external: int,
     keys_loaded: int,
@@ -172,7 +173,10 @@ def restore_accounting_summary(
     One log line per restore carrying the assembly numbers, plus loud
     violations when the assembly over-claims or under-covers: the
     byte-faithful tiers cannot catch a wrong SET of correctly-hashed
-    blocks, but these invariants can.
+    blocks, but these invariants can. The boundary bound is the
+    request's total token length, not the prompt: a recompute-preempted
+    request keeps its sampled output tokens, so a restore may
+    legitimately cover tokens past the prompt boundary.
     """
     boundary = num_locally_computed + num_external
     violations: list[str] = []
@@ -182,8 +186,11 @@ def restore_accounting_summary(
             f"local={num_locally_computed} ext=0 skipped",
             violations,
         )
-    if boundary > num_prompt_tokens:
-        violations.append(f"boundary exceeds prompt: {boundary} > {num_prompt_tokens}")
+    if boundary > num_request_tokens:
+        violations.append(
+            f"boundary exceeds request: {boundary} > {num_request_tokens} "
+            f"(prompt {num_prompt_tokens})"
+        )
     if (
         has_full_group
         and full_group_capacity > 0
@@ -1637,7 +1644,12 @@ class OffloadingConnectorScheduler:
         except OffloadKeyVanishedError:
             # The base scheduler parks the request in WAITING_FOR_REMOTE_KVS
             # and kv_load_failure_policy decides its fate once the workers
-            # report the failed receive.
+            # report the failed receive. Reachable today only via the async
+            # defer path: within one scheduler step the manager lock spans
+            # lookup through prepare_load, so a sync load cannot observe a
+            # key vanishing between the two. Any future window between
+            # lookup and prepare_load must route its failures through this
+            # same failed-load path.
             req_status.load_key_ranges.clear()
             req_status.partial_tail_boundary = None
             self._current_batch_failed_loads.add(request.request_id)
@@ -1652,6 +1664,7 @@ class OffloadingConnectorScheduler:
         line, violations = restore_accounting_summary(
             req_id=request.request_id,
             num_prompt_tokens=request.num_prompt_tokens,
+            num_request_tokens=request.num_tokens,
             num_locally_computed=num_locally_computed_tokens,
             num_external=num_external_tokens,
             keys_loaded=len(keys_to_load),
