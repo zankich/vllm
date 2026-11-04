@@ -205,7 +205,14 @@ async def test_anthropic_streaming_cache_usage(client: anthropic.AsyncAnthropic)
                 and chunk.message is not None
                 and chunk.message.usage is not None
             ):
-                prompt_tokens = chunk.message.usage.input_tokens
+                # input_tokens excludes cached tokens, so reconstruct the
+                # prompt total from the split fields.
+                start_usage = chunk.message.usage
+                prompt_tokens = (
+                    start_usage.input_tokens
+                    + (start_usage.cache_read_input_tokens or 0)
+                    + (start_usage.cache_creation_input_tokens or 0)
+                )
             elif chunk.type == "message_delta" and chunk.usage is not None:
                 usage = chunk.usage
 

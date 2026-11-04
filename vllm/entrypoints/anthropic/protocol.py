@@ -41,6 +41,8 @@ _ANTHROPIC_ERROR_TYPE_BY_STATUS: dict[int, str] = {
     HTTPStatus.TOO_MANY_REQUESTS.value: "rate_limit_error",
     # vLLM reports overload (e.g. QueueOverflowError) as HTTP 503.
     HTTPStatus.SERVICE_UNAVAILABLE.value: "overloaded_error",
+    # Anthropic's own overload status; clients retry on overloaded_error.
+    529: "overloaded_error",
 }
 
 
