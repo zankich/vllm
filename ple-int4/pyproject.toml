@@ -1,0 +1,16 @@
+[project]
+name = "ple-int4"
+version = "0.1.0"
+description = "INT4 PLE embedding method for Qwen3.8-Flash-Next on vLLM (wheel overlay, zero vLLM tree edits)"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.entry-points."vllm.general_plugins"]
+ple_int4 = "ple_int4:install"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["ple_int4"]

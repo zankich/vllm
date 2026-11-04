@@ -6,6 +6,9 @@
 # no prefix caching (every request must run its full prefill through the
 # collector) and no KV offload connector.
 #
+# The venv must carry the ple_int4 plugin for the INT4PLE checkpoint:
+#   uv pip install -e ple-int4
+#
 #   CKPT and CHAT_TEMPLATE point at the deployment's checkpoint dir and chat
 #   template; COLLECT at an existing dump dir.
 #   mkdir -p /tmp/qsa-calib-dumps
@@ -26,6 +29,8 @@ TP="${TP:-4}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
+# served deployment environment. PLE offload state is auto-resolved from
+# the engine config (no VLLM_PLE_CPU_OFFLOAD env var).
 export VLLM_SKIP_P2P_CHECK=1 NCCL_P2P_LEVEL=SYS HF_HUB_OFFLINE=1
 export VLLM_QSA_KV_COLLECT="$COLLECT"
 unset VLLM_QSA_KV_SCALES VLLM_QSA_KV_CLIP_COUNT PYTORCH_CUDA_ALLOC_CONF || true
