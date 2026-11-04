@@ -146,6 +146,11 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         self.complete_write = self.complete_store
 
         self._kv_memoryview = mmap_region.create_kv_memoryview()
+        # Arm the inherited slot-checksum verification with the region view
+        # (the plain CPUOffloadingSpec path stays unarmed — it has no buffer
+        # to checksum).
+        self._kv_bytes = self._kv_memoryview.cast("B")
+        self._integrity = {}
 
     def prepare_read(
         self, keys: Collection[OffloadKey], req_context: ReqContext
@@ -243,6 +248,15 @@ class TieringOffloadingManager(OffloadingManager):
         self._lock = threading.Lock()
         self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
+
+        # Cascade cross-check: tiers that declare the slot (fs) verify
+        # their persisted bytes against the primary's recorded checksums
+        # when the primary exposes them.
+        verify = getattr(self.primary_tier, "verify_stored_slot", None)
+        if verify is not None:
+            for tier in self.secondary_tiers:
+                if hasattr(tier, "_store_cross_check"):
+                    tier._store_cross_check = verify
 
         self._job_id_counter: int = 0
         # Job tracking: maps job_id to metadata for all in-flight transfers.

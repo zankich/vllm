@@ -12,6 +12,7 @@ import mmap
 import os
 import threading
 import time
+from typing import cast
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -35,6 +36,7 @@ from vllm.v1.kv_offload.config import (
     OffloadingModelConfig,
     OffloadingParallelConfig,
 )
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.tiering.base import TransferJob
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.fs.manager import (
@@ -1536,3 +1538,156 @@ def test_mismatch_removal_spares_sibling_group_files(fs_tier):
 
     assert not os.path.exists(path0)
     assert os.path.exists(sibling), "sibling group files must be untouched"
+
+
+# ---------------------------------------------------------------------------
+# Store-time cascade cross-check
+# ---------------------------------------------------------------------------
+
+
+def test_store_refuses_drifted_block_through_real_cascade_wiring(tmp_path, caplog):
+    """The cascade cross-check against the real primary tier: the tiering
+    manager arms the primary's slot checksums and wires its real
+    verify_stored_slot into the fs store path. Bytes that drift between the
+    CPU store completion and the fs write — the store-side mislabel class
+    that load-side integrity verifies as clean forever — must be refused at
+    the mint. A refusal costs a miss and recompute; a silent write costs
+    permanent poison."""
+    import logging
+
+    from vllm.v1.kv_offload.tiering.manager import (
+        CPUPrimaryTierOffloadingManager,
+        TieringOffloadingManager,
+    )
+
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    view = memoryview(tensor.numpy())
+    region = MagicMock()
+    region.create_kv_memoryview.return_value = view
+    primary = CPUPrimaryTierOffloadingManager(
+        num_chunks=_NUM_BLOCKS, mmap_region=region
+    )
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=2,
+        n_write_threads=2,
+    )
+    manager = TieringOffloadingManager(primary_tier=primary, secondary_tiers=[tier])
+    try:
+        # The wiring must hand the tier the primary's real bound method.
+        assert tier._store_cross_check == primary.verify_stored_slot
+
+        # A completed CPU store records the key's slot checksum: armed.
+        out = primary.prepare_store([key(0)], _CTX)
+        assert out is not None and list(out.keys_to_store) == [key(0)]
+        chunk_id = int(cast(CPULoadStoreSpec, out.store_spec).chunk_ids[0])
+        tensor[chunk_id] = 0.25
+        primary.complete_store(out.keys_to_store, _CTX)
+        view_b = view.cast("B")
+        slot = view_b[chunk_id * tier._block_size : (chunk_id + 1) * tier._block_size]
+        assert primary.verify_stored_slot(key(0), slot) is True
+
+        # Drift the slot after the CPU store completed: the fs write must
+        # refuse the mismatched bytes instead of persisting them.
+        tensor[chunk_id] = 0.75
+        assert primary.verify_stored_slot(key(0), slot) is False
+        with caplog.at_level(logging.WARNING):
+            tier.submit_store(make_job(1, [key(0)], [chunk_id]))
+            results = drain(tier)
+        assert all(r.success for r in results), "a refusal is not a job failure"
+        assert not os.path.exists(tier.file_mapper.get_file_name(key(0))), (
+            "mismatched bytes must not persist"
+        )
+        assert any(
+            "cascade cross-check rejected" in r.message for r in caplog.records
+        ), f"expected a rejection line in {caplog.records!r}"
+
+        # Control on the same armed stack: an undrifted key persists.
+        out2 = primary.prepare_store([key(1)], _CTX)
+        assert out2 is not None and list(out2.keys_to_store) == [key(1)]
+        chunk2 = int(cast(CPULoadStoreSpec, out2.store_spec).chunk_ids[0])
+        tensor[chunk2] = 0.5
+        primary.complete_store(out2.keys_to_store, _CTX)
+        tier.submit_store(make_job(2, [key(1)], [chunk2]))
+        assert all(r.success for r in drain(tier))
+        assert os.path.exists(tier.file_mapper.get_file_name(key(1)))
+    finally:
+        manager.shutdown()
+
+
+def test_store_proceeds_when_cross_check_matches(fs_tier):
+    """Contract pin: a passing cross-check (True) does not impede the
+    store."""
+    tier, _ = fs_tier
+    tier._store_cross_check = lambda key, payload: True
+    tier.submit_store(make_job(1, [key(0)], [0]))
+    assert all(r.success for r in drain(tier))
+    assert os.path.exists(tier.file_mapper.get_file_name(key(0)))
+
+
+def test_store_cross_check_none_is_inert(fs_tier):
+    """No CPU record (None) means the check cannot judge: proceed, the
+    load-side integrity still guards what lands."""
+    tier, _ = fs_tier
+    tier._store_cross_check = lambda key, payload: None
+    tier.submit_store(make_job(1, [key(0)], [0]))
+    assert all(r.success for r in drain(tier))
+    assert os.path.exists(tier.file_mapper.get_file_name(key(0)))
+
+
+def test_store_cross_check_partitions_mixed_batch(fs_tier, caplog):
+    """One job, two keys, verdicts split True/False: the passing key
+    persists, the failing key is refused, and the job still succeeds."""
+    import logging
+
+    tier, _ = fs_tier
+    tier._store_cross_check = lambda k, payload: k != key(1)
+    tier.submit_store(make_job(1, [key(0), key(1)], [0, 1]))
+    with caplog.at_level(logging.WARNING):
+        results = drain(tier)
+
+    assert all(r.success for r in results)
+    assert os.path.exists(tier.file_mapper.get_file_name(key(0)))
+    assert not os.path.exists(tier.file_mapper.get_file_name(key(1)))
+    assert any("cascade cross-check rejected" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Cross-restart restore
+# ---------------------------------------------------------------------------
+
+
+def test_lookup_hits_across_manager_restart(tmp_path):
+    """Cross-restart restore contract: a block stored by one manager
+    instance must be found by a fresh instance over the same root_dir."""
+    tensor = _page_aligned_rand_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    mock_view = memoryview(tensor.numpy())
+
+    tier1 = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=mock_view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=4,
+        n_write_threads=4,
+    )
+    tier1.submit_store(make_job(1, [key(1)], [1]))
+    assert all(r.success for r in drain(tier1))
+    assert lookup_and_wait(tier1, [key(1)]) == [LookupResult.HIT]
+    tier1.shutdown()
+
+    tier2 = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=mock_view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=4,
+        n_write_threads=4,
+    )
+    assert lookup_and_wait(tier2, [key(1)]) == [LookupResult.HIT], (
+        "fresh manager over a populated root_dir must find stored blocks"
+    )
+    tier2.shutdown()

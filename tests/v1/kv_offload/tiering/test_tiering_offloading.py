@@ -129,6 +129,8 @@ class MetricsSecondaryTierManager(SecondaryTierManager):
         self.finished_jobs: list[JobResult] = []
         self.submitted_loads: list[TransferJob] = []
         self.submitted_stores: list[TransferJob] = []
+        # Declares the cascade cross-check slot the tiering manager wires.
+        self._store_cross_check = None
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         return self.lookup_result
@@ -1872,3 +1874,104 @@ def test_tiering_spec_rejects_a_tier_that_declares_the_reserved_tier_label():
         pytest.raises(AssertionError, match="reserved label 'tier'"),
     ):
         TieringOffloadingSpec.config_info_keys({"secondary_tiers": tier_configs})
+
+
+def test_tiering_manager_wires_cascade_cross_check():
+    """Contract pin: a secondary tier declaring the cascade cross-check
+    slot gets it wired to the primary's verify_stored_slot whenever the
+    primary exposes it."""
+    mock_region = _mock_mmap_region(4)
+    primary_tier = CPUPrimaryTierOffloadingManager(
+        num_chunks=4, mmap_region=mock_region
+    )
+    stub_tier = MetricsSecondaryTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=mock_region.create_kv_memoryview(),
+        tier_type="test_wiring",
+    )
+    stub_tier._store_cross_check = None
+
+    TieringOffloadingManager(primary_tier=primary_tier, secondary_tiers=[stub_tier])
+
+    expected = getattr(primary_tier, "verify_stored_slot", None)
+    if expected is None:
+        assert stub_tier._store_cross_check is None
+    else:
+        # Bound methods compare equal only for the same instance and
+        # underlying function.
+        assert stub_tier._store_cross_check == expected
+
+
+def test_tiering_lookup_promotes_from_fs_across_restart(tmp_path):
+    """Cross-restart restore at the tiering layer: blocks persisted to the
+    fs tier by an earlier engine instance must be found, promoted into a
+    fresh CPU primary tier, and answered HIT."""
+    import time
+
+    from tests.v1.kv_offload.tiering.test_fs_tier import (
+        _BLOCK_ELEMENTS,
+        _MOCK_OFFLOADING_SPEC,
+        _NUM_BLOCKS,
+        _page_aligned_rand_tensor,
+    )
+    from tests.v1.kv_offload.tiering.test_fs_tier import (
+        drain as fs_drain,
+    )
+    from tests.v1.kv_offload.tiering.test_fs_tier import (
+        key as fs_key,
+    )
+    from tests.v1.kv_offload.tiering.test_fs_tier import (
+        make_job as fs_make_job,
+    )
+    from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
+
+    tensor = _page_aligned_rand_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    seed_view = memoryview(tensor.numpy())
+    seed = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=seed_view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=2,
+        n_write_threads=2,
+    )
+    seed.submit_store(fs_make_job(1, [fs_key(1)], [1]))
+    results = fs_drain(seed)
+    assert results and all(r.success for r in results)
+    seed.shutdown()
+
+    region = MagicMock()
+    region.create_kv_memoryview.return_value = memoryview(tensor.numpy())
+    primary = CPUPrimaryTierOffloadingManager(
+        num_chunks=_NUM_BLOCKS, mmap_region=region
+    )
+    fs = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=2,
+        n_write_threads=2,
+    )
+    manager = TieringOffloadingManager(primary_tier=primary, secondary_tiers=[fs])
+    target = fs_key(1)
+    try:
+        first = manager.lookup(target, _CTX)
+        assert first in (LookupResult.HIT_PENDING, LookupResult.RETRY), (
+            f"fs-resident block must not answer MISS, got {first}"
+        )
+        ctx = ScheduleEndContext(new_req_ids=[], preempted_req_ids=())
+        manager.on_schedule_end(ctx)
+        deadline = time.monotonic() + 5.0
+        result = first
+        while time.monotonic() < deadline:
+            result = manager.lookup(target, _CTX)
+            manager.on_schedule_end(ctx)
+            if result is LookupResult.HIT:
+                break
+            time.sleep(0.05)
+        assert result is LookupResult.HIT, (
+            f"promotion must complete into the primary tier, got {result}"
+        )
+    finally:
+        manager.shutdown()
