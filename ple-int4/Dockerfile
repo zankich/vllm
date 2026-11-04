@@ -7,6 +7,13 @@
 # comes from the base image. gcc + Python.h are present for Triton's JIT shim.
 FROM nvidia/cuda:13.0.0-devel-ubuntu24.04
 
+# DEPRECATED: this installs the stock PyPI vllm wheel, so building it
+# produces upstream vLLM without the fork patches. ple_int4.install()'s
+# pins hash-match the stock modules and cannot catch that, so the image
+# serves silently unpatched. Build the fork image instead: the root
+# Dockerfile applies forks/v0.33.0z.patch and installs this plugin.
+# Kept only as a minimal reference for the plugin's runtime deps.
+
 ARG VLLM_VERSION=0.33.0
 
 RUN apt-get update \
