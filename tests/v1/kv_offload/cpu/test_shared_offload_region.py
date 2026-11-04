@@ -5,6 +5,7 @@
 import contextlib
 import ctypes
 import errno
+import fcntl
 import mmap
 import os
 import threading
@@ -798,6 +799,74 @@ def test_multiprocess_race_construct_and_write(iid):
         assert p.exitcode == 0
 
 
+def test_loser_of_create_race_opens_existing_full_size_file(iid):
+    """A constructor that finds the file already at full size — it lost the
+    O_EXCL race to a concurrent process that has already ftruncated — must
+    open the existing file with its own fd and reach working state, never a
+    recovery path that references an fd the failed create never set."""
+    num_chunks = 4
+    path = f"/dev/shm/vllm_offload_{iid}.mmap"
+    winner_fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.ftruncate(winner_fd, num_chunks * PAGE_SIZE)
+    try:
+        loser = SharedOffloadRegion(
+            engine_id=iid,
+            num_chunks=num_chunks,
+            rank=None,
+            kv_bytes_per_chunk=PAGE_SIZE,
+            cpu_page_size=PAGE_SIZE,
+        )
+        try:
+            assert not loser._creator
+            assert loser.fd is not None and loser.fd != winner_fd
+            mmap_obj = loser.mmap_obj
+            assert mmap_obj is not None
+            assert not mmap_obj.closed
+            assert os.fstat(loser.fd).st_size == num_chunks * PAGE_SIZE
+            mmap_obj[0:1] = b"\x5a"
+            assert memoryview(mmap_obj)[0:1] == b"\x5a"
+        finally:
+            loser.cleanup()
+    finally:
+        os.close(winner_fd)
+        _cleanup_file(path)
+
+
+def test_loser_waits_for_creator_mid_creation_then_succeeds(iid):
+    """A constructor arriving between the winner's O_EXCL create and its
+    ftruncate must wait for the file to reach full size, then succeed."""
+    num_chunks = 2
+    path = f"/dev/shm/vllm_offload_{iid}.mmap"
+    creator_fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+
+    def finish_creation():
+        time.sleep(0.25)
+        os.ftruncate(creator_fd, num_chunks * PAGE_SIZE)
+
+    creator = threading.Thread(target=finish_creation)
+    creator.start()
+    try:
+        loser = SharedOffloadRegion(
+            engine_id=iid,
+            num_chunks=num_chunks,
+            rank=None,
+            kv_bytes_per_chunk=PAGE_SIZE,
+            cpu_page_size=PAGE_SIZE,
+        )
+        creator.join()
+        try:
+            assert not loser._creator
+            assert os.fstat(loser.fd).st_size == num_chunks * PAGE_SIZE
+            mmap_obj = loser.mmap_obj
+            assert mmap_obj is not None and not mmap_obj.closed
+        finally:
+            loser.cleanup()
+    finally:
+        creator.join()
+        os.close(creator_fd)
+        _cleanup_file(path)
+
+
 # ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
@@ -1451,3 +1520,301 @@ def test_barrier_release_failure_keeps_original_error(iid, monkeypatch, failure_
 
     assert barrier.call_count == (2 if failure_phase == "population" else 1)
     assert not os.path.exists(f"/dev/shm/vllm_offload_{iid}.mmap")
+
+
+# ---------------------------------------------------------------------------
+# Orphan reclamation
+# ---------------------------------------------------------------------------
+
+
+def _write_orphan(engine_id: str, size: int = PAGE_SIZE) -> str:
+    """Leave behind a region file the way a hard-killed engine would."""
+    path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    try:
+        os.ftruncate(fd, size)
+    finally:
+        os.close(fd)
+    return path
+
+
+def _write_orphan_reglock(engine_id: str, age_s: float = 0.0) -> str:
+    """Leave behind a registration lock whose region name is gone.
+
+    The barrier flow drops the region name at construction, so a crashed
+    engine leaves its reglock behind with no region file beside it. The
+    age backdates the lock's mtime past the sweeper's orphan window."""
+    path = f"/dev/shm/vllm_offload_{engine_id}.mmap.reglock"
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.close(fd)
+    if age_s:
+        stamp = time.time() - age_s
+        os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_orphaned_region_is_reclaimed(iid):
+    """A region left by a crashed engine is removed when the next one starts.
+
+    cleanup() unlinks the file on a graceful shutdown, but a SIGKILL or an
+    OOM kill skips it. Where /dev/shm outlives the process the orphan keeps
+    consuming the tmpfs budget, so the next start must reclaim it.
+    """
+    orphan = _write_orphan(f"{iid}-orphan")
+    assert os.path.exists(orphan)
+
+    region = _make_region(iid)
+    try:
+        assert not os.path.exists(orphan)
+    finally:
+        region.cleanup()
+        _cleanup_file(orphan)
+
+
+def test_orphaned_segmented_region_is_reclaimed_with_its_segments(iid):
+    """A multi-segment orphan must take its numbered segment files with it.
+
+    Only the first segment carries the engine's liveness mark; the others
+    are only reachable through the base name, so reclaiming the base
+    without its siblings would trade one leak for another."""
+    orphan = _write_orphan(f"{iid}-orphan")
+    segments = []
+    for i in (1, 2):
+        segment = f"{orphan}.{i}"
+        fd = os.open(segment, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        os.ftruncate(fd, PAGE_SIZE)
+        os.close(fd)
+        segments.append(segment)
+
+    region = _make_region(iid)
+    try:
+        assert not os.path.exists(orphan)
+        for segment in segments:
+            assert not os.path.exists(segment), (
+                f"segment {segment} must be reclaimed with its base file"
+            )
+    finally:
+        region.cleanup()
+        for segment in segments:
+            _cleanup_file(segment)
+        _cleanup_file(orphan)
+
+
+def test_live_region_is_not_reclaimed(iid):
+    """A region another live engine is using must survive a new engine's start.
+
+    Reclaiming by filename alone would delete it, breaking a second vLLM
+    instance that shares this host's /dev/shm.
+    """
+    live = _make_region(f"{iid}-live")
+    live_path = live.mmap_path
+    try:
+        other = _make_region(f"{iid}-other")
+        try:
+            assert os.path.exists(live_path)
+        finally:
+            other.cleanup()
+    finally:
+        live.cleanup()
+        _cleanup_file(live_path)
+
+
+def test_empty_region_file_is_not_reclaimed(iid):
+    """A zero-length file is a region mid-creation, not an orphan.
+
+    The creator holds O_EXCL before it sizes the file, so an empty file may
+    belong to an engine that is starting right now.
+    """
+    path = f"/dev/shm/vllm_offload_{iid}-starting.mmap"
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.close(fd)
+    try:
+        region = _make_region(iid)
+        try:
+            assert os.path.exists(path)
+        finally:
+            region.cleanup()
+    finally:
+        _cleanup_file(path)
+
+
+def test_symlink_in_shm_is_not_followed(iid, tmp_path):
+    """A planted symlink must not be opened or removed.
+
+    /dev/shm is world-writable, so a local user can create a name matching
+    the region glob that points somewhere else. Reclamation must refuse to
+    follow it rather than opening an arbitrary file for writing.
+    """
+    target = tmp_path / "victim"
+    target.write_bytes(b"untouched")
+    link = f"/dev/shm/vllm_offload_{iid}-evil.mmap"
+    os.symlink(target, link)
+    try:
+        region = _make_region(iid)
+        try:
+            assert target.exists(), "the symlink target must not be removed"
+            assert target.read_bytes() == b"untouched"
+            # Without O_NOFOLLOW the open() follows the link, the flock
+            # succeeds and the unlink below it removes the planted name --
+            # so a surviving symlink is what shows we never opened it.
+            assert os.path.islink(link), "the planted symlink must be left alone"
+        finally:
+            region.cleanup()
+    finally:
+        _cleanup_file(link)
+
+
+def test_orphaned_reglock_is_reclaimed_with_region(iid):
+    """An orphaned .reglock sibling is reclaimed alongside its region.
+
+    Registration opens the reglock file lazily and the orphan dies with its
+    flock released, so the sibling reglock is harmless on its own. Hygiene
+    reclaims it together with the region so the next start's glob scan is
+    not cluttered by stale siblings.
+    """
+    orphan_id = f"{iid}-orphan"
+    orphan = _write_orphan(orphan_id)
+    orphan_reglock = orphan + ".reglock"
+    with open(orphan_reglock, "wb") as f:
+        f.write(b"\0")
+
+    assert os.path.exists(orphan)
+    assert os.path.exists(orphan_reglock)
+
+    region = _make_region(iid)
+    try:
+        assert not os.path.exists(orphan)
+        assert not os.path.exists(orphan_reglock)
+    finally:
+        region.cleanup()
+        _cleanup_file(orphan_reglock)
+
+
+def test_orphaned_reglock_without_region_is_reclaimed(iid):
+    """A reglock with no region file beside it is reclaimed by the next start.
+
+    The region name is gone, so the region sweep never matches the lock
+    file and nothing else removes it: one inode leaked per engine boot.
+    """
+    orphan = _write_orphan_reglock(f"{iid}-orphan", age_s=3600)
+    try:
+        region = _make_region(iid)
+        try:
+            assert not os.path.exists(orphan), (
+                "an orphaned reglock must be reclaimed by the next start"
+            )
+        finally:
+            region.cleanup()
+    finally:
+        _cleanup_file(orphan)
+
+
+def test_reglock_held_by_a_live_registration_is_not_reclaimed(iid):
+    """A reglock a rank still holds is in use, not residue.
+
+    The lock is held for the whole registration critical section, so a
+    sweeper that took it would delete the file the other ranks are
+    serializing on.
+    """
+    orphan = _write_orphan_reglock(f"{iid}-held", age_s=3600)
+    fd = os.open(orphan, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        region = _make_region(iid)
+        try:
+            assert os.path.exists(orphan), (
+                "a reglock held by a live registration must survive the sweep"
+            )
+        finally:
+            region.cleanup()
+    finally:
+        os.close(fd)
+        _cleanup_file(orphan)
+
+
+def test_reglock_inside_the_orphan_window_is_not_reclaimed(iid):
+    """A reglock younger than the orphan window may belong to a booting engine.
+
+    Its region name is already gone while its ranks are still registering,
+    so only its age says whether it is residue.
+    """
+    orphan = _write_orphan_reglock(f"{iid}-fresh")
+    try:
+        region = _make_region(iid)
+        try:
+            assert os.path.exists(orphan), (
+                "a reglock inside the orphan window must survive the sweep"
+            )
+        finally:
+            region.cleanup()
+    finally:
+        _cleanup_file(orphan)
+
+
+def test_sweep_leaves_a_reglock_a_rank_recreated(iid, monkeypatch):
+    """A remover must not unlink a path it does not own.
+
+    Two removers can open the same reglock: the first one locks it and
+    unlinks it, and a rank that is registering then creates the path
+    again and locks the new inode. The second remover's fd still names
+    the old inode and its lock is free again, so it takes the lock and
+    would unlink the path -- which now names the file the rank is
+    registering on, leaving that rank's lock on an inode nothing else
+    can see. The removal must leave the path alone.
+    """
+    orphan = _write_orphan_reglock(f"{iid}-orphan", age_s=3600)
+    orphan_ino = os.stat(orphan).st_ino
+
+    real_flock = fcntl.flock
+    state = {"raced": False}
+    registrar_fd = []
+
+    def racing_flock(fd, operation):
+        # The sweep's remover has opened the reglock and is about to take
+        # its lock. Before it does, another remover completes its own
+        # removal of the same path, and a rank registers on a new file
+        # created under the same name.
+        if (
+            not state["raced"]
+            and operation == fcntl.LOCK_EX | fcntl.LOCK_NB
+            and os.fstat(fd).st_ino == orphan_ino
+        ):
+            state["raced"] = True
+            other = os.open(orphan, os.O_RDWR | os.O_NOFOLLOW)
+            try:
+                real_flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                os.unlink(orphan)
+            finally:
+                os.close(other)
+            fd_y = os.open(orphan, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            real_flock(fd_y, fcntl.LOCK_EX)
+            registrar_fd.append(fd_y)
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", racing_flock)
+    try:
+        region = _make_region(iid)
+        try:
+            assert state["raced"], "the sweep never took the orphan's lock"
+            assert os.path.exists(orphan), (
+                "the remover unlinked a path that a rank had recreated"
+            )
+            st = os.stat(orphan)
+            assert st.st_ino == os.fstat(registrar_fd[0]).st_ino, (
+                "the path must still name the file the rank registered on"
+            )
+            assert st.st_nlink == 1
+            # The rank's lock on the surviving file still excludes
+            # everyone else: no other rank can enter the critical section.
+            probe = os.open(orphan, os.O_RDWR)
+            try:
+                with pytest.raises(OSError):
+                    real_flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
+        finally:
+            region.cleanup()
+    finally:
+        for fd in registrar_fd:
+            os.close(fd)
+        _cleanup_file(orphan)

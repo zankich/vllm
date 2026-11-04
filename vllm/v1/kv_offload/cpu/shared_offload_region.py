@@ -5,6 +5,7 @@ import ctypes
 import errno
 import fcntl
 import functools
+import glob
 import mmap
 import os
 import time
@@ -123,6 +124,111 @@ def _remove_reglock(path: str) -> bool:
         os.close(fd)
 
 
+_MMAP_GLOB = "/dev/shm/vllm_offload_*.mmap"
+_REGLOCK_GLOB = "/dev/shm/vllm_offload_*.reglock"
+
+# A registration lock file younger than this may still belong to an engine
+# that is registering right now. The file is created moments before the
+# registration that uses it and is never written to again, so its mtime is
+# its creation, and the region name it belongs to is already gone by then:
+# nothing else in the sweep tells a booting engine's lock from residue.
+# The window is comfortably above the gap between a rank finishing its own
+# page populate after the barrier and opening the reglock, so the ranks of
+# an engine that is still coming up all reach the lock inside the window.
+_MIN_ORPHAN_AGE_S = 90.0
+
+
+def _reclaim_orphaned_regions(own_path: str) -> None:
+    """Remove offload regions left behind by an engine that died hard.
+
+    ``cleanup()`` unlinks the region on a graceful shutdown, but a SIGKILL,
+    an OOM kill or a segfault skips it. Where ``/dev/shm`` outlives the
+    process -- a container restart with a tmpfs-backed ``/dev/shm``, for
+    instance -- the orphan keeps consuming the tmpfs budget, and the next
+    start fails to allocate its own region.
+
+    Every participant holds a shared ``flock`` on its region for as long
+    as it lives, and the kernel drops that lock when the process dies. So
+    an orphan is exactly a region no one can be holding: if this process
+    can take the exclusive lock, nothing else is using the file and it is
+    safe to unlink. That keeps a second engine sharing this host's
+    /dev/shm untouched, which unconditional name-based deletion would not.
+
+    Only the first segment file carries the engine's liveness mark, so it
+    is the probe for the whole region: once it proves orphaned, the
+    numbered segment files mapped back to back beneath the region are
+    unlinked with it, and the reglock sibling is reclaimed through the
+    same locked removal, so a rank holding the lock (a reused engine id)
+    keeps its file for the orphan sweep to take later.
+
+    Zero-length files are skipped: a region is empty only between its
+    creator's ``O_EXCL`` create and the ``ftruncate`` that sizes it, so
+    skipping them avoids racing a starting engine.
+    """
+    for path in glob.glob(_MMAP_GLOB):
+        if path == own_path:
+            continue
+        try:
+            if os.path.getsize(path) == 0:
+                continue
+            # /dev/shm is world-writable, so refuse to follow a symlink a
+            # local user may have planted under our glob; O_NOFOLLOW makes
+            # os.open raise ELOOP, which the enclosing handler catches.
+            fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+            with os.fdopen(fd, "r+b") as f:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    continue  # still held: a live engine owns this region
+                os.unlink(path)
+                segment = 1
+                while True:
+                    try:
+                        os.unlink(f"{path}.{segment}")
+                    except FileNotFoundError:
+                        break
+                    segment += 1
+            _remove_reglock(path + _REGLOCK_SUFFIX)
+        except OSError:
+            logger.debug("Skipped reclaiming %s", path, exc_info=True)
+        else:
+            logger.info("Reclaimed orphaned mmap file %s", path)
+
+    _reclaim_orphaned_reglocks()
+
+
+def _reclaim_orphaned_reglocks() -> None:
+    """Remove registration lock files whose region name is gone.
+
+    The barrier flow unlinks the region file at construction, so the
+    reglock is the only name a booting engine leaves in /dev/shm and
+    nothing else matches it: one zero-byte inode per engine boot, kept
+    until the process that created it exits.
+
+    A reglock is only taken when the region it belongs to is gone -- a
+    region file that is still there is reclaimed together with its lock
+    by the region sweep above -- and when nothing holds its lock, which
+    is the case only when no rank is inside the registration critical
+    section. Its age says the rest: the lock file is created moments
+    before the registration that uses it and is never written to again,
+    so a young one belongs to an engine that is still starting up.
+    """
+    now = time.time()
+    for path in glob.glob(_REGLOCK_GLOB):
+        if os.path.exists(path[: -len(_REGLOCK_SUFFIX)]):
+            # The region file is still there: the region sweep above
+            # reclaims the pair together.
+            continue
+        try:
+            age = now - os.path.getmtime(path)
+        except OSError:
+            continue
+        if age < _MIN_ORPHAN_AGE_S:
+            continue
+        if _remove_reglock(path):
+            logger.info("Reclaimed orphaned reglock file %s", path)
+
+
 def _wait_for_file_size(fd: int, expected_size: int, timeout: float = 30.0) -> None:
     """Spin-wait until the file reaches expected_size (creator truncated it)."""
     deadline = time.monotonic() + timeout
@@ -238,6 +344,9 @@ class SharedOffloadRegion:
             # exclusive upper bound for this worker's area within each row
             self._worker_area_end = (rank + 1) * cpu_page_size
         barriers_remaining = 2 if populate_shard is not None else 1
+        # Reclaim orphans before the space check, so a crashed engine's
+        # region frees the tmpfs budget this allocation draws on.
+        _reclaim_orphaned_regions(self.mmap_path)
         try:
             try:
                 self.fd: int | None = os.open(
