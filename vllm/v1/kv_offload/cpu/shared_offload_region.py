@@ -138,7 +138,7 @@ _REGLOCK_GLOB = "/dev/shm/vllm_offload_*.reglock"
 _MIN_ORPHAN_AGE_S = 90.0
 
 
-def _reclaim_orphaned_regions(own_path: str) -> None:
+def _reclaim_orphaned_regions() -> None:
     """Remove offload regions left behind by an engine that died hard.
 
     ``cleanup()`` unlinks the region on a graceful shutdown, but a SIGKILL,
@@ -152,7 +152,12 @@ def _reclaim_orphaned_regions(own_path: str) -> None:
     an orphan is exactly a region no one can be holding: if this process
     can take the exclusive lock, nothing else is using the file and it is
     safe to unlink. That keeps a second engine sharing this host's
-    /dev/shm untouched, which unconditional name-based deletion would not.
+    /dev/shm untouched, and covers this engine's own name too: a prior
+    incarnation that died mid-creation leaves its files under the same
+    engine id, and only this sweep could reclaim them, so skipping the
+    own name would strand a stalled creation and wedge the reboot on the
+    joiner's size wait. A live participant of the same engine blocks the
+    sweep's exclusive probe with its shared lock.
 
     Only the first segment file carries the engine's liveness mark, so it
     is the probe for the whole region: once it proves orphaned, the
@@ -168,11 +173,15 @@ def _reclaim_orphaned_regions(own_path: str) -> None:
     still be running; past it, nothing live can own the files, and the
     uncontended probe below reclaims the stalled creation together with
     its full-size segments, which no glob reaches on their own.
+
+    The unlink re-verifies that the locked fd still names the path: a
+    remover can unlink an orphan between this sweep's open and its lock
+    while a new engine creates a fresh region under the same name, and
+    unlinking the path then would take the new region's file, whose lock
+    this fd does not hold.
     """
     now = time.time()
     for path in glob.glob(_MMAP_GLOB):
-        if path == own_path:
-            continue
         try:
             if os.path.getsize(path) == 0:
                 try:
@@ -190,9 +199,19 @@ def _reclaim_orphaned_regions(own_path: str) -> None:
                     fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except OSError:
                     continue  # still held: a live engine owns this region
+                if not _reglock_matches_path(f.fileno(), path):
+                    # The path names a different file now: another remover
+                    # took this orphan and a new region lives at the name.
+                    # Unlinking would delete that region's file.
+                    continue
                 os.unlink(path)
                 segment = 1
                 while True:
+                    if os.path.exists(path):
+                        # A creator won the base name back between the
+                        # base unlink and this segment unlink; the
+                        # remaining segments belong to its fresh region.
+                        break
                     try:
                         os.unlink(f"{path}.{segment}")
                     except FileNotFoundError:
@@ -356,7 +375,7 @@ class SharedOffloadRegion:
         barriers_remaining = 2 if populate_shard is not None else 1
         # Reclaim orphans before the space check, so a crashed engine's
         # region frees the tmpfs budget this allocation draws on.
-        _reclaim_orphaned_regions(self.mmap_path)
+        _reclaim_orphaned_regions()
         try:
             try:
                 self.fd: int | None = os.open(
@@ -375,9 +394,14 @@ class SharedOffloadRegion:
                 # land on a 0-byte stub and spin in _wait_for_file_size
                 # for the full 30 s timeout.
                 self._creator = True
+                # Lock before anything fallible: the lock is the liveness
+                # mark a sibling rank's orphan sweep probes, and the window
+                # between the create and this lock is the one window where
+                # the sweep could mistake this fresh region for a dead
+                # prior incarnation under the same engine id.
+                _hold_shared_lock(self.fd, self.mmap_path)
                 if creator_memory_check is not None:
                     creator_memory_check(self.total_size_bytes)
-                _hold_shared_lock(self.fd, self.mmap_path)
                 check_shm_free_space(
                     self.total_size_bytes,
                     allocation_name="CPU KV offload shared region in /dev/shm",

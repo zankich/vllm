@@ -33,13 +33,6 @@ PAGE_SIZE = mmap.PAGESIZE
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
-def _set_spawn_method(monkeypatch):
-    # On WSL, NVML is not compatible with fork so vLLM auto-overrides the
-    # multiprocessing start method to 'spawn' with a warning. Set it explicitly
-    # here so the override is a no-op and the warning is suppressed.
-    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-
 
 def _make_region(
     engine_id: str,
@@ -803,11 +796,16 @@ def test_loser_of_create_race_opens_existing_full_size_file(iid):
     """A constructor that finds the file already at full size — it lost the
     O_EXCL race to a concurrent process that has already ftruncated — must
     open the existing file with its own fd and reach working state, never a
-    recovery path that references an fd the failed create never set."""
+    recovery path that references an fd the failed create never set.
+
+    The winner holds its shared lock, as a live sibling would: an unlocked
+    full-size region under the booting engine's name is a dead prior
+    incarnation, which the boot sweep reclaims before the create."""
     num_chunks = 4
     path = f"/dev/shm/vllm_offload_{iid}.mmap"
     winner_fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
     os.ftruncate(winner_fd, num_chunks * PAGE_SIZE)
+    fcntl.flock(winner_fd, fcntl.LOCK_SH)
     try:
         loser = SharedOffloadRegion(
             engine_id=iid,
@@ -834,10 +832,15 @@ def test_loser_of_create_race_opens_existing_full_size_file(iid):
 
 def test_loser_waits_for_creator_mid_creation_then_succeeds(iid):
     """A constructor arriving between the winner's O_EXCL create and its
-    ftruncate must wait for the file to reach full size, then succeed."""
+    ftruncate must wait for the file to reach full size, then succeed.
+
+    The creator holds its shared lock for the whole creation, as in
+    production, so the loser's boot sweep cannot mistake the file for a
+    dead prior incarnation once it reaches full size."""
     num_chunks = 2
     path = f"/dev/shm/vllm_offload_{iid}.mmap"
     creator_fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    fcntl.flock(creator_fd, fcntl.LOCK_SH)
 
     def finish_creation():
         time.sleep(0.25)
@@ -1655,6 +1658,91 @@ def test_stalled_creation_segments_reclaimed_by_base_age(iid, age_s, reclaimed):
         for segment in segments:
             _cleanup_file(segment)
         _cleanup_file(orphan)
+
+
+@pytest.mark.parametrize("age_s,reclaimed", [(3600, True), (0, False)])
+def test_own_stalled_creation_is_reclaimed_by_own_engine(iid, age_s, reclaimed):
+    """A prior incarnation of this engine id that died mid-creation leaves
+    its files under the same name the reboot is about to open.
+
+    Skipping the own name in the sweep strands them forever where this is
+    the only engine with that id, and the reboot wedges on the joiner's
+    size wait against a zero-length base. The sweep must treat its own
+    name like any other: the exclusive-lock probe is what protects a live
+    region, and the age gate what protects a starting creator."""
+    own, segments = _write_stalled_creation(f"{iid}", age_s)
+    assert os.path.exists(own)
+
+    region_module._reclaim_orphaned_regions()
+    try:
+        if reclaimed:
+            assert not os.path.exists(own), (
+                "an aged stalled creation under the booting engine's own "
+                "name must be reclaimed"
+            )
+            for segment in segments:
+                assert not os.path.exists(segment)
+        else:
+            assert os.path.exists(own), (
+                "a fresh stalled creation may belong to a starting creator"
+            )
+    finally:
+        for segment in segments:
+            _cleanup_file(segment)
+        _cleanup_file(own)
+
+
+def test_own_live_region_is_not_reclaimed_by_own_sweep(iid):
+    """A live region under the booting engine's own name survives the
+    sweep: another rank of the same engine holds its shared lock, which
+    must block the sweep's exclusive probe exactly as a foreign engine's
+    would."""
+    live = _make_region(f"{iid}")
+    try:
+        assert os.path.exists(live.mmap_path), (
+            "a live same-name region must survive the sweep's lock probe"
+        )
+        region_module._reclaim_orphaned_regions()
+        assert os.path.exists(live.mmap_path)
+    finally:
+        live.cleanup()
+        _cleanup_file(live.mmap_path)
+
+
+def test_replaced_region_path_survives_stale_sweep_handle(iid, monkeypatch):
+    """Between the sweep's open and its lock, another remover can unlink
+    the orphan while a new engine creates a fresh region under the same
+    name. The sweep's fd then names the dead inode; unlinking the path
+    would delete the new region's file, whose lock the fd does not hold.
+
+    The open is patched to hand the sweep a handle to the unlinked inode,
+    the precise interleaving the race window produces."""
+    base = f"/dev/shm/vllm_offload_{iid}-race.mmap"
+    stale_fd = os.open(base, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    try:
+        os.unlink(base)
+        live_fd = os.open(base, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        os.ftruncate(live_fd, PAGE_SIZE)
+        try:
+            real_open = os.open
+
+            def stale_open(path, flags, *args, **kwargs):
+                if path == base:
+                    return os.dup(stale_fd)
+                return real_open(path, flags, *args, **kwargs)
+
+            monkeypatch.setattr(region_module.os, "open", stale_open)
+            region_module._reclaim_orphaned_regions()
+        finally:
+            os.close(live_fd)
+        assert os.path.exists(base), (
+            "a region created at a name the sweep's fd no longer names "
+            "must survive the sweep"
+        )
+        assert os.path.getsize(base) == PAGE_SIZE
+    finally:
+        os.close(stale_fd)
+        _cleanup_file(base)
 
 
 def test_live_region_is_not_reclaimed(iid):
