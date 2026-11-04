@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 import numpy as np
@@ -1772,3 +1772,226 @@ def test_lru_insert_orders_positioned_chunks_without_followup_access(ready_on_in
     assert evicted is not None
     assert [key for key, _ in evicted] == [tail, middle]
     assert policy.get(head) is not None
+
+
+# ---------------------------------------------------------------------------
+# Slot-checksum integrity (CPU tier)
+
+
+def make_armed_integrity_manager(
+    num_chunks: int = 4, chunk_size: int = 64, **kwargs
+) -> tuple[CPUOffloadingManager, Callable[[int, int], None], Callable[[int], None]]:
+    """A manager with slot checksums armed over a tamperable byte buffer.
+
+    Mirrors the arming the tiering primary-tier manager performs: a view of
+    the tier's slot bytes supplies the input every checksum is taken over.
+    """
+    manager = make_cpu_manager(num_chunks=num_chunks, **kwargs)
+    buf = np.zeros(num_chunks * chunk_size, dtype=np.uint8)
+    view = memoryview(buf)
+    manager._kv_bytes = view
+    manager._integrity = {}
+
+    def write_slot(chunk_id: int, key: int) -> None:
+        view[chunk_id * chunk_size : (chunk_id + 1) * chunk_size] = bytes(
+            ([(key + chunk_id) % 251] * 3 + [0x41]) * (chunk_size // 4)
+        )
+
+    def tamper_slot(chunk_id: int) -> None:
+        view[chunk_id * chunk_size] ^= 0xFF
+
+    return manager, write_slot, tamper_slot
+
+
+def store_and_complete(manager, keys, ctx, write_slot) -> None:
+    out = manager.prepare_store(keys, ctx)
+    assert out is not None
+    for key, chunk in zip(out.keys_to_store, out.store_spec.chunk_ids):
+        write_slot(int(chunk), int.from_bytes(key[:4], "big") % 1000)
+    manager.complete_store(out.keys_to_store, ctx)
+
+
+def test_lookup_miss_and_evict_when_slot_corrupt_after_store():
+    """Stored clean, bytes clobbered later (aliasing, torn writes). A later
+    request's lookup must answer MISS, not HIT, and the corrupt chunk must
+    leave the cache."""
+    manager, write_slot, tamper_slot = make_armed_integrity_manager(num_chunks=4)
+    store_and_complete(manager, to_keys([1, 2]), _EMPTY_REQ_CTX, write_slot)
+
+    assert (
+        manager.lookup(to_key(1), make_req_context(req_id="first")) is LookupResult.HIT
+    )
+
+    tamper_slot(0)
+
+    assert (
+        manager.lookup(to_key(1), make_req_context(req_id="second"))
+        is LookupResult.MISS
+    )
+    # Evicted: a subsequent store reuses the freed slot without error.
+    store_and_complete(manager, to_keys([3]), _EMPTY_REQ_CTX, write_slot)
+    assert (
+        manager.lookup(to_key(3), make_req_context(req_id="third")) is LookupResult.HIT
+    )
+
+
+def test_integrity_rejection_emits_removal_event():
+    """A rejected chunk must announce its death (removed=True event) so
+    event consumers learn the key is gone, mirroring eviction semantics.
+
+    Known carrier limit, deliberately not tested as detection: corruption
+    between the GPU->CPU copy and the store-time recording lands recorded
+    — the checksum anchors truth at complete_store. Post-recording
+    corruption is the detectable class.
+    """
+    manager, write_slot, tamper_slot = make_armed_integrity_manager(
+        num_chunks=4, enable_events=True
+    )
+    store_and_complete(manager, to_keys([1, 2]), _EMPTY_REQ_CTX, write_slot)
+    list(manager.take_events())
+
+    tamper_slot(0)
+    assert (
+        manager.lookup(to_key(1), make_req_context(req_id="detects"))
+        is LookupResult.MISS
+    )
+
+    events = list(manager.take_events())
+    assert len(events) == 1
+    assert events[0].removed is True
+    assert set(events[0].keys) == set(to_keys([1]))
+
+
+def test_integrity_silent_without_memoryview():
+    """No buffer armed (plain-spec construction has no bytes to checksum):
+    behavior is exactly the legacy contract — corruption is not detectable
+    and lookup still answers HIT. This is what every unarmed manager runs
+    with."""
+    manager = make_cpu_manager(num_chunks=4)
+    out = manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
+    assert out is not None
+    manager.complete_store(out.keys_to_store, _EMPTY_REQ_CTX)
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.HIT
+
+
+def test_integrity_verification_once_per_request_context():
+    """Scheduler-thread cost bound: a request verifies each key's bytes on
+    its first lookup and trusts that verdict for the request's lifetime;
+    a different request re-verifies. Intra-request corruption after the
+    first lookup is answered HIT by design; cross-request corruption is
+    caught by the next request's first lookup."""
+    manager, write_slot, tamper_slot = make_armed_integrity_manager(num_chunks=4)
+    store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
+
+    ctx_a = make_req_context(req_id="req-a")
+    ctx_b = make_req_context(req_id="req-b")
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+
+    tamper_slot(0)
+    # Same request: cached verdict, still HIT (documented design limit).
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+    # New request: re-verified, rejected, MISS.
+    assert manager.lookup(to_key(1), ctx_b) is LookupResult.MISS
+
+
+def test_prepare_load_raises_on_vanished_key_before_consuming(caplog):
+    """Confirmed-vs-reject race: request A's lookup confirms two hits (no
+    load reference is taken until prepare_load), the slot corrupts, and
+    request B's fresh lookup rejects and evicts one chunk. A's
+    prepare_load must signal the vanished key instead of hitting
+    ``assert chunk is not None``, and must not consume the keys ahead of
+    it: the load is all-or-nothing. The reject path stays intact: the
+    corrupt bytes are gone and the slot is reusable."""
+    from vllm.v1.kv_offload.base import OffloadKeyVanishedError
+
+    manager, write_slot, tamper_slot = make_armed_integrity_manager(num_chunks=2)
+    store_and_complete(manager, to_keys([1, 2]), _EMPTY_REQ_CTX, write_slot)
+
+    ctx_a = make_req_context(req_id="req-a")
+    ctx_b = make_req_context(req_id="req-b")
+
+    assert manager.lookup(to_key(1), ctx_a) is LookupResult.HIT
+    assert manager.lookup(to_key(2), ctx_a) is LookupResult.HIT
+
+    tamper_slot(0)
+    assert manager.lookup(to_key(1), ctx_b) is LookupResult.MISS
+    assert manager._policy.get(to_key(1)) is None
+
+    # The vanished key comes last, so an incremental consumer would already
+    # have taken a load reference on key 2.
+    with (
+        caplog.at_level("WARNING", logger="vllm.v1.kv_offload.cpu.manager"),
+        pytest.raises(OffloadKeyVanishedError) as excinfo,
+    ):
+        manager.prepare_load(to_keys([2, 1]), ctx_a)
+    assert excinfo.value.key == to_key(1)
+    assert len([r for r in caplog.records if "vanished" in r.message]) == 1
+
+    # Key 2 is untouched: no load reference taken (all-or-nothing), and the
+    # rejected chunk's slot left the evictable count with it.
+    chunk = manager._policy.get(to_key(2))
+    assert chunk is not None and chunk.ref_cnt == 0
+    assert manager._num_evictable_cache_chunks == 1
+
+    # Request finish tolerates the vanished key.
+    manager.on_request_finished(ctx_a)
+
+    assert manager.lookup(to_key(1), make_req_context(req_id="req-c")) is (
+        LookupResult.MISS
+    )
+    store_and_complete(manager, to_keys([3]), _EMPTY_REQ_CTX, write_slot)
+    assert manager.lookup(to_key(3), make_req_context(req_id="req-d")) is (
+        LookupResult.HIT
+    )
+
+
+@pytest.mark.parametrize("cache_policy", ["lru", "arc"])
+def test_rejected_after_load_finish_tolerates_vanished_key(cache_policy):
+    """A key this request already loaded can still be evicted by a later
+    request's corruption rejection; finishing the request must not fault
+    in either policy while the surviving key stays tracked."""
+    manager, write_slot, tamper_slot = make_armed_integrity_manager(
+        num_chunks=2, cache_policy=cache_policy
+    )
+    store_and_complete(manager, to_keys([1, 2]), _EMPTY_REQ_CTX, write_slot)
+
+    ctx_a = make_req_context(req_id="req-a")
+    assert manager.prepare_load(to_keys([1, 2]), ctx_a) is not None
+    manager.complete_load(to_keys([1, 2]), ctx_a)
+
+    rejected_chunk = manager._policy.get(to_key(1))
+    assert rejected_chunk is not None
+    tamper_slot(int(rejected_chunk.chunk_id))
+    ctx_b = make_req_context(req_id="req-b")
+    assert manager.lookup(to_key(1), ctx_b) is LookupResult.MISS
+
+    manager.on_request_finished(ctx_a)
+
+    assert manager._policy.get(to_key(1)) is None
+    assert manager._policy.get(to_key(2)) is not None
+
+
+def test_verify_stored_slot_cross_check():
+    """The cascade cross-check source: whether given bytes match the
+    checksum recorded at this key's CPU-store completion. True/False for
+    a recorded key, None when slot checksums are off or unrecorded."""
+    manager, write_slot, _ = make_armed_integrity_manager(num_chunks=2)
+    store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
+
+    key = to_key(1)
+    stored_chunk = manager._policy.get(key)
+    assert stored_chunk is not None
+    chunk_id = int(stored_chunk.chunk_id)
+    view = manager._kv_bytes
+    assert view is not None
+    size = len(view) // manager._num_chunks
+    stored = bytes(view[chunk_id * size : (chunk_id + 1) * size])
+    tampered = bytearray(stored)
+    tampered[0] ^= 0xFF
+
+    assert manager.verify_stored_slot(key, stored) is True
+    assert manager.verify_stored_slot(key, bytes(tampered)) is False
+    assert manager.verify_stored_slot(to_key(9), stored) is None
+
+    no_view_manager = make_cpu_manager(num_chunks=2)
+    assert no_view_manager.verify_stored_slot(key, stored) is None
