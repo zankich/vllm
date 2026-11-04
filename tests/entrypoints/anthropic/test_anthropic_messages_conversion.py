@@ -40,6 +40,7 @@ from vllm.entrypoints.generate.base.protocol import (
     DeltaMessage,
     DeltaToolCall,
     FunctionCall,
+    PerRequestMetrics,
     ToolCall,
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -1038,6 +1039,7 @@ def _make_stream_chunk(
     stop_reason: int | str | None = None,
     choices: list[ChatCompletionResponseStreamChoice] | None = None,
     usage: UsageInfo | None = None,
+    metrics: PerRequestMetrics | None = None,
 ) -> ChatCompletionStreamResponse:
     if choices is None:
         choices = [
@@ -1054,6 +1056,7 @@ def _make_stream_chunk(
         model="test-model",
         choices=choices,
         usage=usage,
+        metrics=metrics,
     )
     return chunk
 
@@ -1405,6 +1408,117 @@ class TestStreamingCacheUsageSemantics:
         assert "cache_creation_input_tokens" not in start_usage
         assert "cache_read_input_tokens" not in delta_usage
         assert "cache_creation_input_tokens" not in delta_usage
+
+
+class TestPerRequestMetricsSurface:
+    """Per-request metrics (timing and speculative-decoding acceptance) must
+    survive construction and serialization on both the streaming
+    ``message_delta`` event and the non-streaming response, and the
+    converters must forward them from the OpenAI-layer chunks."""
+
+    @staticmethod
+    def _spec_metrics():
+        from vllm.entrypoints.generate.base.protocol import (
+            SpeculativeDecodingMetrics,
+        )
+
+        return SpeculativeDecodingMetrics(
+            mean_acceptance_length=1.0,
+            draft_acceptance_rate=0.5,
+            acceptance_histogram=[0, 1],
+            num_spec_steps=1,
+            num_accepted_draft_tokens=1,
+            num_draft_tokens=2,
+            num_spec_tokens=1,
+        )
+
+    def test_metrics_round_trips_on_stream_event_and_response(self):
+        from vllm.entrypoints.anthropic.protocol import (
+            AnthropicMessagesResponse,
+            AnthropicStreamEvent,
+        )
+        from vllm.entrypoints.generate.base.protocol import PerRequestMetrics
+
+        metrics = PerRequestMetrics(speculative_decoding=self._spec_metrics())
+
+        stream_event = AnthropicStreamEvent(
+            type="message_delta",
+            metrics=metrics,
+        )
+        assert stream_event.metrics is not None
+        assert stream_event.metrics.speculative_decoding is not None
+        assert stream_event.metrics.speculative_decoding.num_accepted_draft_tokens == 1
+        dumped = stream_event.model_dump(exclude_none=True)
+        assert "metrics" in dumped
+        assert dumped["metrics"]["speculative_decoding"]["num_spec_steps"] == 1
+
+        response = AnthropicMessagesResponse(
+            id="msg_test",
+            type="message",
+            role="assistant",
+            model="claude-3-7-sonnet-latest",
+            content=[],
+            stop_reason="end_turn",
+            usage=None,
+            metrics=metrics,
+        )
+        assert response.metrics is not None
+        assert response.metrics.speculative_decoding is metrics.speculative_decoding
+
+    @pytest.mark.asyncio
+    async def test_stream_converter_forwards_metrics_on_message_delta(self):
+        """The OpenAI generator rides per-request metrics on the final
+        empty-choices usage chunk; the Anthropic message_delta must carry
+        them through to the SSE payload."""
+        from vllm.entrypoints.generate.base.protocol import PerRequestMetrics
+
+        metrics = PerRequestMetrics(speculative_decoding=self._spec_metrics())
+
+        async def chunk_input():
+            yield _make_stream_chunk(delta=DeltaMessage(role="assistant"))
+            yield _make_stream_chunk(finish_reason="stop")
+            yield _make_stream_chunk(
+                choices=[],
+                usage=UsageInfo(prompt_tokens=10, completion_tokens=2, total_tokens=12),
+                metrics=metrics,
+            )
+
+        converter = _make_stream_converter()
+        events = _parse_sse_events(
+            [e async for e in converter.message_stream_converter(chunk_input())]
+        )
+
+        deltas = [data for ev, data in events if ev == "message_delta"]
+        assert len(deltas) == 1
+        assert deltas[0]["metrics"]["speculative_decoding"]["num_spec_steps"] == 1
+        assert (
+            deltas[0]["metrics"]["speculative_decoding"]["num_accepted_draft_tokens"]
+            == 1
+        )
+
+    def test_full_converter_forwards_metrics_on_response(self):
+        from vllm.entrypoints.generate.base.protocol import PerRequestMetrics
+
+        metrics = PerRequestMetrics(speculative_decoding=self._spec_metrics())
+        generator = ChatCompletionResponse(
+            id="chatcmpl-metrics",
+            model="test-model",
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content="ok"),
+                    finish_reason="stop",
+                )
+            ],
+            usage=UsageInfo(prompt_tokens=10, completion_tokens=1, total_tokens=11),
+            metrics=metrics,
+        )
+
+        result = _make_full_converter().messages_full_converter(generator)
+
+        assert result.metrics is metrics
+        dumped = result.model_dump(exclude_none=True)
+        assert dumped["metrics"]["speculative_decoding"]["num_spec_tokens"] == 1
 
 
 # ======================================================================
