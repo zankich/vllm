@@ -349,7 +349,7 @@ def convert(
     os.makedirs(out_dir, exist_ok=True)
 
     # Symlink every non-PLE file from the source; absolute paths
-    # (compose bind-mounts /models).
+    # are used because the source is a container-internal mount.
     ple_src_files = set(by_src_file)
     for entry in os.listdir(src_dir):
         src_path = os.path.join(src_dir, entry)
