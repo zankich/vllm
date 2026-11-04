@@ -757,6 +757,8 @@ def test_external_cache_hit_sources_reconcile_different_group_chunk_sizes(
     )
     scheduler = runner.connector_scheduler
     request = MagicMock(request_id="mixed")
+    # The restore-accounting summary reads the request's prompt extent.
+    request.num_prompt_tokens = 2 * block_size
     req_status = RequestOffloadState(
         config=scheduler.config,
         req=request,
@@ -892,6 +894,8 @@ def test_external_cache_hit_sources_use_loaded_attention_ranges(
     spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
     scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
     request = MagicMock(request_id="sparse")
+    # The restore-accounting summary reads the request's prompt extent.
+    request.num_prompt_tokens = 4 * chunk_size
     req_status = RequestOffloadState(
         config=scheduler.config,
         req=request,
@@ -1424,6 +1428,48 @@ def test_partial_lookup_anchor_loads_only_verified_chunks():
     assert load_job.dst_spec.block_ids.tolist() == [31, 32, 41]
     assert load_job.dst_spec.group_sizes == [2, 1]
     assert load_job.dst_spec.block_indices == [0, 1]
+
+
+@pytest.mark.parametrize(
+    "with_partial_tail", [True, False], ids=["partial_tail", "clean"]
+)
+def test_restore_accounting_logs_no_violation(caplog, with_partial_tail):
+    # Partial-tail restore on a cold GPU prefix: the boundary key extends
+    # past the last complete chunk. The capacity invariant must include
+    # the boundary extent for non-window groups, otherwise a corruption-
+    # class VIOLATION floods the log on every correct partial-tail
+    # restore. The clean (no partial tail) case is parametrized alongside
+    # so a fix that masks the clean case cannot regress here.
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h6"}, 1: {b"h6"}}
+    )
+    assert scheduler._lookup(req_status) == 28
+    if with_partial_tail:
+        num_external_tokens = 28
+    else:
+        req_status.partial_tail_boundary = None
+        num_external_tokens = 16
+    with caplog.at_level(
+        "ERROR",
+        logger="vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler",
+    ):
+        scheduler.update_state_after_alloc(
+            request,
+            KVCacheBlocks(
+                (
+                    [KVCacheBlock(31), KVCacheBlock(32)],
+                    [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
+                )
+            ),
+            num_external_tokens=num_external_tokens,
+        )
+    violations = [
+        record.getMessage()
+        for record in caplog.records
+        if "restore-accounting VIOLATION" in record.getMessage()
+    ]
+    assert violations == [], f"unexpected restore-accounting VIOLATION(s): {violations}"
 
 
 def test_partial_lookup_returns_zero_without_stored_tail():
