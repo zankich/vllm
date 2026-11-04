@@ -661,3 +661,61 @@ def test_clip_count_env_enables_drain_reader_env_separate(monkeypatch):
     monkeypatch.delenv("VLLM_QSA_KV_CLIP_READER")
     importlib.reload(qsa_mod)  # restore
     assert not qsa_mod._qsa_clip_counting_enabled()
+
+
+# --- calibration merge script ---------------------------------------------------
+
+
+def test_calib_merge_math_and_fail_closed(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    for rank in range(2):
+        (tmp_path / f"qsa_absmax_rank{rank}.json").write_text(
+            json.dumps(
+                {
+                    "l0.attn": {"k_absmax": 3.0 + rank, "v_absmax": 1.0},
+                    "l1.attn": {"k_absmax": 0.5, "v_absmax": 8.0},
+                }
+            )
+        )
+    out = tmp_path / "merged.json"
+    r = subprocess.run(
+        [
+            sys.executable,
+            "calib/qsa_calib_merge.py",
+            str(tmp_path),
+            str(out),
+            "--ranks",
+            "2",
+            "--layers",
+            "2",
+            "--margin",
+            "1.10",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).parents[3]),
+    )
+    assert r.returncode == 0, r.stderr
+    data = json.loads(out.read_text())
+    # scale = absmax * margin / 448
+    assert math.isclose(data["l0.attn"]["k_scale"], 4.0 * 1.10 / 448.0)
+    assert math.isclose(data["l1.attn"]["v_scale"], 8.0 * 1.10 / 448.0)
+
+    (tmp_path / "qsa_absmax_rank1.json").unlink()
+    r = subprocess.run(
+        [
+            sys.executable,
+            "calib/qsa_calib_merge.py",
+            str(tmp_path),
+            str(out),
+            "--ranks",
+            "2",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).parents[3]),
+    )
+    assert r.returncode != 0
