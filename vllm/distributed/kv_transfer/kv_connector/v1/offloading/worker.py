@@ -6,6 +6,9 @@ from dataclasses import replace
 import torch
 
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorTransferResults,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (
     derive_canonical_mappings,
 )
@@ -60,6 +63,8 @@ class OffloadingConnectorWorker:
 
         # job_id -> req_id for in-flight loads (None for sync loads).
         self._load_jobs: dict[int, ReqId | None] = {}
+        # Loads the scheduler failed without issuing a job.
+        self._failed_loads: set[ReqId] = set()
         self._unsubmitted_store_jobs: list[
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
         ] = []
@@ -268,6 +273,7 @@ class OffloadingConnectorWorker:
             assert success
         if sync_job_ids:
             self.worker.wait(sync_job_ids)
+        self._failed_loads |= metadata.failed_loads
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
@@ -320,6 +326,20 @@ class OffloadingConnectorWorker:
 
         return set(), finished_recving
 
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> KVConnectorTransferResults:
+        """Report failed loads in both finished_recving and failed_recving:
+        every rank does, so the output aggregator surfaces the failure."""
+        finished_sending, finished_recving = self.get_finished(finished_req_ids)
+        failed_recving = self._failed_loads
+        self._failed_loads = set()
+        return KVConnectorTransferResults(
+            finished_sending=finished_sending,
+            finished_recving=finished_recving | failed_recving,
+            failed_recving=failed_recving,
+        )
+
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         """Return completed transfer job IDs since the last call."""
         if not self._connector_worker_meta.completed_jobs:
@@ -331,6 +351,7 @@ class OffloadingConnectorWorker:
     def shutdown(self) -> None:
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()
+        self._failed_loads.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()
         if self.worker is not None:
             self.worker.shutdown()
