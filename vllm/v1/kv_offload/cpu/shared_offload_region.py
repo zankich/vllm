@@ -3,6 +3,7 @@
 import contextlib
 import ctypes
 import errno
+import fcntl
 import functools
 import mmap
 import os
@@ -28,6 +29,98 @@ _MAP_FIXED = 0x10
 # Page-cache inserts are serialized per shm file, capping pre-faulting of one
 # file near 10 GiB/s; smaller segments are not worth a file.
 _MIN_SEGMENT_BYTES = 1 << 30
+
+_REGLOCK_SUFFIX = ".reglock"
+
+
+def _hold_shared_lock(fd: int, path: str) -> None:
+    """Mark this region as in use for as long as the process lives.
+
+    The lock is advisory and shared, so every worker of the same engine can
+    hold it at once; the kernel releases it when the process exits, however
+    it exits. ``_reclaim_orphaned_regions`` reads it to tell a live region
+    from an orphan. A filesystem that does not support ``flock`` only costs
+    us that signal, so failure here is logged and ignored.
+    """
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        logger.debug("Could not flock %s; orphan reclaim disabled for it", path)
+
+
+def _reglock_matches_path(fd: int, path: str) -> bool:
+    """Whether the locked fd is still the file the path names.
+
+    A remover that unlinks the reglock under the lock leaves a rank that
+    opened the path earlier holding a lock on an inode the path no longer
+    names, and the next rank to open the path creates a second inode. The
+    two ranks then hold different inodes and their critical sections
+    overlap. A rank whose fd names a stale inode retries on the file the
+    path names now, and a remover whose fd names a stale inode must not
+    unlink the path: the file the path names now belongs to someone else.
+    """
+    st = os.fstat(fd)
+    if st.st_nlink == 0:
+        return False
+    try:
+        path_st = os.stat(path)
+    except FileNotFoundError:
+        return False
+    return (st.st_dev, st.st_ino) == (path_st.st_dev, path_st.st_ino)
+
+
+def _remove_reglock(path: str) -> bool:
+    """Unlink a registration lock file unless a rank holds its lock.
+
+    The lock is the only thing that separates a live registration from a
+    leftover file, and it is held for the whole registration critical
+    section, so taking it before the unlink is what keeps the removal
+    from splitting that section: a rank that opens the path after the
+    unlink gets a new inode and would no longer exclude a rank that
+    already holds the old one.
+
+    The lock is not enough on its own: two removers can open the same
+    file, and the second one's lock is on an inode the first has already
+    unlinked, while a rank may have created a new file under the same
+    name. The file is unlinked only when it is still the file the path
+    names, so no remover takes away a file it does not own.
+
+    Returns whether the file was removed.
+    """
+    try:
+        # /dev/shm is world-writable, so refuse to follow a symlink a local
+        # user may have planted under this name; O_NOFOLLOW makes os.open
+        # raise ELOOP, which the handler below catches.
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        logger.debug("Could not open reglock %s", path, exc_info=True)
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # A rank is inside the registration critical section.
+            logger.debug("Reglock %s is held; leaving it in place", path)
+            return False
+        if not _reglock_matches_path(fd, path):
+            # The path names a different file now: another remover took
+            # this one, and a rank registered on a new file under the
+            # same name. Unlinking would take that rank's file away.
+            logger.debug("Reglock %s was replaced; leaving it in place", path)
+            return False
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            logger.debug("Failed to unlink reglock %s", path, exc_info=True)
+            return False
+        return True
+    finally:
+        # Closing drops the lock, on the unlinked inode if we got that far.
+        os.close(fd)
 
 
 def _wait_for_file_size(fd: int, expected_size: int, timeout: float = 30.0) -> None:
@@ -154,6 +247,7 @@ class SharedOffloadRegion:
                 # Joiner path — another worker won O_EXCL. Reopen and wait
                 # for the file to reach expected size.
                 self.fd = os.open(self.mmap_path, os.O_RDWR)
+                _hold_shared_lock(self.fd, self.mmap_path)
                 _wait_for_file_size(self.fd, self._segments[0][2])
                 logger.info("Opened existing mmap file %s", self.mmap_path)
             else:
@@ -164,6 +258,7 @@ class SharedOffloadRegion:
                 self._creator = True
                 if creator_memory_check is not None:
                     creator_memory_check(self.total_size_bytes)
+                _hold_shared_lock(self.fd, self.mmap_path)
                 check_shm_free_space(
                     self.total_size_bytes,
                     allocation_name="CPU KV offload shared region in /dev/shm",
@@ -453,3 +548,15 @@ class SharedOffloadRegion:
                     "Failed to unlink path %s", self.mmap_path, exc_info=True
                 )
             self._creator = False
+        # pin_mmap_region creates <mmap_path>.reglock lazily and closes its fd
+        # when done, so the lock file outlives the registration. Remove it
+        # whoever created the region: the barrier flow drops the region name
+        # at construction, which leaves the reglock as the only name this
+        # engine owns in /dev/shm. The lock itself guards the removal, so a
+        # rank still inside the registration keeps the file and the orphan
+        # sweep takes it later.
+        mmap_path = getattr(self, "mmap_path", None)
+        if mmap_path:
+            reglock_path = mmap_path + _REGLOCK_SUFFIX
+            if _remove_reglock(reglock_path):
+                logger.debug("Removed reglock file %s", reglock_path)

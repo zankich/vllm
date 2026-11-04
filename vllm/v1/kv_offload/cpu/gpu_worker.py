@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import fcntl
 import functools
+import os
 import time
 from collections import deque
 from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -27,7 +30,10 @@ from vllm.v1.kv_offload.base import (
     TransferResult,
 )
 from vllm.v1.kv_offload.cpu.host_register import host_register, host_unregister
-from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.kv_offload.cpu.shared_offload_region import (
+    SharedOffloadRegion,
+    _reglock_matches_path,
+)
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
     swap_blocks_batch,
@@ -200,6 +206,70 @@ MAX_HOST_REGISTER_CHUNK_BYTES = 64 * 1024**3
 MIN_HOST_REGISTER_SAVED_BYTES = 3 * 1024**2
 
 
+def _open_and_lock_reglock(reglock_path: str) -> int:
+    """Open the registration lock file and take the exclusive lock on it.
+
+    The lock excludes the other ranks only while they all hold it on the
+    same inode, so the fd is checked against the path once the lock is
+    taken: a remover that unlinked the path in between leaves this rank
+    holding an inode the path no longer names, and the next rank's
+    O_CREAT makes a second one. Such a rank closes the fd and retries on
+    the file the path names now. The open failure propagates out of the
+    loop: the retry only covers a path that changed between a successful
+    open and the re-check, never a failing open.
+    """
+    while True:
+        # /dev/shm is world-writable, so refuse to follow a symlink a local
+        # user may have planted under this name, the way both removers of
+        # the same path do; O_NOFOLLOW makes os.open raise ELOOP.
+        fd = os.open(reglock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            if _reglock_matches_path(fd, reglock_path):
+                return fd
+        except BaseException:
+            # The lock is taken by the time the re-check runs, so the fd
+            # must close before any exception propagates: an open fd
+            # keeps the lock and every later rank blocks until exit.
+            os.close(fd)
+            raise
+        os.close(fd)
+
+
+@contextmanager
+def _region_registration_lock(region: SharedOffloadRegion):
+    """Serialize chunked host registration and its rollback across ranks.
+
+    Concurrent registrations over the same pages intermittently fail with
+    cudaErrorInvalidValue on some drivers (observed on RTX 3090 Ti, TP2,
+    where one rank succeeded while the other failed). The exclusive lock
+    serializes chunked registration across ranks through a dedicated lock
+    file at ``<region.mmap_path>.reglock``, so it can never conflict with
+    the shared liveness marks on the region itself, which is what the
+    orphan-reclaim sweep probes to tell a live region from an orphan.
+    Routing the exclusive lock through a separate inode keeps those marks
+    visible to a racing sweep across the whole registration critical
+    section.
+
+    The lock is only an exclusion while every rank holds it on the same
+    inode, so a rank that finds the file it opened no longer named by the
+    path retries on the current one. Without that check, a remover that
+    unlinks the reglock under the lock lets one rank register on the
+    orphaned inode while a later rank creates a fresh one, and the two
+    critical sections run at once.
+    """
+    if getattr(region, "fd", None) is None:
+        yield
+        return
+    reglock_path = region.mmap_path + ".reglock"
+    reglock_fd = _open_and_lock_reglock(reglock_path)
+    try:
+        yield
+    finally:
+        fcntl.flock(reglock_fd, fcntl.LOCK_UN)
+        os.close(reglock_fd)
+
+
 def pin_mmap_region(
     region: SharedOffloadRegion, worker_slot_only: bool = False
 ) -> None:
@@ -238,25 +308,28 @@ def pin_mmap_region(
         )
 
     # Register, drain and roll back through the same helper, so a failed
-    # chunk leaves neither a pending error nor a partly pinned region.
+    # chunk leaves neither a pending error nor a partly pinned region. The
+    # registration holds the region's reglock across the whole sequence,
+    # whichever range set this rank registers.
     addresses: list[int] = []
     registered_bytes = 0
-    for offset, size in ranges:
-        address = base_ptr + offset
-        if host_register(address, size):
-            addresses.append(address)
-            registered_bytes += size
-            continue
-        logger.warning(
-            "host_register failed for rank=%d at %.2f of %.2f GB; "
-            "the offload region stays pageable",
-            rank,
-            offset / 1e9,
-            total_size / 1e9,
-        )
-        for registered in reversed(addresses):
-            host_unregister(registered)
-        return
+    with _region_registration_lock(region):
+        for offset, size in ranges:
+            address = base_ptr + offset
+            if host_register(address, size):
+                addresses.append(address)
+                registered_bytes += size
+                continue
+            logger.warning(
+                "host_register failed for rank=%d at %.2f of %.2f GB; "
+                "the offload region stays pageable",
+                rank,
+                offset / 1e9,
+                total_size / 1e9,
+            )
+            for registered in reversed(addresses):
+                host_unregister(registered)
+            return
 
     region.pinned_addresses.extend(addresses)
     region.is_pinned = True

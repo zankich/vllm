@@ -867,6 +867,55 @@ def test_cleanup_unregisters_every_pinned_chunk(iid, monkeypatch):
     ]
 
 
+def test_cleanup_removes_reglock_file(iid, host_register):
+    """cleanup() on the creator must remove the .reglock registration file.
+
+    Registration creates ``<mmap_path>.reglock`` lazily and closes its fd
+    when done, so without an explicit removal every engine start leaves a
+    zero-byte inode in /dev/shm.
+    """
+    region = _make_region(iid)
+    reglock_path = region.mmap_path + ".reglock"
+    try:
+        gpu_worker.pin_mmap_region(region)
+        assert os.path.exists(reglock_path), "registration must create the reglock"
+
+        region.cleanup()
+
+        assert not os.path.exists(reglock_path), (
+            "creator cleanup must remove the reglock file"
+        )
+        assert not os.path.exists(region.mmap_path)
+    finally:
+        _cleanup_file(region.mmap_path)
+        _cleanup_file(reglock_path)
+
+
+def test_barrier_cleanup_removes_reglock_file(iid, host_register):
+    """cleanup() must remove the reglock on the barrier flow too.
+
+    The barrier drops the region name at construction, so the creator
+    flag that gates the region unlink is already false by the time
+    cleanup() runs. The reglock is then the only name the engine leaves
+    in /dev/shm, and it would leak one inode per boot.
+    """
+    region = _make_region(iid, barrier=lambda: None)
+    reglock_path = region.mmap_path + ".reglock"
+    try:
+        gpu_worker.pin_mmap_region(region)
+        assert os.path.exists(reglock_path), "registration must create the reglock"
+
+        region.cleanup()
+
+        assert not os.path.exists(reglock_path), (
+            "barrier-flow cleanup must remove the reglock file"
+        )
+    finally:
+        region.cleanup()
+        _cleanup_file(region.mmap_path)
+        _cleanup_file(reglock_path)
+
+
 @pytest.fixture
 def host_register(monkeypatch):
     """Mock the cross-platform host_register/host_unregister helpers with
