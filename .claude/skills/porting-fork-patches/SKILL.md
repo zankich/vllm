@@ -45,14 +45,17 @@ Then measure drift per file the fork touches (`git diff --numstat <merge-base>..
 11. **Keep the plan and ledger safe.** Back the plan up outside the worktree and ban `git clean` in every dispatch. The ledger lives in the worktree and records every ruling, deferral and GPU-owed item with a name, a reason and an owner.
 12. **Treat commit messages and README prose as public.** No hostnames, addresses, names, topology or process narration. A message-only rewrite must leave every tree hash unchanged.
 
-## Unsettled across ports
+## Ruled by the owner (v0.33.0z port, 2026-11-02)
 
-The ports disagreed on these. Until the owner rules, use the working default and record the choice in the plan's decision ledger.
+- **Upstream first.** Where upstream provides a capability, use upstream's implementation, enabling it by configuration if needed. Keep only the tweaks upstream lacks, as separate labeled commits. Minimize custom code maintained.
+- **No verbatim cherry-picks.** Land the content and spirit of each fork change as fresh authored commits against the new base. The fork's history is the source of intent, not a patch series to replay.
+- **Mechanic.** Simulate cherry-picks only to map drift and find hazards. Landing is re-authoring against the upstream seam, with the fork commit named in the message.
+
+## Unsettled across ports
 
 | Question | Working default |
 |---|---|
 | Is an upstream-side or static claim enough for `DROP-ABSORBED`? | No for anything runtime-visible, boot stock upstream. |
-| Port mechanic | Simulate cherry-picks to map drift, then pick a mechanic per patch class and do not mix within a class. |
 | Fix source-branch defects during the port? | No, land them after as labeled commits. |
 | Baseline with known deterministic errors | Fix the invocation and re-record before the first pick. |
 | Is a split admissible when its hunks are not adjacent to their new home? | No, leave it whole. |
