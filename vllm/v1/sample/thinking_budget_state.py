@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Per-batch thinking token budget state; applied after penalties at sample time."""
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -36,6 +37,7 @@ class ThinkingBudgetStateHolder:
 
     think_start_token_ids: list[int]
     think_end_token_ids: list[int]
+    force_token_ids: list[int]
 
     def __init__(
         self,
@@ -62,6 +64,14 @@ class ThinkingBudgetStateHolder:
             self.think_start_token_ids = rs if rs else []
             self.think_end_token_ids = re if re else []
 
+        _wids = [
+            int(t)
+            for t in os.environ.get("VLLM_THINKING_WRAPUP_TOKEN_IDS", "").split(",")
+            if t.strip()
+        ]
+        self.force_token_ids = (
+            _wids + self.think_end_token_ids if _wids else self.think_end_token_ids
+        )
         self.device = device
         self._state: dict[int, dict[str, Any]] = {}
         self.cu_num_tokens: dict[int, int] = {}
@@ -171,6 +181,9 @@ class ThinkingBudgetStateHolder:
     def _init_state_entry(
         self, prompt_tok_ids: list[int] | None, thinking_token_budget: int
     ) -> dict[str, Any]:
+        _reserve = len(self.force_token_ids) - len(self.think_end_token_ids)
+        if _reserve > 0:
+            thinking_token_budget = max(1, thinking_token_budget - _reserve)
         if prompt_tok_ids is None:
             last_start = -1
             last_end = -1
@@ -356,9 +369,7 @@ class ThinkingBudgetStateHolder:
         # eg with 999: [2,4,5,999] -> [3,-1,-1,-1]
         if state["in_end"] and state["end_count"] == 0:
             new_tokens = output[prev_length:]
-            stopping_thinking = (
-                self.think_end_token_ids[state["end_count"]] in new_tokens
-            )
+            stopping_thinking = self.force_token_ids[state["end_count"]] in new_tokens
             if not stopping_thinking:
                 state["in_think"] = True
                 state["in_end"] = False
@@ -446,10 +457,54 @@ class ThinkingBudgetStateHolder:
 
         else:
             state["force_index"] = []
-            if len(state["spec_token_ids"]) > 0:
+            if len(self.force_token_ids) > 1:
+                # Advance MONOTONICALLY on tokens that actually
+                # landed this step. Upstream counts drafted spec
+                # tokens, which the rejection sampler may discard, so
+                # its counter runs ahead of reality and forces the
+                # wrong token (invisible at length 1, fatal at 24).
+                # Recomputing from the output tail instead is not
+                # enough either: only one position per step is
+                # forced, so the sampler fills the rest of the verify
+                # window freely and those interjections break a
+                # tail-anchored match, restarting the walk and
+                # emitting the phrase twice. A counter that only ever
+                # moves forward, on observed tokens, survives both.
+                k = state["end_count"]
+                for _t in output[prev_length:]:
+                    if k < len(self.force_token_ids) and (
+                        _t == self.force_token_ids[k]
+                    ):
+                        k += 1
+                state["end_count"] = k
+                if k < len(self.force_token_ids):
+                    spec = state["spec_token_ids"]
+                    force_at = len(spec)
+                    for i, token_id in enumerate(spec):
+                        if k + i >= len(self.force_token_ids) or (
+                            token_id != self.force_token_ids[k + i]
+                        ):
+                            force_at = i
+                            break
+                    # Pin the first diverging window row, plus the
+                    # bonus row (below). Pinning the WHOLE window was
+                    # measured worse than pinning nothing: rejection
+                    # only lands rows up to the divergence, so the
+                    # later rows emit mid-phrase tokens out of order,
+                    # the monotonic counter never advances past k, and
+                    # thinking runs to max_tokens. Rows before force_at
+                    # already hold drafts matching the continuation.
+                    # The bonus row only survives when every draft was
+                    # accepted, i.e. exactly when its token is
+                    # force_token_ids[k + len(spec)]; it is addressed
+                    # separately because that pass lays out one row per
+                    # sequence (index 0) regardless of window size.
+                    state["force_index"] = list(range(force_at, len(spec)))
+                    state["bonus_force_offset"] = len(spec)
+            elif len(state["spec_token_ids"]) > 0:
                 for i, token_id in enumerate(state["spec_token_ids"]):
-                    if state["end_count"] + 1 < len(self.think_end_token_ids):
-                        if token_id == self.think_end_token_ids[state["end_count"] + 1]:
+                    if state["end_count"] + 1 < len(self.force_token_ids):
+                        if token_id == self.force_token_ids[state["end_count"] + 1]:
                             state["end_count"] += 1
                         else:
                             state["end_count"] += 1
@@ -463,7 +518,7 @@ class ThinkingBudgetStateHolder:
             else:
                 state["end_count"] += 1
                 state["force_index"] = [0]
-            if state["end_count"] >= len(self.think_end_token_ids):
+            if state["end_count"] >= len(self.force_token_ids):
                 state.update(
                     {
                         "in_end": False,
@@ -533,16 +588,26 @@ class ThinkingBudgetStateHolder:
                         continue
                     end_count = state.get("end_count", 0)
                     for force_idx in force_index:
-                        if end_count < len(self.think_end_token_ids):
+                        if end_count < len(self.force_token_ids):
                             mask_idx = self.cu_num_tokens[seq_idx] + force_idx
                             if (
                                 mask_idx < self._mask_capacity
                                 and mask_idx < logits.shape[0]
                             ):
                                 active_indices_cpu.append(mask_idx)
-                                force_tokens_cpu.append(
-                                    self.think_end_token_ids[end_count]
-                                )
+                                if len(self.force_token_ids) > 1:
+                                    _off = (
+                                        state.get("bonus_force_offset", 0)
+                                        if predict_bonus_token
+                                        else force_idx
+                                    )
+                                    _fi = min(
+                                        end_count + _off,
+                                        len(self.force_token_ids) - 1,
+                                    )
+                                else:
+                                    _fi = end_count
+                                force_tokens_cpu.append(self.force_token_ids[_fi])
                             if predict_bonus_token:
                                 if state["end_count"] > 0:
                                     state["bonus_token_forced"] = False
