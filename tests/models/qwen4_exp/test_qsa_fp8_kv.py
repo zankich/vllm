@@ -6,8 +6,8 @@ The fp8-e4m3 cache reader, the fused-prepare capability conjunct and the
 capability-aware warmup are upstream mechanisms; the tests in the first two
 sections pin them so the sidecar loader and the calibration collectors that
 build on them cannot silently detach from them. The static sidecar loader
-(``load_qsa_static_kv_scales``) and the ``VLLM_QSA_KV_SCALES`` call site are
-fork additions re-authored onto the upstream weight-load seam.
+(``load_qsa_static_kv_scales``) and the ``VLLM_QSA_KV_SCALES`` call site
+are fork additions on the upstream weight-load seam.
 """
 
 import json
