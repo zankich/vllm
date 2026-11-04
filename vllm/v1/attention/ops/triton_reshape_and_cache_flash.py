@@ -23,10 +23,63 @@ def _is_supported_kv_cache_dtype(kv_cache_dtype: str) -> bool:
     ):
         return False
     if kv_cache_dtype.startswith("fp8"):
-        return current_platform.has_device_capability(89) or current_platform.is_xpu()
+        # Below SM89 triton cannot compile fp8e4nv, so FP8 KV serves as e5m2
+        # storage there (native in triton on SM80+), quantized in torch by
+        # the cache-store wrappers below.
+        return current_platform.has_device_capability(80) or current_platform.is_xpu()
     if kv_cache_dtype == "bfloat16":
         return current_platform.has_device_capability(80) or current_platform.is_xpu()
     return True
+
+
+def quantize_kv_e5m2_sm80(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize KV to e5m2 in torch with round-to-nearest-even.
+
+    Triton's implicit e5m2 cast rounds ties away from even. Quantizing in
+    torch keeps RNE, and the kernel's is-fp8 input branch then stores the
+    raw bytes without a further cast.
+    """
+    _ks = k_scale.to(torch.float32) if k_scale is not None else 1.0
+    _vs = v_scale.to(torch.float32) if v_scale is not None else 1.0
+    key = (key.to(torch.float32) / _ks).to(torch.float8_e5m2)
+    value = (value.to(torch.float32) / _vs).to(torch.float8_e5m2)
+    return key, value
+
+
+def _quantize_kv_e5m2_for_sm80(
+    kv_cache_dtype: str,
+    kv_cache_torch_dtype: torch.dtype,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+    *caches: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
+    """Serve quantized KV as e5m2 storage below SM89 on CUDA.
+
+    Shared by both cache-store wrappers: triton cannot compile fp8e4nv
+    below SM89, and its implicit e5m2 cast rounds ties away from even, so
+    quantize in torch (RNE) and let the kernel's is-fp8 input branch store
+    raw bytes. Returns the (key, value) pair to store and the caches viewed
+    as e5m2 when the branch fires; the inputs unchanged otherwise.
+    """
+    if not (
+        is_quantized_kv_cache(kv_cache_dtype)
+        and current_platform.is_cuda()
+        and not current_platform.has_device_capability(89)
+        and key.dtype
+        not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
+    ):
+        return key, value, caches
+    if kv_cache_torch_dtype != torch.float8_e5m2:
+        caches = tuple(cache.view(torch.float8_e5m2) for cache in caches)
+    key, value = quantize_kv_e5m2_sm80(key, value, k_scale, v_scale)
+    return key, value, caches
 
 
 @triton.jit
@@ -417,8 +470,8 @@ def triton_reshape_and_cache_flash(
 
     assert _is_supported_kv_cache_dtype(kv_cache_dtype), (
         f"Triton reshape-and-cache cannot store kv_cache_dtype={kv_cache_dtype} "
-        f"on this device: an FP8 KV cache needs native fp8e4nv (SM89+). Use "
-        f"--kv-cache-dtype bfloat16 (or float16 on SM75)."
+        f"on this device: FP8 KV needs SM80+ (e5m2 storage; native fp8e4nv "
+        f"needs SM89+). Use --kv-cache-dtype bfloat16 (or float16 on SM75)."
     )
     kv_cache_torch_dtype = (
         current_platform.fp8_dtype()
@@ -434,6 +487,16 @@ def triton_reshape_and_cache_flash(
         key_cache = key_cache.view(kv_cache_torch_dtype)
         value_cache = value_cache.view(kv_cache_torch_dtype)
     FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype)
+    key, value, (key_cache, value_cache) = _quantize_kv_e5m2_for_sm80(
+        kv_cache_dtype,
+        kv_cache_torch_dtype,
+        key,
+        value,
+        k_scale,
+        v_scale,
+        key_cache,
+        value_cache,
+    )
     # heuristics instead of autotuning
     TILE_SIZE = min(2048, triton.next_power_of_2(n))
     if current_platform.is_rocm() or current_platform.is_xpu():
@@ -592,6 +655,15 @@ def triton_reshape_and_cache_flash_diffkv(
         # (e.g. explicit cast to fp8e4m3fnuz is not supported in triton 3.4)
         kv_cache = kv_cache.view(kv_cache_torch_dtype)
     FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype)
+    key, value, (kv_cache,) = _quantize_kv_e5m2_for_sm80(
+        kv_cache_dtype,
+        kv_cache_torch_dtype,
+        key,
+        value,
+        k_scale,
+        v_scale,
+        kv_cache,
+    )
     # heuristics instead of autotuning
     TILE_SIZE = max(head_size_k, head_size_v)
     TILE_SIZE = triton.next_power_of_2(TILE_SIZE)
