@@ -652,15 +652,18 @@ def test_clip_drain_reads_counters_armed_under_inference_mode(monkeypatch):
     monkeypatch.setattr(qsa_mod, "_qsa_clip_reader_started", True)  # no thread
 
     layer = _fake_qsa_layer("l0")
-    # scale 0.001 -> ceiling 448*0.001 = 0.448: every 5.0 element clips
+    # Distinct ceilings so the counters are attributable per tensor:
+    # k_scale 0.001 -> ceiling 448*0.001 = 0.448, every 5.0 element clips;
+    # v_scale 10.0 -> ceiling 4480.0, nothing clips. Identical scales would
+    # pin nothing about which counter belongs to which tensor.
     layer._k_scale = torch.full((1,), 0.001, device="cuda")
-    layer._v_scale = torch.full((1,), 0.001, device="cuda")
+    layer._v_scale = torch.full((1,), 10.0, device="cuda")
     key = torch.full((1, 2, 8), 5.0, device="cuda", dtype=torch.bfloat16)
     value = torch.full((1, 2, 8), 5.0, device="cuda", dtype=torch.bfloat16)
     with torch.inference_mode():
         qsa_mod._qsa_clip_count(layer, key, value)
     totals = qsa_mod._qsa_clip_drain()
-    assert totals == {"l0": (16, 16)}  # all 16 elements above the ceiling
+    assert totals == {"l0": (16, 0)}  # all K clipped, no V above its ceiling
 
 
 def test_clip_count_env_enables_drain_reader_env_separate(monkeypatch):

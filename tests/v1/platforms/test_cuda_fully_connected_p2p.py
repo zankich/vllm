@@ -11,21 +11,23 @@ tree accepts generic P2P when NVLink is absent: the custom kernel's
 requirement is direct peer access, not NVLink specifically.
 """
 
-_P2P_INDEX = 999  # sentinel distinguishing the generic-P2P query
+import pytest
 
 
-def _probe(monkeypatch, nvlink_ok, p2p_ok):
+def _probe(monkeypatch, nvlink_ok, read_ok, write_ok):
+    """Mock one P2P status answer per caps index, the way the probe fans
+    out: NVLink first, then READ and WRITE separately. The mesh needs
+    READ and WRITE both, so each caps index gets its own answer."""
     from vllm.platforms import cuda as cuda_mod
 
     nvml = cuda_mod.pynvml
     result = {
         nvml.NVML_P2P_CAPS_INDEX_NVLINK: 0 if nvlink_ok else 1,
-        _P2P_INDEX: 0 if p2p_ok else 1,
+        nvml.NVML_P2P_CAPS_INDEX_READ: 0 if read_ok else 1,
+        nvml.NVML_P2P_CAPS_INDEX_WRITE: 0 if write_ok else 1,
     }
 
     def fake_status(handle, peer, caps_index):
-        if caps_index != nvml.NVML_P2P_CAPS_INDEX_NVLINK:
-            caps_index = _P2P_INDEX
         return result[caps_index]
 
     monkeypatch.setattr(nvml, "NVML_P2P_STATUS_OK", 0, raising=False)
@@ -61,16 +63,30 @@ def test_p2p_caps_constants_are_ints():
 
 
 def test_p2p_mesh_accepted_without_nvlink(monkeypatch):
-    # No NVLink anywhere, generic P2P OK on every pair: fully connected
+    # No NVLink anywhere, READ and WRITE OK on every pair: fully connected
     # for the IPC all-reduce path.
-    assert _probe(monkeypatch, nvlink_ok=False, p2p_ok=True) is True
+    assert _probe(monkeypatch, nvlink_ok=False, read_ok=True, write_ok=True) is True
 
 
 def test_no_p2p_rejected(monkeypatch):
     # Neither NVLink nor P2P: not fully connected, same as stock.
-    assert _probe(monkeypatch, nvlink_ok=False, p2p_ok=False) is False
+    assert _probe(monkeypatch, nvlink_ok=False, read_ok=False, write_ok=False) is False
+
+
+@pytest.mark.parametrize(
+    "read_ok,write_ok",
+    [(True, False), (False, True)],
+)
+def test_half_p2p_mesh_rejected(monkeypatch, read_ok, write_ok):
+    # The probe requires direct peer access in both directions: a mesh
+    # that answers OK on READ but not WRITE (or the reverse) is not
+    # fully connected for the one-shot IPC all-reduce.
+    assert (
+        _probe(monkeypatch, nvlink_ok=False, read_ok=read_ok, write_ok=write_ok)
+        is False
+    )
 
 
 def test_nvlink_fast_path(monkeypatch):
     # NVLink on every pair: fully connected without consulting P2P.
-    assert _probe(monkeypatch, nvlink_ok=True, p2p_ok=True) is True
+    assert _probe(monkeypatch, nvlink_ok=True, read_ok=False, write_ok=False) is True

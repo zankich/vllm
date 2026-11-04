@@ -14,38 +14,36 @@ The two failure modes the module's own comments document:
 
 import torch
 
+from tests.v1.sample.utils import create_mock_reasoning_config
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor.interface import BatchUpdate
 from vllm.v1.sample.thinking_budget_state import ThinkingBudgetStateHolder
 
-
-class _MockReasoningConfig:
-    reasoning_start_token_ids = [151667]
-    reasoning_end_token_ids = [151668]
-
-
 WRAPUP_IDS = [9001, 9002]
+WRAPUP_IDS_LONG = [9001, 9002, 9003]
 END_ID = 151668
 START_ID = 151667
 NUM_SPEC_TOKENS = 2
 
 
-def _make_holder(monkeypatch):
+def _make_holder(monkeypatch, wrapup_ids=None):
+    wrapup_ids = WRAPUP_IDS if wrapup_ids is None else wrapup_ids
     monkeypatch.setenv(
-        "VLLM_THINKING_WRAPUP_TOKEN_IDS", ",".join(str(t) for t in WRAPUP_IDS)
+        "VLLM_THINKING_WRAPUP_TOKEN_IDS", ",".join(str(t) for t in wrapup_ids)
     )
     holder = ThinkingBudgetStateHolder(
-        _MockReasoningConfig(),
+        create_mock_reasoning_config([151667], [151668]),
         8,
         NUM_SPEC_TOKENS,
         torch.device("cpu"),
         False,
     )
+    budget = 1 + len(wrapup_ids)
     holder.sync_batch(
         BatchUpdate(
             batch_size=1,
             removed=(),
-            added=[(0, SamplingParams(thinking_token_budget=3), None, [])],
+            added=[(0, SamplingParams(thinking_token_budget=budget), None, [])],
             moved=(),
         )
     )
@@ -123,3 +121,71 @@ def test_force_window_pins_first_diverging_row_plus_bonus(monkeypatch):
     state = holder._state[0]
     assert state["force_index"] == []
     assert state["bonus_force_offset"] == 2
+
+
+def _drive_to_pinned_window(monkeypatch):
+    """Drive a three-id phrase into the pinned-window state: end_count 1,
+    row 1 pinned, bonus row addressed at offset 2. The window drafts
+    [9002, 999]: row 0 matches the continuation, row 1 diverges."""
+    holder = _make_holder(monkeypatch, wrapup_ids=WRAPUP_IDS_LONG)
+    assert holder.force_token_ids == [*WRAPUP_IDS_LONG, END_ID]
+    _drive_into_end_mode(holder)
+    _step(holder, [START_ID, 111, 9001], [9002, 999])
+    state = holder._state[0]
+    assert state["end_count"] == 1
+    assert state["force_index"] == [1]
+    assert state["bonus_force_offset"] == 2
+    return holder
+
+
+def _drive_to_matching_window(monkeypatch):
+    """Drive a three-id phrase into the fully-matching window: end_count 1,
+    force_index empty, bonus row addressed at offset 2. The window drafts
+    [9002, 9003], which is exactly the continuation."""
+    holder = _make_holder(monkeypatch, wrapup_ids=WRAPUP_IDS_LONG)
+    _drive_into_end_mode(holder)
+    _step(holder, [START_ID, 111, 9001, 888], [9002, 9003])
+    state = holder._state[0]
+    assert state["end_count"] == 1
+    assert state["force_index"] == []
+    assert state["bonus_force_offset"] == 2
+    return holder
+
+
+def test_apply_target_call_forces_the_row_addressed_phrase_token(monkeypatch):
+    """The row-to-token numbering is the feature's output; the state tests
+    above pin its inputs. On the pinned window the target call (the second
+    spec-mode pass) must force, at the pinned row, the phrase token
+    addressed by the row index: min(end_count + force_idx, last) with
+    end_count 1 and row 1 pinned is the third phrase id. Dropping the
+    row-index addressing or the clamp flips the forced id."""
+    holder = _drive_to_pinned_window(monkeypatch)
+    logits = torch.zeros(8, 160_000)
+
+    out = holder.apply_to_logits(logits, False, [[9002, 999]])
+    row = holder.cu_num_tokens[0] + 1  # force_index [1]
+    row_logits = out[row]
+    assert int(row_logits.argmax()) == 9003
+    assert row_logits[9003] > 1e8
+    assert row_logits[END_ID] <= 0
+    # The unpinned row carries no force.
+    assert out[row - 1].abs().max() == 0
+
+
+def test_apply_bonus_call_forces_the_bonus_row_phrase_token(monkeypatch):
+    """On the fully-matching window the bonus call (the first spec-mode
+    pass) must force, at the bonus row, the phrase token addressed by
+    bonus_force_offset: min(end_count + offset, last) with end_count 1 and
+    offset 2 is the end token. Dropping the bonus-row offset selection
+    falls back to row addressing and forces the second phrase id
+    instead, so the asserted id discriminates the two."""
+    holder = _drive_to_matching_window(monkeypatch)
+    logits = torch.zeros(8, 160_000)
+
+    out = holder.apply_to_logits(logits, True, [[9002, 9003]])
+    row = holder.cu_num_tokens[0]  # bonus row is the seq's only row here
+    row_logits = out[row]
+    assert int(row_logits.argmax()) == END_ID
+    assert row_logits[END_ID] > 1e8
+    assert row_logits[9002] <= 0
+    assert row_logits[9003] <= 0
