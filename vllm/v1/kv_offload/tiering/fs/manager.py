@@ -171,6 +171,11 @@ class FileSystemTierManager(SecondaryTierManager):
         # Integrity binding: payload path -> (st_dev, st_ino) at store time.
         # A mismatch at load means the tier's storage was replaced under a
         # live engine; the whole map is ground truth for nothing at that point.
+        # Known ceiling: the map grows with every stored path for the
+        # process lifetime and is never compacted. It bites only at
+        # multi-terabyte tier sizes (millions of paths); revisit with a
+        # rebuild-from-listdir compaction if a deployment approaches that
+        # scale, not before.
         self._storage_ids: dict[str, tuple[int, int]] = {}
 
         # Extract block size from primary view

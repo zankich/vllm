@@ -44,6 +44,7 @@ Then measure drift per file the fork touches (`git diff --numstat <merge-base>..
 10. **Nothing outward-facing without the owner.** No push, no moving tag, no default-branch flip, no `latest`. Build under an rc tag. Generate the image diff from the pushed tip, scoped to image paths, and overlay it. Never copy the fork tree into the image. Install plugins with `pip install <dir>`.
 11. **Keep the plan and ledger safe.** Back the plan up outside the worktree and ban `git clean` in every dispatch. The ledger lives in the worktree and records every ruling, deferral and GPU-owed item with a name, a reason and an owner.
 12. **Treat commit messages and README prose as public.** No hostnames, addresses, names, topology or process narration. A message-only rewrite must leave every tree hash unchanged.
+13. **Record every deviation inside a vendored file.** An edit to a vendored copy (for example the pynvml P2P caps constants, which must be ints for the ctypes binding, where upstream ships trailing-comma tuples) dies silently at the next re-vendor, and the crash surfaces far from the cause. Each port's ledger lists every vendored-file deviation with its failing symptom, a collected test pins the deviation, and a dependency refresh re-applies and re-verifies the list.
 
 ## Ruled by the owner (v0.33.0z port, 2026-11-02)
 
