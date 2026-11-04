@@ -1862,6 +1862,36 @@ def test_integrity_rejection_emits_removal_event():
     assert set(events[0].keys) == set(to_keys([1]))
 
 
+def test_in_flight_corrupt_chunk_serves_current_request_and_rejects_next():
+    """A chunk referenced by an in-flight load (ref_cnt > 0) skips the
+    integrity verify on lookup: the copy already in flight completes, and
+    the next request's first lookup rejects. Rejecting mid-flight instead
+    would pull bytes out from under the in-flight copy."""
+    manager, write_slot, tamper_slot = make_armed_integrity_manager(num_chunks=4)
+    store_and_complete(manager, to_keys([1]), _EMPTY_REQ_CTX, write_slot)
+
+    load = manager.prepare_load(to_keys([1]), _EMPTY_REQ_CTX)
+    assert load is not None  # ref_cnt now 1
+
+    tamper_slot(0)
+
+    # In flight: the verify is skipped and the lookup still answers HIT.
+    assert (
+        manager.lookup(to_key(1), make_req_context(req_id="in-flight"))
+        is LookupResult.HIT
+    )
+    assert manager._policy.get(to_key(1)) is not None
+
+    manager.complete_load(to_keys([1]), _EMPTY_REQ_CTX)  # ref_cnt back to 0
+
+    # The next request's first lookup rejects the corrupt chunk.
+    assert (
+        manager.lookup(to_key(1), make_req_context(req_id="next"))
+        is LookupResult.MISS
+    )
+    assert manager._policy.get(to_key(1)) is None
+
+
 def test_integrity_silent_without_memoryview():
     """No buffer armed (plain-spec construction has no bytes to checksum):
     behavior is exactly the legacy contract — corruption is not detectable

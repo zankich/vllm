@@ -34,12 +34,6 @@ PAGE_SIZE = mmap.PAGESIZE
 REGISTER_HOLD_SECONDS = 0.5
 
 
-@pytest.fixture(autouse=True)
-def _set_spawn_method(monkeypatch):
-    # Keep the multiprocessing start method explicit (see
-    # test_shared_offload_region for the WSL/NVML rationale).
-    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-
 
 def _registration_region(mmap_path: str, fd: int, rank: int = 0) -> SharedOffloadRegion:
     """Describe a region for pin_mmap_region without mapping it."""
