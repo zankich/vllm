@@ -161,16 +161,26 @@ def _reclaim_orphaned_regions(own_path: str) -> None:
     same locked removal, so a rank holding the lock (a reused engine id)
     keeps its file for the orphan sweep to take later.
 
-    Zero-length files are skipped: a region is empty only between its
-    creator's ``O_EXCL`` create and the ``ftruncate`` that sizes it, so
-    skipping them avoids racing a starting engine.
+    Zero-length files are a region mid-creation, not orphans: a base is
+    empty only between its creator's ``O_EXCL`` create and the ``ftruncate``
+    that sizes it last, after the numbered segments are already at full
+    size. Inside the orphan window they are skipped, since the creator may
+    still be running; past it, nothing live can own the files, and the
+    uncontended probe below reclaims the stalled creation together with
+    its full-size segments, which no glob reaches on their own.
     """
+    now = time.time()
     for path in glob.glob(_MMAP_GLOB):
         if path == own_path:
             continue
         try:
             if os.path.getsize(path) == 0:
-                continue
+                try:
+                    age = now - os.path.getmtime(path)
+                except OSError:
+                    continue
+                if age < _MIN_ORPHAN_AGE_S:
+                    continue
             # /dev/shm is world-writable, so refuse to follow a symlink a
             # local user may have planted under our glob; O_NOFOLLOW makes
             # os.open raise ELOOP, which the enclosing handler catches.

@@ -1600,6 +1600,63 @@ def test_orphaned_segmented_region_is_reclaimed_with_its_segments(iid):
         _cleanup_file(orphan)
 
 
+def _write_stalled_creation(engine_id: str, age_s: float) -> tuple[str, list[str]]:
+    """Leave behind a hard-killed creator's mid-creation state: a zero-length
+    base (created first, sized last) with its numbered segments already at
+    full size, the way a SIGKILL between the segment ftruncates and the base
+    ftruncate would. The age backdates the base's mtime."""
+    orphan = f"/dev/shm/vllm_offload_{engine_id}.mmap"
+    fd = os.open(orphan, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.close(fd)
+    segments = []
+    for i in (1, 2):
+        segment = f"{orphan}.{i}"
+        fd = os.open(segment, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        os.ftruncate(fd, PAGE_SIZE)
+        os.close(fd)
+        segments.append(segment)
+    if age_s:
+        stamp = time.time() - age_s
+        os.utime(orphan, (stamp, stamp))
+    return orphan, segments
+
+
+@pytest.mark.parametrize("age_s,reclaimed", [(3600, True), (0, False)])
+def test_stalled_creation_segments_reclaimed_by_base_age(iid, age_s, reclaimed):
+    """A hard-killed creator's full-size segments are reclaimed through the
+    zero-length base once its age proves the creator is gone.
+
+    The creator sizes the base file last, so a size-0 base with full-size
+    segments beside it is a creation that never finished. Inside the orphan
+    window the creator may still be running and its liveness mark must be
+    probed, not assumed away; past the window nothing live can own the
+    files, and skipping the base forever would strand whole-gigabyte
+    segments no glob matches.
+    """
+    orphan, segments = _write_stalled_creation(f"{iid}-stalled", age_s)
+    assert os.path.exists(orphan) and all(os.path.exists(s) for s in segments)
+
+    region = _make_region(iid)
+    try:
+        if reclaimed:
+            assert not os.path.exists(orphan), (
+                "an aged zero-length base must be reclaimed"
+            )
+            for segment in segments:
+                assert not os.path.exists(segment), (
+                    f"segment {segment} must be reclaimed with its stalled base"
+                )
+        else:
+            assert os.path.exists(orphan), (
+                "a fresh zero-length base may belong to a starting creator"
+            )
+    finally:
+        region.cleanup()
+        for segment in segments:
+            _cleanup_file(segment)
+        _cleanup_file(orphan)
+
+
 def test_live_region_is_not_reclaimed(iid):
     """A region another live engine is using must survive a new engine's start.
 

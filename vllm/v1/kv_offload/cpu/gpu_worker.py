@@ -31,6 +31,7 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu.host_register import host_register, host_unregister
 from vllm.v1.kv_offload.cpu.shared_offload_region import (
+    _REGLOCK_SUFFIX,
     SharedOffloadRegion,
     _reglock_matches_path,
 )
@@ -261,7 +262,7 @@ def _region_registration_lock(region: SharedOffloadRegion):
     if getattr(region, "fd", None) is None:
         yield
         return
-    reglock_path = region.mmap_path + ".reglock"
+    reglock_path = region.mmap_path + _REGLOCK_SUFFIX
     reglock_fd = _open_and_lock_reglock(reglock_path)
     try:
         yield

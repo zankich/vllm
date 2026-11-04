@@ -198,13 +198,16 @@ def test_registration_serializes_two_ranks_on_shared_region(tmp_path, worker_slo
         )
 
         seen = list(events)
+        # Each rank's critical section spans its first enter to its last
+        # exit, so every held call of a multi-call registration counts.
         intervals: dict[int, tuple[float, float]] = {}
         for kind, rank, t in seen:
+            start, end = intervals.get(rank, (t, t))
             if kind == "enter":
-                intervals.setdefault(rank, (t, t))
-                intervals[rank] = (t, intervals[rank][1])
+                start = min(start, t)
             else:
-                intervals[rank] = (intervals[rank][0], t)
+                end = max(end, t)
+            intervals[rank] = (start, end)
         (a_enter, a_exit), (b_enter, b_exit) = intervals.values()
         assert a_exit < b_enter or b_exit < a_enter, (
             f"critical sections overlapped: {intervals}"
