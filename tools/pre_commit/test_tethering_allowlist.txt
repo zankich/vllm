@@ -113,6 +113,7 @@ tests/models/flint/test_qk_norm_rope.py  # CI jobs disabled pending locked gguf 
 tests/models/flint/test_qkv_fused.py  # CI jobs disabled pending locked gguf installation
 tests/models/qwen4_exp/test_qsa_fp8_kv.py  # fork-local suite, not collected by any Buildkite job
 tests/v1/attention/backends/test_triton_fp8kv_sm80.py  # fork-local suite, not collected by any Buildkite job
+tests/v1/distributed/test_custom_allreduce_group_policy.py  # fork-local suite, not collected by any Buildkite job
 tests/v1/platforms/test_cuda_fully_connected_p2p.py  # fork-local suite, not collected by any Buildkite job
 tests/parser/cohere/test_citations.py  # CI jobs disabled pending locked cmake installation
 tests/parser/cohere/test_reasoning.py  # CI jobs disabled pending locked cmake installation
