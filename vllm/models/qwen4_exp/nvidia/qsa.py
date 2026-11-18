@@ -4,7 +4,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+import atexit
+import json
+import math
+import os
+import threading
+import time
+from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
 from typing import ClassVar, cast
 
 import torch
@@ -18,6 +25,7 @@ from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
@@ -58,6 +66,8 @@ from ..common.qsa_indexer import QSAIndexerMetadata, qsa_kv_cache_dtype
 from . import model
 from .ops.qsa_indexer import _TOPK_WORKSPACE_BYTES
 from .qsa_indexer import QSAIndexer
+
+logger = init_logger(__name__)
 
 
 class Qwen4ExpQSAQKVIndexerLinear(MergedColumnParallelLinear):
@@ -436,7 +446,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # One launch does the indexer prepare, the main QK-norm/RoPE/gate and
         # the main K/V cache write (see QSAIndexer.forward); otherwise all of
         # them take the separate kernels. The fused writer receives an fp8
-        # pointer, which Triton cannot lower below sm_89.
+        # pointer, which Triton cannot lower below sm_89. The calibration
+        # readers (absmax collector, clip counter) read the BF16 K/V the
+        # fused launch never materializes, so they switch to the unfused
+        # writer on every cache dtype and capability.
         self.use_fused_qsa_prepare = (
             self.use_fused_qk_norm_rope_gate
             and self.indexer.use_fused_pre_indexer
@@ -444,6 +457,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self.kv_cache_torch_dtype != torch.uint8
                 or current_platform.has_device_capability(89)
             )
+            and not _qsa_calibration_kv_readers_armed()
         )
         # Without a quant config here (BF16, or ModelOpt FP4, which keeps
         # attention in BF16) the fused layer is unquantized. Otherwise the
@@ -604,6 +618,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             query = q.view(num_tokens, self.num_heads, self.head_dim)
             key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
             value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
+            if _qsa_collect_dir:
+                _qsa_collect_absmax(self.layer_name, key, value)
+            if _qsa_clip_on:
+                _qsa_clip_count(self, key, value)
         else:
             # Norm/RoPE/gate and the K/V cache write happen inside _run_qsa.
             query = key = value = gate = None
@@ -623,9 +641,331 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         return output
 
 
+_QSA_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
+
+
+def _is_qsa_fp8_cache_dtype(cache_dtype: str) -> bool:
+    return cache_dtype in _QSA_FP8_CACHE_DTYPES
+
+
+def load_qsa_static_kv_scales(
+    layers: nn.Module | Mapping[str, nn.Module],
+    sidecar_path: str | Path,
+    *,
+    strict: bool = True,
+) -> list[str]:
+    """Apply scalar QSA K/V dequant scales from a JSON sidecar file.
+
+    Call on every model worker after checkpoint weight loading and before
+    profiling, warmup or cudagraph capture. ``layers`` may be the loaded
+    root module or ``compilation_config.static_forward_context``. The JSON
+    schema is::
+
+        {"model.layers.3.self_attn.attn": {"k_scale": 0.25, "v_scale": 2.0}}
+
+    Only fp8-cache layers are valid targets. With ``strict=True`` (the
+    default) every local layer must be covered; sidecar names this rank does
+    not hold are skipped, because under pipeline parallelism they belong to
+    another rank's stage. Malformed entries always raise: a calibration that
+    was requested but only partially applied decodes at the wrong scale.
+
+    Returns the sorted names of the layers the scales were applied to.
+    """
+    path = Path(sidecar_path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path} must contain a JSON object keyed by layer name")
+
+    if isinstance(layers, nn.Module):
+        qsa_layers = {
+            layer.layer_name: layer
+            for layer in layers.modules()
+            if isinstance(layer, Qwen4ExpQSAAttention)
+        }
+    else:
+        qsa_layers = {
+            name: layer
+            for name, layer in layers.items()
+            if isinstance(name, str) and isinstance(layer, Qwen4ExpQSAAttention)
+        }
+
+    if not qsa_layers:
+        raise ValueError("No Qwen4Exp QSA attention layers were supplied")
+    non_fp8_layers = sorted(
+        name
+        for name, layer in qsa_layers.items()
+        if not _is_qsa_fp8_cache_dtype(layer.kv_cache_dtype)
+    )
+    if non_fp8_layers:
+        raise ValueError(
+            "Static QSA KV scales may only be injected into E4M3 layers; "
+            f"non-FP8 layers: {non_fp8_layers}"
+        )
+
+    non_local = sorted(name for name in raw if name not in qsa_layers)
+    if non_local:
+        logger.debug(
+            "Skipping %d non-local QSA layer names in %s: %s",
+            len(non_local),
+            path,
+            non_local,
+        )
+    missing = sorted(name for name in qsa_layers if name not in raw)
+    if strict and missing:
+        raise ValueError(f"Missing QSA layer scales in {path}: {missing}")
+
+    validated: dict[str, tuple[float, float]] = {}
+    for layer_name in sorted(name for name in raw if name in qsa_layers):
+        entry = raw[layer_name]
+        if not isinstance(entry, dict):
+            raise ValueError(f"{layer_name} scales must be a JSON object")
+        if set(entry) != {"k_scale", "v_scale"}:
+            raise ValueError(f"{layer_name} must contain exactly k_scale and v_scale")
+
+        values: list[float] = []
+        for field in ("k_scale", "v_scale"):
+            value = entry[field]
+            if type(value) not in (int, float):
+                raise ValueError(f"{layer_name}.{field} must be a scalar JSON number")
+            scale = float(value)
+            if not math.isfinite(scale) or scale <= 0.0:
+                raise ValueError(f"{layer_name}.{field} must be finite and positive")
+            values.append(scale)
+
+        layer = qsa_layers[layer_name]
+        for field in ("_k_scale", "_v_scale"):
+            tensor = getattr(layer, field, None)
+            if not isinstance(tensor, torch.Tensor) or tensor.numel() != 1:
+                raise ValueError(
+                    f"{layer_name}.{field} must be an existing scalar tensor"
+                )
+        validated[layer_name] = (values[0], values[1])
+
+    with torch.no_grad():
+        for layer_name, (k_scale, v_scale) in validated.items():
+            layer = qsa_layers[layer_name]
+            layer._k_scale.fill_(k_scale)
+            layer._v_scale.fill_(v_scale)
+            # Host-float mirrors the backend reads: forward passes these
+            # to the kernel, the writer quantizes with the tensors, so both
+            # forms must agree.
+            layer._k_scale_float = float(k_scale)
+            layer._v_scale_float = float(v_scale)
+
+    return sorted(validated)
+
+
+# --- QSA K/V calibration readers ----------------------------------------------
+# The absmax collector (VLLM_QSA_KV_COLLECT) and the clip counter
+# (VLLM_QSA_KV_CLIP_COUNT) read the pre-quantization BF16 K/V tensors that
+# only the unfused writer materializes: the fused prepare writes the cache
+# inside the indexer launch and never exposes them. Both switch the layer to
+# the unfused writer on every cache dtype and capability through the
+# use_fused_qsa_prepare conjunct.
+
+_QSA_KV_COLLECT_ENV = "VLLM_QSA_KV_COLLECT"
+_qsa_collect_dir = os.environ.get(_QSA_KV_COLLECT_ENV, "").strip()
+_qsa_collect_state: dict[str, list[torch.Tensor]] = {}
+_qsa_collect_calls = 0
+_qsa_collect_rank: int | None = None
+
+
+def _qsa_collect_dump() -> None:
+    global _qsa_collect_rank
+    if not _qsa_collect_state:
+        return
+    # Resolve the TP rank once and cache it: the atexit flush can run after
+    # distributed teardown, where re-resolving would fall back to the pid and
+    # write a differently-named duplicate next to the rank file.
+    if _qsa_collect_rank is None:
+        try:
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            _qsa_collect_rank = get_tensor_model_parallel_rank()
+        except Exception:
+            _qsa_collect_rank = os.getpid()
+    out = {
+        name: {"k_absmax": float(st[0].item()), "v_absmax": float(st[1].item())}
+        for name, st in _qsa_collect_state.items()
+    }
+    path = Path(_qsa_collect_dir) / f"qsa_absmax_rank{_qsa_collect_rank}.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(out, indent=1), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _qsa_collect_absmax(
+    layer_name: str, key: torch.Tensor, value: torch.Tensor
+) -> None:
+    global _qsa_collect_calls
+    k_abs = key.detach().abs().amax().float()
+    v_abs = value.detach().abs().amax().float()
+    st = _qsa_collect_state.get(layer_name)
+    if st is None:
+        if not _qsa_collect_state:
+            atexit.register(_qsa_collect_dump)
+        _qsa_collect_state[layer_name] = [k_abs, v_abs]
+    else:
+        torch.maximum(st[0], k_abs, out=st[0])
+        torch.maximum(st[1], v_abs, out=st[1])
+    _qsa_collect_calls += 1
+    if _qsa_collect_calls % 2000 == 0:
+        _qsa_collect_dump()
+
+
+# --- QSA K/V runtime clip counter ----------------------------------------------
+# Under-coverage guard for the calibrated sidecar: counts K/V elements that
+# would saturate E4M3 after scaling (|x| > 448 * scale). The increments are
+# pure tensor ops inside the forward, so they are safe under cudagraph
+# capture by construction. Reading is the hazardous half: CUDA forbids sync
+# reads, pinned-host allocation, stream creation and event queries from
+# another thread while a capture is active, and no API exposes capture state
+# to a non-capturing thread, so a live reader cannot be made safe alongside
+# graphs. Reading therefore happens in two safe places only:
+#   - VLLM_QSA_KV_CLIP_COUNT=1 arms the counters and drains per-layer totals
+#     once at engine shutdown, on the engine's own thread with capture gone.
+#   - VLLM_QSA_KV_CLIP_READER=<seconds> additionally runs the live reader
+#     thread, diagnostic-only under --enforce-eager boots without graphs.
+_QSA_CLIP_ENV = "VLLM_QSA_KV_CLIP_COUNT"
+_QSA_CLIP_READER_ENV = "VLLM_QSA_KV_CLIP_READER"
+
+
+def _parse_clip_env(name: str) -> float:
+    raw = os.environ.get(name, "").strip()
+    try:
+        value = float(raw) if raw else 0.0
+    except ValueError as exc:
+        # fail closed: a set-but-broken gate must not be silent
+        raise ValueError(f"{name} must be an interval in seconds, got {raw!r}") from exc
+    if raw and not (math.isfinite(value) and value > 0.0):
+        raise ValueError(
+            f"{name} must be a finite positive number of seconds, got {raw!r}"
+        )
+    return value
+
+
+_qsa_clip_on = bool(os.environ.get(_QSA_CLIP_ENV, "").strip())
+_qsa_clip_interval = _parse_clip_env(_QSA_CLIP_READER_ENV)
+_qsa_clip_counters: dict[str, torch.Tensor] = {}
+_qsa_clip_reader_started = False
+_qsa_clip_drain_registered = False
+_qsa_clip_lock = threading.Lock()
+
+
+def _qsa_calibration_kv_readers_armed() -> bool:
+    """True when a calibration reader forces the unfused K/V writer on."""
+    return bool(_qsa_collect_dir or _qsa_clip_on)
+
+
+def _qsa_clip_counting_enabled() -> bool:
+    return _qsa_clip_on
+
+
+def _qsa_clip_drain() -> dict[str, tuple[int, int]]:
+    """Final totals, once, on the way down: capture is destroyed and this
+    runs on the engine's own thread, so a synchronous read is safe here and
+    nowhere else. Runs via atexit, so logging may already be torn down —
+    the totals are still returned for any caller that can consume them."""
+    totals: dict[str, tuple[int, int]] = {}
+    try:
+        for name, ctr in sorted(_qsa_clip_counters.items()):
+            totals[name] = (int(ctr[0].item()), int(ctr[1].item()))
+        clipped = {n: t for n, t in totals.items() if t[0] or t[1]}
+        if clipped:
+            logger.warning(
+                "QSA KV CLIPPING final totals: %s",
+                "; ".join(f"{n}: k={t[0]} v={t[1]}" for n, t in clipped.items()),
+            )
+        else:
+            logger.info(
+                "QSA clip counters final: zero clips on %d layer(s)",
+                len(totals),
+            )
+    except Exception:
+        pass  # interpreter teardown: streams and handlers may be gone
+    return totals
+
+
+def _qsa_clip_reader() -> None:
+    last: dict[str, tuple[int, int]] = {}
+    passes = 0
+    while True:
+        time.sleep(_qsa_clip_interval)
+        passes += 1
+        try:
+            totals_k = totals_v = 0
+            for name, ctr in list(_qsa_clip_counters.items()):
+                k_total = int(ctr[0].item())
+                v_total = int(ctr[1].item())
+                totals_k += k_total
+                totals_v += v_total
+                prev_k, prev_v = last.get(name, (0, 0))
+                if k_total > prev_k or v_total > prev_v:
+                    logger.warning(
+                        "QSA KV CLIPPING on %s: k +%d (total %d), v +%d (total %d)"
+                        " -- inputs exceeded the calibration absmax; the scales"
+                        " sidecar may need re-calibration",
+                        name,
+                        k_total - prev_k,
+                        k_total,
+                        v_total - prev_v,
+                        v_total,
+                    )
+                last[name] = (k_total, v_total)
+            if passes % 10 == 1:
+                logger.info(
+                    "QSA clip counters alive: %d layer(s), totals k=%d v=%d",
+                    len(_qsa_clip_counters),
+                    totals_k,
+                    totals_v,
+                )
+        except Exception:
+            logger.exception("QSA clip reader pass failed; thread continues")
+
+
+def _qsa_clip_count(
+    layer: Qwen4ExpQSAAttention, key: torch.Tensor, value: torch.Tensor
+) -> None:
+    global _qsa_clip_reader_started, _qsa_clip_drain_registered
+    if not _qsa_clip_on:
+        return
+    ctr = _qsa_clip_counters.get(layer.layer_name)
+    if ctr is None:
+        # First forward is eager (profiling/warmup precede capture), so the
+        # allocation never happens inside cudagraph capture.
+        ctr = torch.zeros(2, dtype=torch.int64, device=key.device)
+        _qsa_clip_counters[layer.layer_name] = ctr
+        with _qsa_clip_lock:
+            if not _qsa_clip_drain_registered:
+                _qsa_clip_drain_registered = True
+                atexit.register(_qsa_clip_drain)
+            if _qsa_clip_interval and not _qsa_clip_reader_started:
+                _qsa_clip_reader_started = True
+                threading.Thread(
+                    target=_qsa_clip_reader,
+                    name="qsa-clip-reader",
+                    daemon=True,
+                ).start()
+                logger.warning(
+                    "QSA clip live reader armed (%.0fs): diagnostic only, "
+                    "safe under --enforce-eager; with cudagraphs a tick "
+                    "during capture can kill the engine",
+                    _qsa_clip_interval,
+                )
+    # Thresholds are 1-D so the comparison promotes to float32; a 0-dim
+    # float32 tensor promotes like a Python scalar and the threshold would be
+    # rounded to the BF16 grid of K/V, undercounting values just above the
+    # calibrated ceiling.
+    k_ceiling = (448.0 * layer._k_scale).to(torch.float32).view(1)
+    v_ceiling = (448.0 * layer._v_scale).to(torch.float32).view(1)
+    ctr[0] += (key.detach().abs() > k_ceiling).sum()
+    ctr[1] += (value.detach().abs() > v_ceiling).sum()
+
+
 __all__ = [
     "QSAIndexer",
     "Qwen4ExpQSAAttention",
     "Qwen4ExpQSABackend",
     "Qwen4ExpQSAImpl",
+    "load_qsa_static_kv_scales",
 ]

@@ -2396,6 +2396,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, use Python spinloop extension to poll in a more efficient
     # way when using the mp backend.
     "VLLM_USE_SPINLOOP_EXT": lambda: bool(int(os.getenv("VLLM_USE_SPINLOOP_EXT", "0"))),
+    # Path to the QSA KV scale sidecar file. Read raw by
+    # vllm/models/qwen4_exp/nvidia/model.py; declared so a sidecar-armed
+    # boot does not warn about an unknown environment variable, and
+    # ignored as a compile factor because the sidecar is a data file,
+    # not a compilation input.
+    "VLLM_QSA_KV_SCALES": lambda: os.getenv("VLLM_QSA_KV_SCALES", ""),
+    # QSA calibration collector and clip-counter diagnostics, read raw by
+    # vllm/models/qwen4_exp/nvidia/qsa.py; same declaration and
+    # compile-factor treatment as the sidecar path.
+    "VLLM_QSA_KV_COLLECT": lambda: os.getenv("VLLM_QSA_KV_COLLECT", ""),
+    "VLLM_QSA_KV_CLIP_COUNT": lambda: os.getenv("VLLM_QSA_KV_CLIP_COUNT", ""),
+    "VLLM_QSA_KV_CLIP_READER": lambda: os.getenv("VLLM_QSA_KV_CLIP_READER", ""),
     # Comma-separated GPU_BDF=NIC_BDF pairs for RDMA NIC selection.
     # Must be set together with VLLM_NIC_SELECTION_VARS.
     "VLLM_GPU_NIC_PCIE_MAPPING": lambda: os.getenv("VLLM_GPU_NIC_PCIE_MAPPING", ""),
@@ -2584,6 +2596,10 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SKIP_VERSION_SUFFIX",
         "FORCE_COLOR",
         "VLLM_REQUEST_BODY_LOG_LEVEL",
+        "VLLM_QSA_KV_SCALES",
+        "VLLM_QSA_KV_COLLECT",
+        "VLLM_QSA_KV_CLIP_COUNT",
+        "VLLM_QSA_KV_CLIP_READER",
     }
 
     from vllm.config.utils import normalize_value
