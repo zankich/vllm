@@ -14,10 +14,9 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
               (hash-based subdirectories to limit directory fan-out)
 """
 
-import functools
 import json
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, ClassVar
 
 try:
@@ -49,6 +48,7 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
     TransferJob,
 )
+from vllm.v1.kv_offload.tiering.fs import integrity
 from vllm.v1.kv_offload.tiering.fs.io import (
     batch_load_block,
     batch_store_block,
@@ -157,6 +157,12 @@ class FileSystemTierManager(SecondaryTierManager):
         self._load_job_keys: dict[JobId, list[OffloadKey]] = {}
         # Block count per in-flight job, used to report transfer_bytes.
         self._job_block_counts: dict[JobId, int] = {}
+        # Keys each in-flight store job actually persisted (the cascade
+        # cross-check may refuse some of the offered keys), written by the
+        # pool worker in the store task; consumed in get_finished_jobs for
+        # mark_present and the stored event. Same worker-to-scheduler handoff
+        # as _load_progress.
+        self._store_persisted_keys: dict[JobId, list[OffloadKey]] = {}
         # Per load job: how many blocks loaded before a failure (partial keep).
         # Written by the pool worker inside the load task before it raises (so
         # before task_done publishes the job); read on the scheduler thread in
@@ -164,6 +170,19 @@ class FileSystemTierManager(SecondaryTierManager):
         # the GIL that read cannot observe the finished job without the prior
         # write, so no extra lock is needed (get_finished is itself lock-free).
         self._load_progress: dict[JobId, int] = {}
+        # Per load job: the keys whose payload files the job rejected and
+        # removed (definite corruption classes only). Same worker-to-scheduler
+        # handoff as _load_progress; consumed to emit removed events.
+        self._load_removed: dict[JobId, list[OffloadKey]] = {}
+        # Integrity binding: payload path -> (st_dev, st_ino) at store time.
+        # A mismatch at load means the tier's storage was replaced under a
+        # live engine; the whole map is ground truth for nothing at that point.
+        # Known ceiling: the map grows with every stored path for the
+        # process lifetime and is never compacted. It bites only at
+        # multi-terabyte tier sizes (millions of paths); revisit with a
+        # rebuild-from-listdir compaction if a deployment approaches that
+        # scale, not before.
+        self._storage_ids: dict[str, tuple[int, int]] = {}
 
         # Extract block size from primary view
         assert primary_kv_view.strides is not None, (
@@ -192,6 +211,9 @@ class FileSystemTierManager(SecondaryTierManager):
         # I/O on filesystems that reject it (e.g. overlayfs, some NFS mounts)
         # rather than failing every block.
         self._use_o_direct = probe_o_direct(os.path.dirname(config_path))
+        # Integrity records ride user.* xattrs on the payload files; refuse to
+        # serve as a silent 100% miss on filesystems without them.
+        integrity.probe_xattr(root_dir)
         if not self._use_o_direct:
             logger.warning(
                 "O_DIRECT is not supported at '%s'; falling back to buffered "
@@ -199,6 +221,15 @@ class FileSystemTierManager(SecondaryTierManager):
                 root_dir,
                 tier_type,
             )
+
+        # Cascade cross-check: optional callable (key, payload) -> bool |
+        # None from the primary tier's recorded checksums. False refuses
+        # the fs write. Set by the tiering manager when the primary tier
+        # exposes verify_stored_slot; None (no slot, no records) stays
+        # inert so the load-side integrity checks remain the only guard.
+        self._store_cross_check: (
+            Callable[[OffloadKey, bytes | memoryview], bool | None] | None
+        ) = None
 
         self._pool = DualQueueThreadPool(
             n_read_threads,
@@ -223,16 +254,85 @@ class FileSystemTierManager(SecondaryTierManager):
     def submit_store(self, job_metadata: TransferJob) -> None:
         keys = list(job_metadata.keys)
         self._store_jobs[job_metadata.job_id] = job_metadata
-        task = functools.partial(
-            batch_store_block,
-            [self.file_mapper.get_file_name(key) for key in keys],
-            self._primary_kv_view,
-            [int(cid) * self._block_size for cid in job_metadata.chunk_ids],
-            self._block_size,
-            self._use_o_direct,
-        )
-        self._job_block_counts[job_metadata.job_id] = len(keys)
-        self._pool.enqueue_store(job_metadata.job_id, 1, [task])
+        paths = [self.file_mapper.get_file_name(key) for key in keys]
+        offsets = [int(cid) * self._block_size for cid in job_metadata.chunk_ids]
+
+        def store_task() -> None:
+            # Mint integrity records only for files this job creates. The
+            # payload write skips files that already exist (both the C and
+            # Python paths), and a record re-minted over a pre-existing file
+            # binds bytes that may never have reached it: under FP8 KV a
+            # recompute of the same prefix quantizes differently, so a
+            # re-minted record described foreign bytes and every later load
+            # failed the checksum deterministically.
+            # A pre-existing file with a missing or foreign record is the
+            # load path's to reject and remove; the next store rewrites
+            # clean. Residual race: two same-key stores interleaving between
+            # the existence snapshot and the rename can still cross-mint
+            # (microsecond window); the escalation if it shows up is a
+            # wrote-mask from the C store plus per-path serialization.
+            fresh = [not os.path.exists(p) for p in paths]
+            sel_paths, sel_keys, sel_offsets, sel_fresh = paths, keys, offsets, fresh
+            if self._store_cross_check is not None:
+                # Store-side self-verification: the bytes being persisted
+                # must still match the primary tier's recorded checksum
+                # for the key. Load-side integrity binds the key to the
+                # bytes AS STORED, so a mislabel at write time would
+                # verify clean forever; this check refuses it at the mint.
+                view_c = self._primary_kv_view.cast("B")
+                keep = []
+                for i, is_fresh in enumerate(fresh):
+                    if not is_fresh:
+                        keep.append(True)
+                    elif (
+                        self._store_cross_check(
+                            keys[i],
+                            view_c[offsets[i] : offsets[i] + self._block_size],
+                        )
+                        is False
+                    ):
+                        logger.warning(
+                            "cascade cross-check rejected %s: bytes diverged "
+                            "from the primary tier's recorded checksum",
+                            paths[i],
+                        )
+                        keep.append(False)
+                    else:
+                        keep.append(True)
+                sel = [i for i, kp in enumerate(keep) if kp]
+                sel_paths = [paths[i] for i in sel]
+                sel_keys = [keys[i] for i in sel]
+                sel_offsets = [offsets[i] for i in sel]
+                sel_fresh = [fresh[i] for i in sel]
+            batch_store_block(
+                sel_paths,
+                self._primary_kv_view,
+                sel_offsets,
+                self._block_size,
+                self._use_o_direct,
+            )
+            view_b = self._primary_kv_view.cast("B")
+            for path, key, offset, is_fresh in zip(
+                sel_paths, sel_keys, sel_offsets, sel_fresh
+            ):
+                if is_fresh:
+                    integrity.write_record(
+                        path, key, view_b[offset : offset + self._block_size]
+                    )
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                self._storage_ids[path] = (st.st_dev, st.st_ino)
+            # transfer_bytes counts what the cross-check actually persisted
+            # (sel_keys after the cascade filter), not what was offered.
+            # Mirrors submit_load's _load_progress write: closure-captured
+            # job_id, written on the pool worker before task_done, no extra
+            # lock.
+            self._job_block_counts[job_metadata.job_id] = len(sel_keys)
+            self._store_persisted_keys[job_metadata.job_id] = sel_keys
+
+        self._pool.enqueue_store(job_metadata.job_id, 1, [store_task])
 
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
@@ -246,7 +346,34 @@ class FileSystemTierManager(SecondaryTierManager):
         offsets = [int(cid) * self._block_size for cid in job_metadata.chunk_ids]
 
         def load_task() -> None:
+            # Keys whose payload files this job rejects and removes; handed
+            # to get_finished_jobs for the removed event.
+            removed: list[OffloadKey] = []
             try:
+                # Integrity pre-checks, before any block is read. A missing
+                # or foreign record, or a payload whose storage identity
+                # changed under a live tier, rejects the whole job
+                # (num_succeeded=0): the request recomputes cold, and no part
+                # of the batch is trusted.
+                for path, key in zip(paths, keys):
+                    record = integrity.read_record(path)
+                    if record is None or record[0] != bytes(key):
+                        integrity.remove_block(path, "record")
+                        removed.append(key)
+                        raise OSError(f"integrity record missing or foreign for {path}")
+                    try:
+                        st = os.stat(path)
+                    except OSError as exc:
+                        raise OSError(f"payload vanished under load: {path}") from exc
+                    known = self._storage_ids.get(path)
+                    if known is not None and known != (st.st_dev, st.st_ino):
+                        # The storage this tier's in-memory state was built on
+                        # was replaced underneath it; everything the tier
+                        # believes is now suspect.
+                        self._storage_ids.clear()
+                        integrity.remove_block(path, "storage-id")
+                        removed.append(key)
+                        raise OSError(f"storage identity changed for {path}")
                 batch_load_block(
                     paths,
                     self._primary_kv_view,
@@ -254,6 +381,24 @@ class FileSystemTierManager(SecondaryTierManager):
                     self._block_size,
                     self._use_o_direct,
                 )
+                # Post-check: the bytes just read must match the record.
+                view_b = self._primary_kv_view.cast("B")
+                for i, (path, key, offset) in enumerate(zip(paths, keys, offsets)):
+                    record = integrity.read_record(path)
+                    if record is None or not (
+                        record[0] == bytes(key)
+                        and record[1]
+                        == integrity.block_checksum(
+                            key, view_b[offset : offset + self._block_size]
+                        )
+                    ):
+                        integrity.remove_block(path, "mismatch")
+                        removed.append(key)
+                        failure = OSError(f"integrity checksum mismatch for {path}")
+                        # Blocks before the failing one passed verification
+                        # and are kept, per the partial-keep contract.
+                        failure.num_succeeded = i  # type: ignore[attr-defined]
+                        raise failure
             except OSError as exc:
                 # Runs on the pool worker thread. Record how many blocks loaded
                 # before the failure so get_finished_jobs can keep them; this
@@ -261,6 +406,8 @@ class FileSystemTierManager(SecondaryTierManager):
                 # under the GIL once the finished queue hands back this job.
                 num_succeeded = getattr(exc, "num_succeeded", 0)
                 self._load_progress[job_id] = num_succeeded
+                if removed:
+                    self._load_removed[job_id] = removed
                 # Surfaces errno (e.g. EMFILE "Too many open files") for both
                 # the C and Python load paths.
                 logger.debug(
@@ -283,13 +430,18 @@ class FileSystemTierManager(SecondaryTierManager):
             block_count = self._job_block_counts.pop(job_id, 0)
             transfer_bytes = block_count * self._block_size if block_count else None
             job = self._store_jobs.pop(job_id, None)
+            persisted_keys = self._store_persisted_keys.pop(job_id, None)
             if job is not None and success:
-                # Successful store makes previously absent keys known-present.
-                self._lookup_manager.mark_present(job.keys)
-                if self.events is not None and job.keys:
+                # Successful store makes previously absent keys known-present
+                # and reports only what the cross-check persisted: a rejected
+                # key never reached the tier and must be neither marked
+                # present nor announced as stored.
+                stored_keys = persisted_keys if persisted_keys is not None else job.keys
+                self._lookup_manager.mark_present(stored_keys)
+                if self.events is not None and stored_keys:
                     self.events.append(
                         OffloadingEvent(
-                            keys=list(job.keys),
+                            keys=list(stored_keys),
                             medium=self.medium,
                             removed=False,
                             locality=self.locality,
@@ -298,6 +450,7 @@ class FileSystemTierManager(SecondaryTierManager):
                     )
             load_keys = self._load_job_keys.pop(job_id, None)
             num_succeeded = self._load_progress.pop(job_id, 0)
+            removed_keys = self._load_removed.pop(job_id, None)
             if load_keys is not None and not success:
                 # A batched load stops at the first bad block and reports how
                 # many loaded before it. Those earlier blocks are kept in the
@@ -306,6 +459,17 @@ class FileSystemTierManager(SecondaryTierManager):
                 successful = load_keys[:num_succeeded]
                 failed = load_keys[num_succeeded:]
                 self._lookup_manager.mark_miss(failed)
+                if removed_keys and self.events is not None:
+                    # The pruner's feed learns the key died in this tier.
+                    # Corruption removals are never expected evictions.
+                    self.events.append(
+                        OffloadingEvent(
+                            keys=removed_keys,
+                            medium=self.medium,
+                            removed=True,
+                            locality=self.locality,
+                        )
+                    )
                 results.append(
                     JobResult(
                         job_id=job_id,

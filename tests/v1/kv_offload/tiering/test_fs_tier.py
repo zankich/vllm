@@ -12,6 +12,7 @@ import mmap
 import os
 import threading
 import time
+from typing import cast
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -35,6 +36,7 @@ from vllm.v1.kv_offload.config import (
     OffloadingModelConfig,
     OffloadingParallelConfig,
 )
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.tiering.base import TransferJob
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.fs.manager import (
@@ -841,6 +843,47 @@ def test_successful_store_emits_stored_event(fs_tier_with_events):
     assert list(tier.take_events()) == []
 
 
+def test_refused_key_is_not_marked_present(fs_tier_with_events, monkeypatch):
+    """A key the cascade cross-check refuses never reached the tier, so it
+    must not be marked known-present nor reported in the stored event."""
+    tier = fs_tier_with_events
+    keys = [key(0), key(1), key(2)]
+    marked: list[OffloadKey] = []
+    monkeypatch.setattr(
+        tier._lookup_manager, "mark_present", lambda ks: marked.extend(ks)
+    )
+
+    def refuse_middle(k, _payload):
+        return k != keys[1]
+
+    tier._store_cross_check = refuse_middle
+    tier.submit_store(make_job(1, keys, [0, 1, 2]))
+    assert all(r.success for r in drain(tier))
+
+    assert marked == [keys[0], keys[2]]
+    events = list(tier.take_events())
+    assert len(events) == 1
+    assert list(events[0].keys) == [keys[0], keys[2]]
+
+
+def test_store_event_omits_cross_check_rejected_keys(fs_tier_with_events):
+    """A key the cascade cross-check refuses never reaches the tier, so
+    the stored event must not report it as stored."""
+    tier = fs_tier_with_events
+    keys = [key(1), key(2)]
+
+    def reject_second(k, _payload):
+        return k != keys[1]
+
+    tier._store_cross_check = reject_second
+    tier.submit_store(make_job(1, keys, [0, 1]))
+    assert all(r.success for r in drain(tier))
+
+    events = list(tier.take_events())
+    assert len(events) == 1
+    assert events[0].keys == [keys[0]]
+
+
 @pytest.mark.parametrize(
     ("locality", "expected"),
     [(None, None), ("REMOTE", Locality.REMOTE)],
@@ -1056,3 +1099,650 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         assert torch.allclose(reader_tensor[1], expected)
     finally:
         reader.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Integrity records: key-bound payloads (fs tier)
+# ---------------------------------------------------------------------------
+
+_SIDECAR_SUFFIX = ".meta"  # legacy carrier, kept for the orphan-inertness test
+_XATTR = "user.vllm_kv_integrity"
+
+
+def _store_blocks(tier, tensor, seeds: list[tuple[int, float]]):
+    """Store one block per (block_id, fill value) and wait for completion."""
+    for block_id, fill in seeds:
+        tensor[block_id] = fill
+    job = make_job(1, [key(i) for i in range(len(seeds))], [b for b, _ in seeds])
+    tier.submit_store(job)
+    assert all(r.success for r in drain(tier))
+
+
+def _strip_record(path: str) -> None:
+    import contextlib
+
+    with contextlib.suppress(OSError):
+        os.removexattr(path, _XATTR)
+
+
+def _has_record(path: str) -> bool:
+    import contextlib
+
+    with contextlib.suppress(OSError):
+        os.getxattr(path, _XATTR)
+        return True
+    return False
+
+
+def test_load_rejects_payload_tampered_in_place(fs_tier):
+    """Same-length in-place byte rewrite must fail the load, not serve it."""
+    tier, tensor = fs_tier
+    _store_blocks(tier, tensor, [(0, 0.25)])
+    path = tier.file_mapper.get_file_name(key(0))
+    with open(path, "r+b") as f:
+        f.write(b"\x01" * os.path.getsize(path))
+    ctx = ReqContext(req_id="tamper-req")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    tier.submit_load(make_job(2, [key(0)], [1], is_promotion=True))
+    results = drain(tier)
+    assert not results[0].success, "tampered payload must fail the load"
+    assert not os.path.exists(path), "tampered payload must be removed"
+    assert tier.lookup(key(0), ctx) in (LookupResult.MISS, LookupResult.RETRY)
+
+
+def test_load_rejects_block_written_under_a_different_key(fs_tier):
+    """Index-confusion shape: key(0)'s payload file overwritten with key(1)'s
+    bytes. The integrity record must not verify content against the wrong
+    key."""
+    import shutil
+
+    tier, tensor = fs_tier
+    _store_blocks(tier, tensor, [(0, 0.25), (1, 0.75)])
+    path0 = tier.file_mapper.get_file_name(key(0))
+    path1 = tier.file_mapper.get_file_name(key(1))
+
+    shutil.copyfile(path1, path0)
+    ctx = ReqContext(req_id="crosskey-req")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    tier.submit_load(make_job(2, [key(0)], [2], is_promotion=True))
+    results = drain(tier)
+    assert not results[0].success, "wrong-for-key payload must fail the load"
+    assert not os.path.exists(path0), "rejected payload must be removed"
+    assert tier.lookup(key(0), ctx) in (LookupResult.MISS, LookupResult.RETRY)
+
+
+def test_load_rejects_transplanted_integrity_record(fs_tier):
+    """Even a fully consistent payload+record pair transplanted from another
+    key must be rejected: the record names its key, and the load is for a
+    different one."""
+    import shutil
+    import struct
+
+    tier, tensor = fs_tier
+    _store_blocks(tier, tensor, [(0, 0.25), (1, 0.75)])
+    path0 = tier.file_mapper.get_file_name(key(0))
+    path1 = tier.file_mapper.get_file_name(key(1))
+
+    shutil.copyfile(path1, path0)
+    # Hand-pack a format-correct record naming key(1) and plant it on key(0)'s
+    # payload; the checksum field is irrelevant to the key-binding rejection.
+    k1 = bytes(key(1))
+    record = struct.pack("<4sBH16s", b"KVMI", 1, len(k1), b"\x00" * 16) + k1
+    os.setxattr(path0, _XATTR, record)
+    ctx = ReqContext(req_id="transplant-req")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    tier.submit_load(make_job(2, [key(0)], [2], is_promotion=True))
+    results = drain(tier)
+    assert not results[0].success, "transplanted record must fail the load"
+    assert not os.path.exists(path0), "rejected payload must be removed"
+
+
+def test_load_without_integrity_record_is_a_miss(fs_tier):
+    """A payload whose record is stripped (legacy or tampered) cannot be
+    verified, so it must not be trusted: fail, remove, recompute."""
+    tier, tensor = fs_tier
+    _store_blocks(tier, tensor, [(0, 0.25)])
+    path = tier.file_mapper.get_file_name(key(0))
+    assert _has_record(path), "store must write an integrity record xattr"
+    _strip_record(path)
+    ctx = ReqContext(req_id="nosidecar-req")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    tier.submit_load(make_job(2, [key(0)], [1], is_promotion=True))
+    results = drain(tier)
+    assert not results[0].success, "unverifiable payload must fail the load"
+    assert not os.path.exists(path), "unverifiable payload must be removed"
+
+
+def test_legacy_sidecar_files_are_inert(fs_tier):
+    """Pre-carrier-migration .meta sidecars may sit beside payloads forever;
+    they must never be consulted — a store under the xattr carrier with a
+    poisoned legacy .meta next to it still loads clean."""
+    tier, tensor = fs_tier
+    _store_blocks(tier, tensor, [(0, 0.25)])
+    path = tier.file_mapper.get_file_name(key(0))
+    with open(path + _SIDECAR_SUFFIX, "wb") as f:
+        f.write(b"garbage that would poison any sidecar-reading load")
+    ctx = ReqContext(req_id="legacy-req")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    tier.submit_load(make_job(2, [key(0)], [1], is_promotion=True))
+    results = drain(tier)
+    assert results[0].success, "legacy .meta must not affect xattr-verified loads"
+    assert torch.all(tensor[1] == 0.25)
+
+
+def test_tier_construction_fails_loud_without_xattr_support(tmp_path, monkeypatch):
+    """On a filesystem without user.* xattr support the tier must refuse to
+    start, not silently run as a 100% cache miss."""
+
+    def no_xattr(*args, **kwargs):
+        raise OSError(95, "Operation not supported")
+
+    monkeypatch.setattr(os, "setxattr", no_xattr)
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    with pytest.raises((OSError, ValueError)):
+        FileSystemTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=memoryview(tensor.numpy()),
+            tier_type="fs",
+            root_dir=str(tmp_path),
+            n_read_threads=2,
+            n_write_threads=2,
+        )
+
+
+def test_storage_replaced_under_live_tier_degrades_to_miss(fs_tier):
+    """Wipe the tier contents under a live manager and drop a foreign file at
+    a known path (a live-wipe remediation shape). The load must fail, and
+    the tier must keep working: a fresh store/load roundtrip afterwards
+    succeeds."""
+    import shutil
+
+    tier, tensor = fs_tier
+    _store_blocks(tier, tensor, [(0, 0.25)])
+    path = tier.file_mapper.get_file_name(key(0))
+
+    for entry in os.listdir(os.path.dirname(path)):
+        full = os.path.join(os.path.dirname(path), entry)
+        if os.path.isfile(full):
+            os.remove(full)
+        else:
+            shutil.rmtree(full)
+    with open(path, "wb") as f:
+        f.write(b"\xff" * tier._block_size)
+    ctx = ReqContext(req_id="wipe-req")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    tier.submit_load(make_job(2, [key(0)], [1], is_promotion=True))
+    results = drain(tier)
+    assert not results[0].success, "replaced storage must not be trusted"
+    # Production shape: the request that saw the rejection finishes (dropping
+    # its cached miss verdict), a later request re-probes fresh.
+    tier.on_request_finished(ctx)
+    # The tier remains serviceable: re-store and load clean.
+    tensor[0] = 0.5
+    tier.submit_store(make_job(3, [key(0)], [0]))
+    assert all(r.success for r in drain(tier))
+    assert lookup_and_wait(tier, [key(0)], ctx=ReqContext(req_id="wipe-req2")) == [
+        LookupResult.HIT
+    ]
+    tier.submit_load(make_job(4, [key(0)], [2], is_promotion=True))
+    assert all(r.success for r in drain(tier))
+    assert torch.all(tensor[2] == 0.5)
+
+
+# ---------------------------------------------------------------------------
+# Store-side record minting and removal signaling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("use_c_ext", [True, False])
+def test_store_of_existing_key_keeps_first_writers_record(
+    fs_tier, monkeypatch, use_c_ext
+):
+    """The payload write skips files that already exist, so a later store of
+    the same key must not re-mint the integrity record from its own view
+    bytes either. Under FP8 KV a recompute quantizes differently, and a
+    re-minted record would describe bytes that never reached the file: every
+    later load then failed the checksum deterministically, was removed,
+    re-stored, and re-poisoned."""
+    import vllm.v1.kv_offload.tiering.fs.io as io_mod
+
+    if use_c_ext and not io_mod._HAS_FSIO_C:
+        pytest.skip("fs_io_C extension not built")
+    monkeypatch.setattr(io_mod, "_HAS_FSIO_C", use_c_ext)
+
+    tier, tensor = fs_tier
+    _store_blocks(tier, tensor, [(0, 0.25)])
+    path = tier.file_mapper.get_file_name(key(0))
+    with open(path, "rb") as f:
+        first = f.read()
+
+    # Same key, drifted bytes in the primary view (recompute under FP8).
+    tensor[0] = 0.75
+    tier.submit_store(make_job(2, [key(0)], [0]))
+    assert all(r.success for r in drain(tier))
+
+    with open(path, "rb") as f:
+        assert f.read() == first, "skip-existing payload write keeps first bytes"
+
+    ctx = ReqContext(req_id="keep-record")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    tier.submit_load(make_job(3, [key(0)], [1], is_promotion=True))
+    results = drain(tier)
+    assert results[0].success, "kept payload+record pair must still verify"
+    assert os.path.exists(path)
+    assert torch.all(tensor[1] == 0.25), "restores the first writer's bytes"
+
+
+@pytest.mark.parametrize("use_c_ext", [True, False])
+def test_store_does_not_mint_over_recordless_foreign_file(
+    fs_tier, monkeypatch, use_c_ext
+):
+    """A file present before the store with no record (crash corner, planted
+    foreign bytes) must not be minted over: the record would bind bytes that
+    may not be the file's. The load path owns rejecting and removing it; the
+    next store after that removal rewrites clean."""
+    import vllm.v1.kv_offload.tiering.fs.io as io_mod
+
+    if use_c_ext and not io_mod._HAS_FSIO_C:
+        pytest.skip("fs_io_C extension not built")
+    monkeypatch.setattr(io_mod, "_HAS_FSIO_C", use_c_ext)
+
+    from vllm.v1.kv_offload.tiering.fs import integrity
+
+    tier, tensor = fs_tier
+    _store_blocks(tier, tensor, [(0, 0.25)])
+    path = tier.file_mapper.get_file_name(key(0))
+
+    # Replace the payload with foreign bytes and strip the record.
+    with open(path, "wb") as f:
+        f.write(b"\xff" * tier._block_size)
+    os.removexattr(path, integrity.XATTR_NAME)
+
+    tensor[0] = 0.75
+    tier.submit_store(make_job(2, [key(0)], [0]))
+    assert all(r.success for r in drain(tier))
+    assert integrity.read_record(path) is None, "no mint over a foreign file"
+
+    # The load rejects the record-less file and removes it.
+    ctx = ReqContext(req_id="foreign-req")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    tier.submit_load(make_job(3, [key(0)], [1], is_promotion=True))
+    assert not drain(tier)[0].success
+    assert not os.path.exists(path)
+
+    # Next store rewrites clean and the roundtrip works again.
+    tier.submit_store(make_job(4, [key(0)], [0]))
+    assert all(r.success for r in drain(tier))
+    tier.submit_load(make_job(5, [key(0)], [2], is_promotion=True))
+    assert all(r.success for r in drain(tier))
+    assert torch.all(tensor[2] == 0.75)
+
+
+def test_postcheck_failure_keeps_verified_prefix(fs_tier):
+    """A post-check mismatch carries num_succeeded up to the failing block:
+    blocks whose checksum verified keep their HIT verdict and show up as
+    successful_keys, per the partial-keep contract."""
+    tier, tensor = fs_tier
+    _store_blocks(tier, tensor, [(0, 0.25), (1, 0.75)])
+    path1 = tier.file_mapper.get_file_name(key(1))
+    with open(path1, "r+b") as f:
+        f.write(b"\x01" * os.path.getsize(path1))
+
+    ctx = ReqContext(req_id="postcheck-partial")
+    assert lookup_and_wait(tier, [key(0), key(1)], ctx=ctx) == [
+        LookupResult.HIT,
+        LookupResult.HIT,
+    ]
+    tier.submit_load(make_job(2, [key(0), key(1)], [2, 3], is_promotion=True))
+    results = drain(tier)
+    assert not results[0].success
+    assert results[0].successful_keys == (key(0),)
+    assert not os.path.exists(path1)
+    assert os.path.exists(tier.file_mapper.get_file_name(key(0)))
+    assert tier.lookup(key(0), ctx) == LookupResult.HIT
+    assert tier.lookup(key(1), ctx) == LookupResult.MISS
+
+
+def test_integrity_removal_emits_removed_event(fs_tier_with_events, caplog):
+    """The pruner feed must learn that a mismatch-removed key died: one
+    OffloadingEvent(removed=True) per failed load job carrying the removed
+    keys, plus a distinct engine log line distinguishing 'removed once, gone'
+    from 'removed and re-minted'."""
+    import logging
+
+    tier = fs_tier_with_events
+    tier.submit_store(make_job(1, [key(0)], [0]))
+    assert all(r.success for r in drain(tier))
+    assert [ev.removed for ev in tier.take_events()] == [False]
+    path = tier.file_mapper.get_file_name(key(0))
+    with open(path, "r+b") as f:
+        f.write(b"\x01" * os.path.getsize(path))
+
+    ctx = ReqContext(req_id="removed-evt")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    with caplog.at_level(logging.WARNING):
+        tier.submit_load(make_job(2, [key(0)], [0], is_promotion=True))
+        assert not drain(tier)[0].success
+    assert not os.path.exists(path)
+    assert any(
+        "integrity-mismatch removed" in r.message and path in r.message
+        for r in caplog.records
+    ), f"expected a distinct removal line in {caplog.records!r}"
+
+    events = list(tier.take_events())
+    assert len(events) == 1
+    assert events[0].removed is True
+    assert list(events[0].keys) == [key(0)]
+    assert events[0].medium == Medium.STORAGE
+    assert not events[0].removal_expected
+
+
+def test_transient_record_read_failure_emits_no_removed_event(fs_tier_with_events):
+    """Contract pin: a transient record-read errno must not tell the
+    pruner feed a key died. See
+    ``test_integrity_record_branch_emits_removed_event`` for the
+    regression guard on the recorded-removal path."""
+    tier = fs_tier_with_events
+    tier.submit_store(make_job(1, [key(0)], [0]))
+    assert all(r.success for r in drain(tier))
+    store_events = list(tier.take_events())
+    assert len(store_events) == 1 and not store_events[0].removed
+    path = tier.file_mapper.get_file_name(key(0))
+
+    # The cached HIT verdict is taken before the loop exists, so the failure
+    # surfaces in the load task itself (read_record runs before any file
+    # open). chmod-000 would not work: CI runs as root.
+    ctx = ReqContext(req_id="xattr-err")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+
+    saved = path + ".saved"
+    loop = path + ".loop"
+    os.rename(path, saved)
+    os.symlink(loop, path)
+    os.symlink(path, loop)
+
+    tier.submit_load(make_job(2, [key(0)], [0], is_promotion=True))
+    assert not drain(tier)[0].success
+
+    assert os.path.lexists(path), "transient record-read errno keeps the file"
+    assert list(tier.take_events()) == [], "no removed event for a transient"
+
+    os.unlink(path)
+    os.unlink(loop)
+    os.rename(saved, path)
+
+
+def test_integrity_record_branch_emits_removed_event(fs_tier_with_events, caplog):
+    """Regression guard for the ``record`` reason branch: a payload
+    whose integrity record is missing or foreign must be removed, the
+    pruner feed must learn the key died
+    (``OffloadingEvent(removed=True)`` on ``medium=STORAGE``,
+    ``removal_expected=False``), and the engine log must carry
+    ``integrity-record removed <path>``.
+
+    Pair: ``test_integrity_removal_emits_removed_event`` covers the
+    ``mismatch`` reason branch.
+    """
+    import logging
+
+    tier = fs_tier_with_events
+    tier.submit_store(make_job(1, [key(0)], [0]))
+    assert all(r.success for r in drain(tier))
+    assert [ev.removed for ev in tier.take_events()] == [False]
+    path = tier.file_mapper.get_file_name(key(0))
+    _strip_record(path)
+
+    ctx = ReqContext(req_id="record-branch")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    with caplog.at_level(logging.WARNING):
+        tier.submit_load(make_job(2, [key(0)], [0], is_promotion=True))
+        assert not drain(tier)[0].success
+    assert not os.path.exists(path)
+    assert any(
+        "integrity-record removed" in r.message and path in r.message
+        for r in caplog.records
+    ), f"expected an integrity-record removal line in {caplog.records!r}"
+
+    events = list(tier.take_events())
+    assert len(events) == 1
+    assert events[0].removed is True
+    assert list(events[0].keys) == [key(0)]
+    assert events[0].medium == Medium.STORAGE
+    assert not events[0].removal_expected
+
+
+def test_integrity_storage_id_branch_emits_removed_event(fs_tier_with_events, caplog):
+    """Regression guard for the ``storage-id`` reason branch: a payload
+    whose storage identity changed under a live tier must be removed,
+    the pruner feed must learn the key died, and the engine log must carry
+    ``integrity-storage-id removed <path>``.
+
+    The integrity record rides the inode, so the swap keeps a valid
+    payload+record pair and only the storage-id check can catch it.
+    """
+    import logging
+    import shutil
+
+    tier = fs_tier_with_events
+    tier.submit_store(make_job(1, [key(0)], [0]))
+    assert all(r.success for r in drain(tier))
+    assert [ev.removed for ev in tier.take_events()] == [False]
+    path = tier.file_mapper.get_file_name(key(0))
+
+    # Replace the file in-place so the path stays valid but the inode
+    # changes: the integrity record rides along with the rename so the
+    # storage-id check fires before the record check accepts the payload.
+    # ext4 may reuse an inode just freed in the same directory, so the
+    # file is staged through a sibling path before being renamed back to
+    # ``path``: the rename does not change the inode, but the round
+    # trip through ``<path>.diff`` evicts the original from the FS's
+    # free-inode cache.
+    saved = path + ".saved"
+    shutil.copy2(path, saved)
+    os.unlink(path)
+    tmp_diff = path + ".diff"
+    os.rename(saved, tmp_diff)
+    os.rename(tmp_diff, path)
+    assert os.path.exists(path)
+
+    ctx = ReqContext(req_id="storage-id-branch")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    with caplog.at_level(logging.WARNING):
+        tier.submit_load(make_job(2, [key(0)], [0], is_promotion=True))
+        assert not drain(tier)[0].success
+    assert not os.path.exists(path)
+    assert any(
+        "integrity-storage-id removed" in r.message and path in r.message
+        for r in caplog.records
+    ), f"expected an integrity-storage-id removal line in {caplog.records!r}"
+
+    events = list(tier.take_events())
+    assert len(events) == 1
+    assert events[0].removed is True
+    assert list(events[0].keys) == [key(0)]
+    assert events[0].medium == Medium.STORAGE
+    assert not events[0].removal_expected
+
+
+def test_mismatch_removal_spares_sibling_group_files(fs_tier):
+    """Contract pin: removal is path-scoped. See
+    ``test_integrity_record_branch_emits_removed_event`` for the regression
+    guard on the actual removal path."""
+    import shutil
+
+    from vllm.v1.kv_offload.tiering.fs import integrity
+
+    tier, tensor = fs_tier
+    _store_blocks(tier, tensor, [(0, 0.25)])
+    path0 = tier.file_mapper.get_file_name(key(0))
+    assert "_g0/" in path0
+
+    sibling = path0.replace("_g0/", "_g1/")
+    os.makedirs(os.path.dirname(sibling), exist_ok=True)
+    shutil.copyfile(path0, sibling)
+    with open(sibling, "rb") as f:
+        integrity.write_record(sibling, bytes(key(0)), f.read())
+
+    with open(path0, "r+b") as f:
+        f.write(b"\x01" * os.path.getsize(path0))
+
+    ctx = ReqContext(req_id="sibling-req")
+    assert lookup_and_wait(tier, [key(0)], ctx=ctx) == [LookupResult.HIT]
+    tier.submit_load(make_job(2, [key(0)], [1], is_promotion=True))
+    assert not drain(tier)[0].success
+
+    assert not os.path.exists(path0)
+    assert os.path.exists(sibling), "sibling group files must be untouched"
+
+
+# ---------------------------------------------------------------------------
+# Store-time cascade cross-check
+# ---------------------------------------------------------------------------
+
+
+def test_store_refuses_drifted_block_through_real_cascade_wiring(tmp_path, caplog):
+    """The cascade cross-check against the real primary tier: the tiering
+    manager arms the primary's slot checksums and wires its real
+    verify_stored_slot into the fs store path. Bytes that drift between the
+    CPU store completion and the fs write — the store-side mislabel class
+    that load-side integrity verifies as clean forever — must be refused at
+    the mint. A refusal costs a miss and recompute; a silent write costs
+    permanent poison."""
+    import logging
+
+    from vllm.v1.kv_offload.tiering.manager import (
+        CPUPrimaryTierOffloadingManager,
+        TieringOffloadingManager,
+    )
+
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    view = memoryview(tensor.numpy())
+    region = MagicMock()
+    region.create_kv_memoryview.return_value = view
+    primary = CPUPrimaryTierOffloadingManager(
+        num_chunks=_NUM_BLOCKS, mmap_region=region
+    )
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=2,
+        n_write_threads=2,
+    )
+    manager = TieringOffloadingManager(primary_tier=primary, secondary_tiers=[tier])
+    try:
+        # The wiring must hand the tier the primary's real bound method.
+        assert tier._store_cross_check == primary.verify_stored_slot
+
+        # A completed CPU store records the key's slot checksum: armed.
+        out = primary.prepare_store([key(0)], _CTX)
+        assert out is not None and list(out.keys_to_store) == [key(0)]
+        chunk_id = int(cast(CPULoadStoreSpec, out.store_spec).chunk_ids[0])
+        tensor[chunk_id] = 0.25
+        primary.complete_store(out.keys_to_store, _CTX)
+        view_b = view.cast("B")
+        slot = view_b[chunk_id * tier._block_size : (chunk_id + 1) * tier._block_size]
+        assert primary.verify_stored_slot(key(0), slot) is True
+
+        # Drift the slot after the CPU store completed: the fs write must
+        # refuse the mismatched bytes instead of persisting them.
+        tensor[chunk_id] = 0.75
+        assert primary.verify_stored_slot(key(0), slot) is False
+        with caplog.at_level(logging.WARNING):
+            tier.submit_store(make_job(1, [key(0)], [chunk_id]))
+            results = drain(tier)
+        assert all(r.success for r in results), "a refusal is not a job failure"
+        assert not os.path.exists(tier.file_mapper.get_file_name(key(0))), (
+            "mismatched bytes must not persist"
+        )
+        assert any(
+            "cascade cross-check rejected" in r.message for r in caplog.records
+        ), f"expected a rejection line in {caplog.records!r}"
+
+        # Control on the same armed stack: an undrifted key persists.
+        out2 = primary.prepare_store([key(1)], _CTX)
+        assert out2 is not None and list(out2.keys_to_store) == [key(1)]
+        chunk2 = int(cast(CPULoadStoreSpec, out2.store_spec).chunk_ids[0])
+        tensor[chunk2] = 0.5
+        primary.complete_store(out2.keys_to_store, _CTX)
+        tier.submit_store(make_job(2, [key(1)], [chunk2]))
+        assert all(r.success for r in drain(tier))
+        assert os.path.exists(tier.file_mapper.get_file_name(key(1)))
+    finally:
+        manager.shutdown()
+
+
+def test_store_proceeds_when_cross_check_matches(fs_tier):
+    """Contract pin: a passing cross-check (True) does not impede the
+    store."""
+    tier, _ = fs_tier
+    tier._store_cross_check = lambda key, payload: True
+    tier.submit_store(make_job(1, [key(0)], [0]))
+    assert all(r.success for r in drain(tier))
+    assert os.path.exists(tier.file_mapper.get_file_name(key(0)))
+
+
+def test_store_cross_check_none_is_inert(fs_tier):
+    """No CPU record (None) means the check cannot judge: proceed, the
+    load-side integrity still guards what lands."""
+    tier, _ = fs_tier
+    tier._store_cross_check = lambda key, payload: None
+    tier.submit_store(make_job(1, [key(0)], [0]))
+    assert all(r.success for r in drain(tier))
+    assert os.path.exists(tier.file_mapper.get_file_name(key(0)))
+
+
+def test_store_cross_check_partitions_mixed_batch(fs_tier, caplog):
+    """One job, two keys, verdicts split True/False: the passing key
+    persists, the failing key is refused, and the job still succeeds."""
+    import logging
+
+    tier, _ = fs_tier
+    tier._store_cross_check = lambda k, payload: k != key(1)
+    tier.submit_store(make_job(1, [key(0), key(1)], [0, 1]))
+    with caplog.at_level(logging.WARNING):
+        results = drain(tier)
+
+    assert all(r.success for r in results)
+    assert os.path.exists(tier.file_mapper.get_file_name(key(0)))
+    assert not os.path.exists(tier.file_mapper.get_file_name(key(1)))
+    assert any("cascade cross-check rejected" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Cross-restart restore
+# ---------------------------------------------------------------------------
+
+
+def test_lookup_hits_across_manager_restart(tmp_path):
+    """Cross-restart restore contract: a block stored by one manager
+    instance must be found by a fresh instance over the same root_dir."""
+    tensor = _page_aligned_rand_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    mock_view = memoryview(tensor.numpy())
+
+    tier1 = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=mock_view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=4,
+        n_write_threads=4,
+    )
+    tier1.submit_store(make_job(1, [key(1)], [1]))
+    assert all(r.success for r in drain(tier1))
+    assert lookup_and_wait(tier1, [key(1)]) == [LookupResult.HIT]
+    tier1.shutdown()
+
+    tier2 = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=mock_view,
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=4,
+        n_write_threads=4,
+    )
+    assert lookup_and_wait(tier2, [key(1)]) == [LookupResult.HIT], (
+        "fresh manager over a populated root_dir must find stored blocks"
+    )
+    tier2.shutdown()
