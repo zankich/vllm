@@ -53,9 +53,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             global_world_size,
             use_all2all=use_all2all,
         )
-        # Match the group name exactly so ETP does not enable TP-only backends.
-        if unique_name.split(":")[0] != "tp":
-            # custom allreduce or torch symm mem can be used only by tp
+        # Match the group prefix so ETP does not enable TP-only backends.
+        # Single-node expert-parallel groups are also admitted so decode's
+        # small MoE combine all-reduces take the one-shot IPC path instead
+        # of the NCCL latency floor; CUDA IPC buffers cannot cross nodes,
+        # so a group whose rank span crosses a node boundary stays out.
+        ep_group_admitted = self.is_ep_communicator and self._ranks_span_one_node()
+        if unique_name.split(":")[0] != "tp" and not ep_group_admitted:
+            # custom allreduce or torch symm mem can be used only by tp/ep
             use_custom_allreduce = False
             use_torch_symm_mem = False
             use_flashinfer_allreduce = False
@@ -65,21 +70,31 @@ class CudaCommunicator(DeviceCommunicatorBase):
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
-            use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
-            # FlashInfer all-reduce does not provide a fixed reduction order.
-            use_flashinfer_allreduce = (
-                envs.VLLM_ALLREDUCE_USE_FLASHINFER and not envs.VLLM_BATCH_INVARIANT
-            )
-            use_flashinfer_pcie_ipc_allreduce = (
-                envs.VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC
-                and not envs.VLLM_BATCH_INVARIANT
-            )
-            # Neither AITER nor QuickReduce all-reduce has a fixed reduction order.
-            use_aiter_allreduce = (
-                use_custom_allreduce
-                and not envs.VLLM_BATCH_INVARIANT
-                and bool(rocm_aiter_ops.is_custom_all_reduce_enabled())
-            )
+            if ep_group_admitted:
+                # The EP admission is scoped to CustomAllreduce: symm mem,
+                # FlashInfer and AITER stay TP-only, and the dispatch chain
+                # still falls through to PYNCCL on any size or dtype gate.
+                use_torch_symm_mem = False
+                use_flashinfer_allreduce = False
+                use_flashinfer_pcie_ipc_allreduce = False
+                use_aiter_allreduce = False
+            else:
+                use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
+                # FlashInfer all-reduce does not provide a fixed reduction order.
+                use_flashinfer_allreduce = (
+                    envs.VLLM_ALLREDUCE_USE_FLASHINFER and not envs.VLLM_BATCH_INVARIANT
+                )
+                use_flashinfer_pcie_ipc_allreduce = (
+                    envs.VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC
+                    and not envs.VLLM_BATCH_INVARIANT
+                )
+                # Neither AITER nor QuickReduce all-reduce has a fixed
+                # reduction order.
+                use_aiter_allreduce = (
+                    use_custom_allreduce
+                    and not envs.VLLM_BATCH_INVARIANT
+                    and bool(rocm_aiter_ops.is_custom_all_reduce_enabled())
+                )
 
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
@@ -310,6 +325,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
         config = get_current_vllm_config_or_none()
         return config is not None and bool(config.parallel_config.mori_ep_v2)
 
+    def _ranks_span_one_node(self) -> bool:
+        """Whether this group's global ranks all sit on one node.
+
+        Nodes hold contiguous rank blocks of world_size // nnodes (the
+        parallel config's node boundary, the same local-world split the
+        mp backend launches with), so the group spans one node iff its
+        lowest and highest global rank share a block.
+        """
+        config = get_current_vllm_config_or_none()
+        if config is None:
+            return True
+        nnodes = config.parallel_config.nnodes
+        if nnodes <= 1:
+            return True
+        ranks_per_node = self.global_world_size // nnodes
+        if ranks_per_node <= 0:
+            return False
+        return min(self.ranks) // ranks_per_node == max(self.ranks) // ranks_per_node
+
     def _log_all_reduce_backend_selection(self) -> None:
         """Log the all-reduce backends that are active for this group.
 
@@ -436,6 +470,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
             ca_comm is not None
             and not ca_comm.disabled
             and ca_comm.should_custom_ar(input_)
+            # should_custom_ar's batch-invariant branch accepts every size,
+            # a path written for NVLink meshes; the P2P-widened EP admission
+            # covers decode's small combines, so the size gate keeps binding
+            # and large combines stay on the PYNCCL ring.
+            and not (
+                self.is_ep_communicator
+                and envs.VLLM_BATCH_INVARIANT
+                and input_.nbytes >= ca_comm.max_size
+            )
         ):
             out = ca_comm.custom_all_reduce(input_)
             assert out is not None
