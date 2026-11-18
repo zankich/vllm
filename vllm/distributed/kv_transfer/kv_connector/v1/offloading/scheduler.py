@@ -52,6 +52,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingManager,
     OffloadingSpec,
     OffloadKey,
+    OffloadKeyVanishedError,
     OffloadPolicy,
     ReqContext,
     RequestOffloadingContext,
@@ -154,6 +155,61 @@ def resolve_mamba_align_size(
             assert mamba_align_size is None or mamba_align_size == tokens_per_chunk
             mamba_align_size = tokens_per_chunk
     return mamba_align_size
+
+
+def restore_accounting_summary(
+    req_id: str,
+    num_prompt_tokens: int,
+    num_request_tokens: int,
+    num_locally_computed: int,
+    num_external: int,
+    keys_loaded: int,
+    group_tokens_per_chunk: int,
+    group_detail: str = "",
+    full_group_capacity: int = 0,
+    has_full_group: bool = False,
+) -> tuple[str, list[str]]:
+    """Restore-assembly arithmetic for one offload restore.
+
+    One log line per restore carrying the assembly numbers, plus loud
+    violations when the assembly over-claims or under-covers: the
+    byte-faithful tiers cannot catch a wrong SET of correctly-hashed
+    blocks, but these invariants can. The boundary bound is the
+    request's total token length, not the prompt: a recompute-preempted
+    request keeps its sampled output tokens, so a restore may
+    legitimately cover tokens past the prompt boundary.
+    """
+    boundary = num_locally_computed + num_external
+    violations: list[str] = []
+    if num_external == 0:
+        return (
+            f"restore-accounting req={req_id} prompt={num_prompt_tokens} "
+            f"local={num_locally_computed} ext=0 skipped",
+            violations,
+        )
+    if boundary > num_request_tokens:
+        violations.append(
+            f"boundary exceeds request: {boundary} > {num_request_tokens} "
+            f"(prompt {num_prompt_tokens})"
+        )
+    if (
+        has_full_group
+        and full_group_capacity > 0
+        and full_group_capacity < num_external
+    ):
+        violations.append(
+            f"non-window groups cannot cover ext: {full_group_capacity} "
+            f"tokens < {num_external}"
+        )
+    line = (
+        f"restore-accounting req={req_id} prompt={num_prompt_tokens} "
+        f"local={num_locally_computed} ext={num_external} "
+        f"boundary={boundary} keys={keys_loaded} "
+        f"chunk={group_tokens_per_chunk}"
+    )
+    if group_detail:
+        line += f" groups={group_detail}"
+    return line, violations
 
 
 class SchedulerOffloadConfig(NamedTuple):
@@ -679,6 +735,9 @@ class OffloadingConnectorScheduler:
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
+        # Requests whose load cannot be served; the workers report them as
+        # failed receives.
+        self._current_batch_failed_loads: set[ReqId] = set()
         # Requests loading synchronously in the current engine step
         self._current_batch_sync_loads: set[ReqId] = set()
         self._current_batch_sync_load_bytes = 0
@@ -1520,7 +1579,6 @@ class OffloadingConnectorScheduler:
         self._acquire_step()
 
         req_status = self._req_status[request.request_id]
-        req_status.loaded_from_offload = True
         sync_load = request.request_id in self._current_batch_sync_loads
 
         num_locally_computed_tokens = req_status.num_locally_computed_tokens
@@ -1535,6 +1593,12 @@ class OffloadingConnectorScheduler:
         # per group
         group_sizes: list[int] = []
         block_indices: list[int] = []
+        group_load_detail: list[str] = []
+        # (group_state, num_chunks) pairs whose next_stored_chunk_idx advance
+        # is deferred until prepare_load succeeds.
+        chunk_level_advances: list[tuple[RequestGroupState, int]] = []
+        full_group_capacity = 0
+        has_full_group = False
         for group_config, group_state in zip(
             self.config.kv_group_configs,
             req_status.group_states,
@@ -1610,6 +1674,37 @@ class OffloadingConnectorScheduler:
                             num_cached_tokens, (chunk_idx + 1) * tokens_per_chunk
                         )
                         req_status.load_key_ranges.append((range_start, range_end, key))
+                group_load_detail.append(
+                    f"{tokens_per_chunk}:"
+                    f"{end_chunk_idx - start_chunk_idx}"
+                    f"s{start_chunk_idx}"
+                    + ("+b" if partial_tail_boundary is not None else "")
+                )
+                if group_config.sliding_window_size_in_chunks is None:
+                    # Blocks below load_start are, by the scan above, null or
+                    # already hashed (prefix-cache resident): their span is
+                    # covered without loading anything. A mixed restore --
+                    # prefix-cache hit below, offload hit above -- starts the
+                    # load past the first fresh block, and without this term
+                    # every such restore trips the corruption-class invariant.
+                    # May overlap the first loaded chunk when load_start is
+                    # mid-chunk; the invariant is one-directional, so
+                    # over-counting cannot mask a real violation.
+                    full_group_capacity += (
+                        load_start_gpu_block_idx - first_fresh_gpu_block_idx
+                    ) * tokens_per_block
+                    full_group_capacity += (
+                        end_chunk_idx - start_chunk_idx
+                    ) * tokens_per_chunk
+                    if partial_tail_boundary is not None:
+                        # The boundary key covers the tail tokens past the
+                        # last complete chunk: include its extent so the
+                        # capacity invariant covers the full ext on
+                        # partial-tail restores.
+                        full_group_capacity += (
+                            partial_tail_boundary - end_chunk_idx * tokens_per_chunk
+                        )
+                    has_full_group = True
 
             dst_block_ids.extend(
                 block.block_id
@@ -1620,14 +1715,71 @@ class OffloadingConnectorScheduler:
 
             # Skip prefix-hit chunks for block-level policy; for
             # request-level, next_stored_chunk_idx stays at 0 so all
-            # chunks (including hits) are offloaded.
+            # chunks (including hits) are offloaded. Deferred until
+            # prepare_load succeeds below: a vanished key sends the
+            # request down the failed-load path, and the recompute
+            # policy must stay free to re-store the prefix chunks.
             if req_status.offloading_context.policy == OffloadPolicy.CHUNK_LEVEL:
-                group_state.next_stored_chunk_idx = num_chunks
+                chunk_level_advances.append((group_state, num_chunks))
 
-        src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
+        try:
+            src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
+        except OffloadKeyVanishedError:
+            # The base scheduler parks the request in WAITING_FOR_REMOTE_KVS
+            # and kv_load_failure_policy decides its fate once the workers
+            # report the failed receive. Reachable today only via the async
+            # defer path: within one scheduler step the manager lock spans
+            # lookup through prepare_load, so a sync load cannot observe a
+            # key vanishing between the two. Any future window between
+            # lookup and prepare_load must route its failures through this
+            # same failed-load path — and note that a request holding a
+            # sync-load reservation would arrive here still listed in
+            # _current_batch_sync_loads with no job issued, so its forward
+            # would run on unloaded KV before get_transfer_results surfaces
+            # the failure; a future window must also drop the reservation
+            # (discard from _current_batch_sync_loads) to restore the
+            # async-park semantics. Unreachable today for the same
+            # step-region reason.
+            req_status.load_key_ranges.clear()
+            req_status.partial_tail_boundary = None
+            self._current_batch_failed_loads.add(request.request_id)
+            return
+        # Load bookkeeping lands only once the load is actually issued: a
+        # vanished key must leave loaded_from_offload False (the
+        # EAGLE-boundary store gate reads it) and the chunk-level
+        # next_stored_chunk_idx at its pre-hit value (the store walk starts
+        # there), so the recompute policy re-stores the prefix chunks.
+        req_status.loaded_from_offload = True
+        for group_state, num_chunks in chunk_level_advances:
+            group_state.next_stored_chunk_idx = num_chunks
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
+
+        # The assembly arithmetic, one line per restore, with loud invariant
+        # checks. Sync-load requests bypass finished_recving, so this line is
+        # their observation point too. DEBUG, not INFO: it fires on every
+        # restore and the invariant violations below carry the signal.
+        line, violations = restore_accounting_summary(
+            req_id=request.request_id,
+            num_prompt_tokens=request.num_prompt_tokens,
+            num_request_tokens=request.num_tokens,
+            num_locally_computed=num_locally_computed_tokens,
+            num_external=num_external_tokens,
+            keys_loaded=len(keys_to_load),
+            group_tokens_per_chunk=self.config.kv_group_configs[0].tokens_per_chunk,
+            group_detail=",".join(group_load_detail),
+            full_group_capacity=full_group_capacity,
+            has_full_group=has_full_group,
+        )
+        logger.debug(line)
+        for violation in violations:
+            logger.error(
+                "restore-accounting VIOLATION req=%s: %s "
+                "(corruption-class assembly error candidate — capture this request)",
+                request.request_id,
+                violation,
+            )
 
         load_job_id = self._generate_job_id()
         self._current_batch_load_jobs[load_job_id] = TransferJob(
@@ -2344,6 +2496,7 @@ class OffloadingConnectorScheduler:
             load_jobs=self._current_batch_load_jobs,
             store_jobs=partial_store_jobs | normal_store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
+            failed_loads=self._current_batch_failed_loads,
         )
 
         # All prepare_store calls for finished requests have been issued.
@@ -2357,6 +2510,7 @@ class OffloadingConnectorScheduler:
             if not req_status.transfer_jobs:
                 del self._req_status[req_id]
         self._current_batch_load_jobs = {}
+        self._current_batch_failed_loads = set()
         self._current_batch_sync_loads = set()
         self._current_batch_sync_load_bytes = 0
         self._current_batch_jobs_to_flush = set()
@@ -2612,6 +2766,7 @@ class OffloadingConnectorScheduler:
         # _current_batch_jobs_to_flush may still hold a previous reset's flush
         # set if no step ran since; the new ids are merged into it.
         assert not self._current_batch_load_jobs
+        assert not self._current_batch_failed_loads
         assert not self._current_batch_sync_loads
         assert not self._current_batch_allocated_block_ids
 

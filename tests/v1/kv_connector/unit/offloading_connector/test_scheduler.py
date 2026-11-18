@@ -29,6 +29,7 @@ from tests.v1.spec_decode.utils import attach_speculator_config
 from vllm import SamplingParams
 from vllm.config import KVEventsConfig, KVTransferConfig, SpeculativeConfig
 from vllm.distributed.kv_events import MEDIUM_CPU, BlockRemoved, BlockStored
+from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
     scheduler as scheduler_module,
@@ -74,6 +75,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
     SlidingWindowManager,
 )
+from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
@@ -92,6 +94,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingKVEventsConfig,
     OffloadingManager,
     OffloadKey,
+    OffloadKeyVanishedError,
     OffloadPolicy,
     ReqContext,
     RequestOffloadingContext,
@@ -1024,6 +1027,8 @@ def test_external_cache_hit_sources_reconcile_different_group_chunk_sizes(
     )
     scheduler = runner.connector_scheduler
     request = MagicMock(request_id="mixed")
+    # The restore-accounting summary reads the request's total extent.
+    request.num_prompt_tokens = request.num_tokens = 2 * block_size
     req_status = RequestOffloadState(
         config=scheduler.config,
         req=request,
@@ -1159,6 +1164,8 @@ def test_external_cache_hit_sources_use_loaded_attention_ranges(
     spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
     scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
     request = MagicMock(request_id="sparse")
+    # The restore-accounting summary reads the request's total extent.
+    request.num_prompt_tokens = request.num_tokens = 4 * chunk_size
     req_status = RequestOffloadState(
         config=scheduler.config,
         req=request,
@@ -1301,6 +1308,137 @@ def test_partial_lookup_anchor_loads_only_verified_chunks():
     assert load_job.dst_spec.block_ids.tolist() == [31, 32, 41]
     assert load_job.dst_spec.group_sizes == [2, 1]
     assert load_job.dst_spec.block_indices == [0, 1]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "with_partial_tail", [True, False], ids=["partial_tail", "clean"]
+)
+def test_restore_accounting_logs_no_violation(caplog, with_partial_tail):
+    # Partial-tail restore on a cold GPU prefix: the boundary key extends
+    # past the last complete chunk. The capacity invariant must include
+    # the boundary extent for non-window groups, otherwise a corruption-
+    # class VIOLATION floods the log on every correct partial-tail
+    # restore. The clean (no partial tail) case is parametrized alongside
+    # so a fix that masks the clean case cannot regress here.
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h6"}, 1: {b"h6"}}
+    )
+    assert scheduler._lookup(req_status) == 28
+    if with_partial_tail:
+        num_external_tokens = 28
+    else:
+        req_status.partial_tail_boundary = None
+        num_external_tokens = 16
+    with caplog.at_level(
+        "ERROR",
+        logger="vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler",
+    ):
+        scheduler.update_state_after_alloc(
+            request,
+            KVCacheBlocks(
+                (
+                    [KVCacheBlock(31), KVCacheBlock(32)],
+                    [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
+                )
+            ),
+            num_external_tokens=num_external_tokens,
+        )
+    violations = [
+        record.getMessage()
+        for record in caplog.records
+        if "restore-accounting VIOLATION" in record.getMessage()
+    ]
+    assert violations == [], f"unexpected restore-accounting VIOLATION(s): {violations}"
+
+
+@pytest.mark.cpu_test
+def test_restore_accounting_counts_resident_head_tokens(caplog):
+    # A load that starts past the first fresh block: the first FA block is
+    # already resident (hashed — e.g. re-allocation after preemption kept
+    # part of the prefix), so the walk starts at block 1. The resident
+    # head covers [0,16) without loading anything; the capacity invariant
+    # must count that span or every such restore logs a false
+    # corruption-class VIOLATION.
+    scheduler = _make_partial_tail_scheduler()
+    request, req_status = _make_anchored_partial_tail_request(
+        scheduler, {0: {b"h3", b"h6"}, 1: {b"h6"}}
+    )
+    assert scheduler._lookup(req_status) == 28
+    resident = KVCacheBlock(
+        31, block_hash=make_block_hash_with_group_id(BlockHash(b"h3"), 0)
+    )
+    with caplog.at_level(
+        "ERROR",
+        logger="vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler",
+    ):
+        scheduler.update_state_after_alloc(
+            request,
+            KVCacheBlocks(
+                (
+                    [resident, KVCacheBlock(32)],
+                    [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
+                )
+            ),
+            num_external_tokens=28,
+        )
+    violations = [
+        record.getMessage()
+        for record in caplog.records
+        if "restore-accounting VIOLATION" in record.getMessage()
+    ]
+    assert violations == [], f"unexpected restore-accounting VIOLATION(s): {violations}"
+    # Premise pin: the load really does start past the first fresh block
+    # in both groups (block index 1, not 0).
+    [load_job] = scheduler._current_batch_load_jobs.values()
+    assert load_job.dst_spec.block_indices == [1, 1]
+
+
+@pytest.mark.cpu_test
+def test_restore_accounting_line_logs_at_debug_not_info(caplog):
+    # The per-restore arithmetic line fires on every restore; at INFO it
+    # floods the log under prefix-heavy serving. It is a debugging aid
+    # and belongs at DEBUG. Pin both directions: silent at INFO, present
+    # at DEBUG, so a fix cannot simply delete the line.
+    logger_name = "vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler"
+
+    def restore_once():
+        scheduler = _make_partial_tail_scheduler()
+        request, req_status = _make_anchored_partial_tail_request(
+            scheduler, {0: {b"h3", b"h6"}, 1: {b"h6"}}
+        )
+        assert scheduler._lookup(req_status) == 28
+        scheduler.update_state_after_alloc(
+            request,
+            KVCacheBlocks(
+                (
+                    [KVCacheBlock(31), KVCacheBlock(32)],
+                    [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
+                )
+            ),
+            num_external_tokens=28,
+        )
+
+    with caplog.at_level("INFO", logger=logger_name):
+        restore_once()
+    info_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "restore-accounting req=" in record.getMessage()
+    ]
+    assert info_lines == [], f"restore-accounting line fired at INFO: {info_lines}"
+
+    with caplog.at_level("DEBUG", logger=logger_name):
+        restore_once()
+    debug_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "restore-accounting req=" in record.getMessage()
+    ]
+    assert len(debug_lines) == 1, (
+        f"expected exactly one restore-accounting DEBUG line, got: {debug_lines}"
+    )
 
 
 @pytest.mark.cpu_test
@@ -2046,6 +2184,121 @@ def test_scheduler_reports_allocation_failure(request_runner):
     # Two attempts: once while running (block becomes full during prefill),
     # once from finished_req_ids on the next step.
     assert reduced[_ConnectorMetricName.ALLOCATION_FAILURE] == 2
+
+
+@pytest.mark.parametrize("policy", ["fail", "recompute"])
+def test_vanished_pinned_load_follows_kv_load_failure_policy(
+    request_runner, policy: str
+):
+    """A load the manager can no longer serve reaches the core scheduler as
+    a failed receive: "fail" finishes the request with an error, while
+    "recompute" reschedules it with nothing computed."""
+    block_size = 4
+    num_tokens = 3 * block_size
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=10,
+        async_scheduling=False,
+        kv_load_failure_policy=policy,
+    )
+    scheduler = runner.scheduler
+    num_free_blocks = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+
+    def vanished(keys, req_context):
+        raise OffloadKeyVanishedError(next(iter(keys)))
+
+    runner.manager.lookup.return_value = LookupResult.HIT
+    runner.manager.prepare_load = vanished
+    runner.new_request(token_ids=[0] * num_tokens)
+    req_id = str(runner.req_id)
+    request = scheduler.requests[req_id]
+
+    scheduler_output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    meta = scheduler_output.kv_connector_metadata
+    assert isinstance(meta, OffloadingConnectorMetadata)
+    assert not meta.load_jobs
+    assert meta.failed_loads == {req_id}
+
+    runner.worker_connector.bind_connector_metadata(meta)
+    runner.worker_connector.start_load_kv(runner._dummy_ctx)
+    results = runner.worker_connector.get_transfer_results(
+        scheduler_output.finished_req_ids
+    )
+    runner.worker_connector.clear_connector_metadata()
+    model_runner_output = KVOutputAggregator(1).aggregate(
+        [
+            ModelRunnerOutput.with_kv_conn_output_only(
+                KVConnectorOutput(
+                    finished_recving=results.finished_recving,
+                    failed_recving=results.failed_recving,
+                )
+            )
+        ]
+    )
+    assert model_runner_output is not None
+    engine_outputs = scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    if policy == "fail":
+        assert request.status == RequestStatus.FINISHED_ERROR
+        (output,) = engine_outputs[0].outputs
+        assert output.request_id == req_id
+        assert output.finish_reason == FinishReason.ERROR
+        # The next step signals the finish to the connector and frees all.
+        scheduler.schedule()
+        assert req_id not in scheduler.requests
+        assert req_id not in runner.connector_scheduler._req_status
+        assert (
+            scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+            == num_free_blocks
+        )
+    else:
+        assert not any(out.outputs for out in engine_outputs.values())
+        assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert request.num_computed_tokens == 0
+        # The vanished key now answers MISS: the retry recomputes it all.
+        runner.manager.lookup.return_value = LookupResult.MISS
+        scheduler_output = scheduler.schedule()
+        assert request.status == RequestStatus.RUNNING
+        (new_req,) = scheduler_output.scheduled_new_reqs
+        assert new_req.req_id == req_id
+        assert new_req.num_computed_tokens == 0
+        assert scheduler_output.num_scheduled_tokens[req_id] == num_tokens
+
+
+def test_vanished_pinned_load_keeps_prefix_restorable(request_runner):
+    """Defect entry 4: the pre-prepare_load bookkeeping must not survive a
+    vanished key. loaded_from_offload gates the EAGLE-boundary store skip and
+    next_stored_chunk_idx gates the store walk, so leaving them set after a
+    failed load makes the recompute policy neither re-store the prefix chunks
+    nor treat the request as never-loaded."""
+    block_size = 4
+    num_tokens = 3 * block_size
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=10,
+        async_scheduling=False,
+        kv_load_failure_policy="recompute",
+    )
+    scheduler = runner.scheduler
+
+    def vanished(keys, req_context):
+        raise OffloadKeyVanishedError(next(iter(keys)))
+
+    runner.manager.lookup.return_value = LookupResult.HIT
+    runner.manager.prepare_load = vanished
+    runner.manager.on_new_request.return_value = RequestOffloadingContext(
+        policy=OffloadPolicy.CHUNK_LEVEL
+    )
+    runner.new_request(token_ids=[0] * num_tokens)
+    req_id = str(runner.req_id)
+
+    scheduler.schedule()
+
+    req_status = runner.connector_scheduler._req_status[req_id]
+    assert not req_status.loaded_from_offload
+    for group_state in req_status.group_states:
+        assert group_state.next_stored_chunk_idx == 0
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])

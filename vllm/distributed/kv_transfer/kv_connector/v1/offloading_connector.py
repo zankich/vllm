@@ -157,6 +157,12 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         results = super().get_transfer_results(finished_req_ids)
         assert self.connector_worker is not None
         results.failed_recving = self.connector_worker.take_failed_recving()
+        # A failed receive must also appear in finished_recving: the output
+        # aggregator computes failed_recving as the intersection of the
+        # pending failed set with finished_recving, so a request reported
+        # only as failed never completes its rank count and parks in
+        # WAITING_FOR_REMOTE_KVS until teardown.
+        results.finished_recving |= results.failed_recving
         return results
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:

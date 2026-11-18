@@ -273,6 +273,9 @@ class OffloadingConnectorWorker:
             assert success
         if sync_job_ids:
             self.worker.wait(sync_job_ids)
+        # Loads the scheduler failed without issuing a job travel the same
+        # failed-recving drain as load-job failures.
+        self._failed_recving |= metadata.failed_loads
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
