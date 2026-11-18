@@ -26,6 +26,8 @@ pytestmark = pytest.mark.skip_global_cleanup
         (500, "api_error"),
         (501, "api_error"),
         (503, "overloaded_error"),
+        # Anthropic's own overload status; clients retry on overloaded_error.
+        (529, "overloaded_error"),
     ],
 )
 def test_error_type_is_translated_to_anthropic_vocabulary(

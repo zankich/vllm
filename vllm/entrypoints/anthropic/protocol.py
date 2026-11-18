@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 import vllm.envs as envs
 from vllm.entrypoints.generate.base.protocol import (
     MMPayload,
+    PerRequestMetrics,
     resolve_return_mm_kwargs_alias,
 )
 
@@ -40,6 +41,8 @@ _ANTHROPIC_ERROR_TYPE_BY_STATUS: dict[int, str] = {
     HTTPStatus.TOO_MANY_REQUESTS.value: "rate_limit_error",
     # vLLM reports overload (e.g. QueueOverflowError) as HTTP 503.
     HTTPStatus.SERVICE_UNAVAILABLE.value: "overloaded_error",
+    # Anthropic's own overload status; clients retry on overloaded_error.
+    529: "overloaded_error",
 }
 
 
@@ -436,6 +439,9 @@ class AnthropicStreamEvent(BaseModel):
     index: int | None = None
     error: AnthropicError | None = None
     usage: AnthropicUsage | None = None
+    # vLLM-specific field that is not in Anthropic spec: per-request metrics
+    # (timing and speculative-decoding acceptance) on the final message_delta.
+    metrics: PerRequestMetrics | None = None
 
 
 class AnthropicMessagesResponse(BaseModel):
@@ -453,6 +459,13 @@ class AnthropicMessagesResponse(BaseModel):
     usage: AnthropicUsage | None = None
 
     # vLLM-specific fields that are not in Anthropic spec
+    metrics: PerRequestMetrics | None = Field(
+        default=None,
+        description=(
+            "vLLM per-request metrics (timing and speculative-decoding "
+            "acceptance) for single-sequence requests."
+        ),
+    )
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
