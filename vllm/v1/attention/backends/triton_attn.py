@@ -54,6 +54,24 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 
+def kv_fp8_dtype_for_platform(
+    default_dtype: torch.dtype,
+    platform=None,
+) -> torch.dtype:
+    """The fp8 dtype to serve quantized KV with on this platform.
+
+    Below SM89 on CUDA, e5m2 replaces the default e4m3: triton cannot
+    compile fp8e4nv there, so quantized KV serves as e5m2 (native in
+    triton on SM80+), quantized in torch (RNE) by the cache-store
+    wrapper; decode loads e5m2 and dequantizes in-kernel as usual.
+    """
+    if platform is None:
+        platform = current_platform
+    if platform.is_cuda() and not platform.has_device_capability(89):
+        return torch.float8_e5m2
+    return default_dtype
+
+
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
@@ -510,21 +528,41 @@ class TritonAttentionImpl(AttentionImpl):
         else:
             self.sliding_window = (sliding_window - 1, 0)
         self.kv_cache_dtype = kv_cache_dtype
+        self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
+        self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
         if current_platform.is_cuda():
             cap = current_platform.get_device_capability()
             cap_str = cap.as_version_str() if cap is not None else "unknown"
             dev = current_platform.get_device_name()
-            if self.kv_cache_dtype.startswith("fp8") and not (
-                current_platform.has_device_capability(89)
-            ):
-                suggested = (
-                    "float16" if (cap is None or cap.to_int() < 80) else "bfloat16"
+            # The kernel dequantizes FP8 K/V in software (_cast_kv_tile), and
+            # below SM89 the per-tensor path stores the cache as e5m2, so SM80
+            # suffices there. Per-token-head FP8 quantizes into the cache dtype
+            # through _PER_TOKEN_HEAD_QUANT_PARAMS, which has no e5m2 entry,
+            # so it needs the e4m3 path and SM89+.
+            if self.kv_cache_dtype.startswith("fp8"):
+                min_cap = (
+                    80 if self._kv_quant_mode == KVQuantMode.FP8_PER_TENSOR else 89
                 )
-                raise ValueError(
-                    f"FP8 KV cache is not supported by the Triton attention backend "
-                    f"on {dev} (compute capability {cap_str}); native FP8 (fp8e4nv) "
-                    f"requires SM89+. Re-run with --kv-cache-dtype {suggested}."
-                )
+                if not current_platform.has_device_capability(min_cap):
+                    if self._kv_quant_mode == KVQuantMode.FP8_PER_TENSOR:
+                        suggested = (
+                            "float16"
+                            if (cap is None or cap.to_int() < 80)
+                            else "bfloat16"
+                        )
+                    else:
+                        suggested = (
+                            "fp8"
+                            if (cap is not None and cap.to_int() >= 80)
+                            else "float16"
+                        )
+                    raise ValueError(
+                        f"FP8 KV cache is not supported by the Triton attention "
+                        f"backend on {dev} (compute capability {cap_str}); native "
+                        f"FP8 (fp8e4nv) requires SM89+ and the e5m2 fallback "
+                        f"requires SM80+ (per-tensor FP8 only). Re-run with "
+                        f"--kv-cache-dtype {suggested}."
+                    )
             if self.kv_cache_dtype == "bfloat16" and not (
                 current_platform.has_device_capability(80)
             ):
@@ -543,6 +581,15 @@ class TritonAttentionImpl(AttentionImpl):
 
         self.attn_type = attn_type
         self.fp8_dtype = current_platform.fp8_dtype()
+        # Below SM89 triton cannot compile fp8e4nv; see kv_fp8_dtype_for_platform.
+        # Only the per-tensor path serves as e5m2 there: the per-token-head
+        # store quantizes into the cache dtype and has no e5m2 quant params,
+        # so it keeps e4m3 and the init gate above requires SM89+ for it.
+        if (
+            is_quantized_kv_cache(self.kv_cache_dtype)
+            and self._kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+        ):
+            self.fp8_dtype = kv_fp8_dtype_for_platform(self.fp8_dtype)
 
         self.sinks = sinks
         if sinks is not None:
@@ -553,15 +600,19 @@ class TritonAttentionImpl(AttentionImpl):
             )
         self.use_alibi_sqrt = use_alibi_sqrt
         self.chunk_lookback = chunk_lookback
-        self.supports_quant_query_input = current_platform.is_cuda()
+        self.supports_quant_query_input = current_platform.is_cuda() and (
+            # When quantized KV serves as e5m2 (below SM89, see
+            # kv_fp8_dtype_for_platform) queries must stay bf16: an
+            # e4m3 query would leave the q_descale guard below without
+            # a scale while the kernel still compiles
+            # USE_FP8_Q_DESCALE true.
+            self.fp8_dtype == current_platform.fp8_dtype()
+        )
         if current_platform.is_rocm():
             # Enable GPUs with fp8 MMA support
             from vllm.platforms.rocm import on_gfx11, on_gfx90a
 
             self.supports_quant_query_input = not (on_gfx90a() or on_gfx11())
-
-        self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
-        self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
 
         # Enable tensor descriptors for Q/K/V load/store on platforms that
         # benefit from HW 2D block reads (Intel XPU).  The dead branch

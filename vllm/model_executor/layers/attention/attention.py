@@ -226,13 +226,25 @@ def _init_kv_cache_quant(
                 CompressedTensorsKVCacheMethod,
             )
 
-            if not isinstance(quant_method, CompressedTensorsKVCacheMethod) or (
+            _scheme_calibrated = not isinstance(
+                quant_method, CompressedTensorsKVCacheMethod
+            ) or (
                 cast(CompressedTensorsConfig, quant_method.quant_config).kv_cache_scheme
                 is not None
-            ):
-                raise ValueError(
-                    "fp8_e5m2 kv-cache is not supported with fp8 checkpoints."
-                )
+            )
+            if _scheme_calibrated:
+                # Below SM89, e5m2 is the only fp8 KV flavor triton can
+                # compile, so allow it even for checkpoints with a calibrated
+                # kv_cache_scheme: the static scales were calibrated for e4m3
+                # semantics, and e5m2 storage adds mantissa noise (2-bit vs
+                # 3-bit) but no range risk. Keep the raise on SM89+ where
+                # e4m3 is available.
+                from vllm.platforms import current_platform as _cp
+
+                if _cp.is_cuda() and _cp.has_device_capability(89):
+                    raise ValueError(
+                        "fp8_e5m2 kv-cache is not supported with fp8 checkpoints."
+                    )
         # If quantization is enabled, we make "k_scale" and "v_scale"
         # parameters so that it can be loaded from the model checkpoint.
         # The k/v_scale will then be converted back to native float32

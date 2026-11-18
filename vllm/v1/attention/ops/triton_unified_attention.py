@@ -1045,6 +1045,18 @@ def unified_attention(
         assert k_scale_cache is not None and v_scale_cache is not None, (
             f"{kv_quant_mode.name} requires k_scale_cache / v_scale_cache"
         )
+    if (
+        kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+        and q_descale is None
+        and q.dtype == current_platform.fp8_dtype()
+    ):
+        # USE_FP8_Q_DESCALE compiles true for a platform-fp8 query, so
+        # the kernel would read the null q_scale pointer.
+        raise ValueError(
+            "fp8 query with per-tensor quantized KV requires q_descale; "
+            "pass the query scale or keep queries in bf16 for in-kernel "
+            "KV dequant."
+        )
 
     use_mm_prefix = False
     max_mm_ranges = 0
@@ -1145,6 +1157,22 @@ def unified_attention(
     TILE_SIZE_DECODE = _get_tile_size(
         head_size, sliding_window_val, q.element_size(), is_prefill=False
     )
+
+    # SM80/86 shared memory (100KB per block) cannot hold the default
+    # head_dim-512 prefill tiles with Triton's default pipelining (114944 B
+    # required against the 101376 B limit). Cap num_stages at 1 and halve
+    # the prefill tile for large heads on sub-SM90 devices — only for
+    # fp8-KV serving, the workload the constraint was measured on; every
+    # other sub-SM90 prefill keeps stock launch behavior.
+    if (
+        current_platform.is_cuda()
+        and not current_platform.has_device_capability(90)
+        and k.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
+    ):
+        if launch_num_stages is None:
+            launch_num_stages = 1
+        if head_size > 256:
+            TILE_SIZE_PREFILL = 16
 
     # Wider KV tile for the tuned large-head path (see above). Only the 2D
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
